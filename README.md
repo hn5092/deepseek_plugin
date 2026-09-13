@@ -76,7 +76,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DeepSeek.ps1
 装的是什么：
 
 - **settings 模式**：把 `llm-deepseek` 模型目录（`deepseek-v4-flash` 支持图片输入、`deepseek-v4-pro` 纯文本、`deepseek-v4-flash-vision-exp` 带 `imagePixelBudget`/`imageMaxBytes`）合并进 `settings.yaml`；`apiKeyEnv`/`baseURL` 用插件默认值（`DEEPSEEK_API_KEY` / `https://api.deepseek.com`），所以文件里不长出第二份真源。
-- **profile 模式**：建 `profiles/<名字>/`（`package.json` + `cordis.patch.yml` + 空的 `cordis.yml`），`-Surface web|headless` 决定挂哪个 bundle；`dsh --profile <名字>` 直接可用。
+- **profile 模式**：建 `profiles/<名字>/`（`package.json` + `cordis.patch.yml` + 空的 `cordis.yml`），`-Surface web|headless` 决定挂哪个 bundle；`dsh --profile <名字>` 直接可用。它同时写 `agent-default-model`（默认 `opencode-go-2` / `deepseek-v4.1-flash` / `reasoningEffort: max`，可用 `-DefaultRoute/-DefaultModel/-ReasoningEffort` 改），所以重放后默认推理等级仍是 max。
 
 安全与可回滚：
 

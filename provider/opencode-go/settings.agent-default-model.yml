@@ -1,0 +1,6 @@
+# Default model for new sessions. reasoningEffort max is this deployment's default for the
+# OpenCode Go routes; the installer substitutes the three placeholders from its parameters.
+agent-default-model:
+  provider: __DEFAULT_ROUTE__
+  model: __DEFAULT_MODEL__
+  reasoningEffort: __EFFORT__

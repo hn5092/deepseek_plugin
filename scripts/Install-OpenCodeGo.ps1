@@ -47,6 +47,9 @@ param(
     [string] $DshHome = (Join-Path $env:APPDATA 'dsh-desktop\harness'),
     [string] $Client = 'dsh-opencode-go',
     [string[]] $Ref = @('OPENCODE_API_KEY_1', 'OPENCODE_API_KEY_2', 'OPENCODE_API_KEY_3', 'OPENCODE_API_KEY_4', 'OPENCODE_API_KEY_5'),
+    [string] $DefaultRoute = 'opencode-go-2',
+    [string] $DefaultModel = 'deepseek-v4.1-flash',
+    [ValidateSet('low', 'high', 'max')] [string] $ReasoningEffort = 'max',
     [switch] $DryRun,
     [switch] $Uninstall
 )
@@ -54,10 +57,13 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $template = Join-Path (Split-Path -Parent $PSScriptRoot) 'provider\opencode-go\settings.llm-pi-ai.yml'
+$defaultTemplate = Join-Path (Split-Path -Parent $PSScriptRoot) 'provider\opencode-go\settings.agent-default-model.yml'
 $settingsPath = Join-Path $DshHome 'settings.yaml'
 $modulesDir = Join-Path $DshHome 'profiles\node_modules'
 $beginMarker = '# >>> dsh-opencode-go routes'
 $endMarker = '# <<< dsh-opencode-go routes'
+$defaultBegin = '# >>> dsh-opencode-go default model'
+$defaultEnd = '# <<< dsh-opencode-go default model'
 $refs = @($Ref | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
 if (-not (Test-Path -LiteralPath $settingsPath)) { throw "settings.yaml not found: $settingsPath" }
@@ -67,6 +73,8 @@ if (-not $Uninstall -and $refs.Count -ne 5) { throw "exactly 5 credential refere
 $existing = [IO.File]::ReadAllText($settingsPath)
 $managedPattern = '(?ms)^\s*' + [regex]::Escape($beginMarker) + '.*?' + [regex]::Escape($endMarker) + '\r?\n?'
 $sectionPattern = '(?ms)^llm-pi-ai:.*?(?=^[a-z][a-z0-9-]*:|\z)'
+$defaultPattern = '(?ms)^agent-default-model:.*?(?=^[a-z][a-z0-9-]*:|\z)'
+$defaultManaged = '(?ms)^\s*' + [regex]::Escape($defaultBegin) + '.*?' + [regex]::Escape($defaultEnd) + '\r?\n?'
 $managed = [regex]::IsMatch($existing, $managedPattern)
 $section = [regex]::Match($existing, $sectionPattern)
 $providerIds = @()
@@ -77,6 +85,7 @@ if ($section.Success) {
 if ($Uninstall) {
     if ($managed) {
         $text = [regex]::Replace($existing, $managedPattern, '')
+        $text = [regex]::Replace($text, $defaultManaged, '')
     } elseif ($section.Success -and @($providerIds | Where-Object { $_ -notmatch '^opencode-go-' }).Count -eq 0) {
         $text = [regex]::Replace($existing, $sectionPattern, '')
     } else {
@@ -116,6 +125,16 @@ if ($managed) {
     $text = $prefix + $block
 }
 
+# Default model block: replace that section (managed or not) so a replay restores the
+# reasoning effort this deployment expects.
+$defaultBody = ([IO.File]::ReadAllText($defaultTemplate).TrimEnd()) -replace '__DEFAULT_ROUTE__', $DefaultRoute -replace '__DEFAULT_MODEL__', $DefaultModel -replace '__EFFORT__', $ReasoningEffort
+$defaultBlock = $defaultBegin + ' (managed by scripts/Install-OpenCodeGo.ps1)' + "`n" + $defaultBody + "`n" + $defaultEnd
+$text = [regex]::Replace($text, $defaultManaged, '')
+if ([regex]::IsMatch($text, $defaultPattern)) {
+    $text = [regex]::Replace($text, $defaultPattern, $defaultBlock + "`n")
+} else {
+    $text = $text.TrimEnd() + "`n`n" + $defaultBlock
+}
 if ($DryRun) { Write-Host "[dry run] would write the route set ($($refs -join ', '))"; return }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -148,12 +167,17 @@ if ((Test-Path -LiteralPath $yamlModule) -and $nodeExe) {
         '  if (!route) { console.error("missing route " + routes[i]); process.exit(2); }'
         '  if (route.apiKeyEnv !== refs[i]) { console.error("route " + routes[i] + " references " + route.apiKeyEnv + " instead of " + refs[i]); process.exit(3); }'
         '}'
+        'if (process.argv[5]) {'
+        '  const d = doc["agent-default-model"];'
+        '  if (!d || d.reasoningEffort !== process.argv[5]) { console.error("agent-default-model.reasoningEffort is " + (d && d.reasoningEffort) + ", expected " + process.argv[5]); process.exit(4); }'
+        '  console.log("validated default effort:", d.reasoningEffort);'
+        '}'
         'console.log("validated routes:", routes.join(", "));'
     )
     [IO.File]::WriteAllText($probePath, ($probe -join "`n"), [Text.UTF8Encoding]::new($false))
     $refFile = Join-Path $env:TEMP 'dsh-opencode-go-refs.txt'
     [IO.File]::WriteAllText($refFile, (($refs -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
-    & $nodeExe $probePath $yamlModule $settingsPath $refFile
+    & $nodeExe $probePath $yamlModule $settingsPath $refFile $ReasoningEffort
     $code = $LASTEXITCODE
     Remove-Item $probePath, $refFile -Force -ErrorAction SilentlyContinue
     if ($code -ne 0) {

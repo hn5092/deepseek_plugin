@@ -188,7 +188,18 @@ window.__ModuleLoader__.load({
             );
         }
 
-        function OpenCodeUsageAction({ sessionId, useSessions }) {
+        /** Read one primitive out of the shared model-directory snapshot store. */
+        function useDirectoryProvider(directory) {
+            const subscribe = react.useCallback((notify) => (directory ? directory.subscribe(notify) : () => {}), [directory]);
+            const snapshot = react.useCallback(() => {
+                if (!directory) return null;
+                const value = directory.getSnapshot();
+                return value && value.current ? value.current.provider : null;
+            }, [directory]);
+            return react.useSyncExternalStore(subscribe, snapshot, snapshot);
+        }
+
+        function OpenCodeUsageAction({ sessionId, useSessions, directory }) {
             const state = useUsage();
             const [open, setOpen] = react.useState(false);
             const wrapRef = react.useRef(null);
@@ -200,7 +211,13 @@ window.__ModuleLoader__.load({
             const selection = readSessions((store) => (sessionId && store && store.byId
                 ? store.byId[sessionId]?.projectionValues?.modelSelection
                 : undefined));
-            const provider = selection && selection.lastUsed ? selection.lastUsed.provider : null;
+            // `pending` is the model the composer has selected but not used yet; reading only
+            // `lastUsed` would leave the chip on the previous account until the next turn.
+            const chosen = selection ? (selection.pending ?? selection.lastUsed) : null;
+            // The model-directory store holds the composer's live selection, so the chip follows
+            // a switch immediately; the session projection only lands after the host round trip.
+            const liveProvider = useDirectoryProvider(directory);
+            const provider = liveProvider || (chosen && chosen.provider ? chosen.provider : null);
 
             const toggle = () => setOpen((value) => !value);
 
@@ -305,14 +322,23 @@ window.__ModuleLoader__.load({
         }
 
         /** Client services required before the composer-row action can register. */
-        const inject = ["slots"];
+        const inject = ["slots", "modelDirectories"];
 
         function apply(ctx) {
             ensureStyles();
+            const directories = ctx.modelDirectories;
             ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
                 name: "conversation.input.right",
                 id: "opencode-go-usage",
-                order: 40
+                order: 40,
+                inject: (sessionId) => {
+                    try {
+                        const resolved = directories && sessionId !== void 0 ? directories.directoryFor(sessionId) : void 0;
+                        return { sessionId: sessionId, directory: resolved ? resolved.store : void 0 };
+                    } catch (error) {
+                        return { sessionId: sessionId };
+                    }
+                }
             }, OpenCodeUsageAction));
         }
 
