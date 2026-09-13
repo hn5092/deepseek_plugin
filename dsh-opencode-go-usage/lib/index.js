@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import z from "@deepseek-ai/schemastery";
 
@@ -35,6 +38,12 @@ export const Config = z.object({
     /** Exact route the browser half reads. Changing it also means changing lib/client.js. */
     path: z.string().default("/opencode-go-usage"),
     endpoint: z.string().default("https://opencode.ai/zen/go/v1/usage"),
+    /** In-process sampling interval; 0 disables it. Default: every 30 minutes. */
+    sampleEveryMs: z.number().step(1).min(0).default(1800000),
+    /** Bounded history kept for the trend column and for trend questions. */
+    historyMax: z.number().step(1).min(0).default(96),
+    /** JSONL history file; empty uses %LOCALAPPDATA%\opencode-go-usage\history.jsonl. */
+    historyPath: z.string().default(""),
     /** Reuse one upstream snapshot for this long; the browser polls every 30s. */
     cacheMs: z.number().step(1).min(0).default(30000),
     timeoutMs: z.number().step(1).min(1000).default(15000)
@@ -62,6 +71,59 @@ function windowOf(value) {
  * Resolve one credential reference and read its usage windows. Failures stay on the
  * row so one bad key never blanks the panel.
  */
+/** Resolved history file: configured path, else the LocalAppData folder beside the old log. */
+function historyFile(config) {
+    if (config.historyPath) return config.historyPath;
+    const base = process.env.LOCALAPPDATA || os.tmpdir();
+    return path.join(base, "opencode-go-usage", "history.jsonl");
+}
+
+/** One compact history line: the windows only, no credentials, no key material. */
+function historyLine(payload) {
+    return JSON.stringify({
+        at: payload.sampledAt,
+        accounts: payload.accounts.map((row) => ({
+            account: row.account,
+            route: row.route,
+            rolling: row.rolling ? row.rolling.percent : null,
+            weekly: row.weekly ? row.weekly.percent : null,
+            monthly: row.monthly ? row.monthly.percent : null,
+            error: row.error
+        }))
+    });
+}
+
+/** Append one sample, rotating the file once it grows past 2 MiB. */
+function appendHistory(file, payload) {
+    try {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        try {
+            if (fs.statSync(file).size > 2 * 1024 * 1024) fs.renameSync(file, file + ".1");
+        } catch {
+            // Missing file is the normal first-sample path.
+        }
+        fs.appendFileSync(file, historyLine(payload) + "\n");
+    } catch {
+        // A read-only machine must not break the usage panel.
+    }
+}
+
+/** Last `max` samples, oldest first; absent or unreadable history yields an empty array. */
+function readHistory(file, max) {
+    if (max <= 0) return [];
+    try {
+        const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+        return lines.slice(-max).map((line) => {
+            try {
+                return JSON.parse(line);
+            } catch {
+                return null;
+            }
+        }).filter(Boolean);
+    } catch {
+        return [];
+    }
+}
 /** Trailing number of a reference, else its position; used to name the matching route. */
 function routeNumber(ref, index) {
     const match = /(\d+)\s*$/.exec(ref);
@@ -153,7 +215,8 @@ export function apply(ctx, config) {
         let body;
         let status = 200;
         try {
-            body = JSON.stringify(await snapshot());
+            const payload = await snapshot();
+            body = JSON.stringify({ ...payload, history: readHistory(file, Math.min(config.historyMax, 24)) });
         } catch (error) {
             status = 500;
             body = JSON.stringify({ error: messageOf(error) });
@@ -167,4 +230,27 @@ export function apply(ctx, config) {
     };
 
     ctx.effect(() => ctx.webServer.register({ kind: "exact", path: config.path, handler }), "opencode-go-usage: " + config.path);
+
+    // Sampling runs inside this process: no scheduled task, no shell, no window. The first
+    // sample lands immediately so the history starts with the plugin, not a tick later.
+    const file = historyFile(config);
+    if (config.sampleEveryMs > 0) {
+        ctx.effect(() => {
+            let stopped = false;
+            const take = async () => {
+                if (stopped) return;
+                try {
+                    appendHistory(file, await snapshot());
+                } catch {
+                    // Sampling is advisory; the route still serves the live value.
+                }
+            };
+            void take();
+            const timer = setInterval(() => { void take(); }, config.sampleEveryMs);
+            return () => {
+                stopped = true;
+                clearInterval(timer);
+            };
+        }, "opencode-go-usage: sampler");
+    }
 }

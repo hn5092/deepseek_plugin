@@ -161,7 +161,29 @@ window.__ModuleLoader__.load({
             return match ? match[1] : route;
         }
 
-        function AccountRows({ accounts, activeAccount }) {
+        /** Most recent history sample that is not the one being displayed. */
+        function previousSample(payload) {
+            const history = payload && Array.isArray(payload.history) ? payload.history : [];
+            for (let index = history.length - 1; index >= 0; index--) {
+                const sample = history[index];
+                if (sample && sample.at !== payload.sampledAt) return sample;
+            }
+            return null;
+        }
+
+        function deltaText(current, previous) {
+            if (typeof current !== "number" || typeof previous !== "number") return "—";
+            const delta = current - previous;
+            if (delta === 0) return "0%";
+            return (delta > 0 ? "+" : "") + delta + "%";
+        }
+
+        function rowDelta(previous, account, window) {
+            if (!previous || !Array.isArray(previous.accounts)) return "—";
+            const row = previous.accounts.find((entry) => entry.account === account);
+            return row ? row[window] : "—";
+        }
+        function AccountRows({ accounts, activeAccount, previous }) {
             const rows = accounts.map((row) => h("tr", {
                 key: row.account,
                 "data-active": row.account === activeAccount ? "true" : null
@@ -171,7 +193,9 @@ window.__ModuleLoader__.load({
                 percentCell(row.rolling),
                 percentCell(row.weekly),
                 percentCell(row.monthly),
-                h("td", null, whenText(row.weekly && row.weekly.resetsAt))
+                h("td", null, whenText(row.weekly && row.weekly.resetsAt)),
+                h("td", null, deltaText(percentOf(row.weekly), rowDelta(previous, row.account, "weekly"))
+                    + " / " + deltaText(percentOf(row.monthly), rowDelta(previous, row.account, "monthly")))
             ));
             return h("table", { className: "dsw-ogu-table" },
                 h("thead", null,
@@ -181,7 +205,8 @@ window.__ModuleLoader__.load({
                         h("th", null, "5 小时"),
                         h("th", null, "周"),
                         h("th", null, "月"),
-                        h("th", null, "周重置")
+                        h("th", null, "周重置"),
+                        h("th", null, "Δ周/Δ月")
                     )
                 ),
                 h("tbody", null, ...rows)
@@ -307,12 +332,12 @@ window.__ModuleLoader__.load({
                 ),
                 open ? h("div", { className: "dsw-ogu-panel" },
                     h("div", { className: "dsw-ogu-title" }, "OpenCode Go 用量（5 小时 / 周 / 月）"),
-                    h(AccountRows, { accounts, activeAccount: active ? active.account : null }),
+                    h(AccountRows, { accounts, activeAccount: active ? active.account : null, previous: previousSample(state.payload) }),
                     failures.length > 0 ? h("div", { className: "dsw-ogu-error" },
                         failures.map((row) => row.account + ": " + row.error).join("；")) : null,
                     h("div", { className: "dsw-ogu-meta" },
                         state.payload && state.payload.sampledAt
-                            ? "采样于 " + whenText(state.payload.sampledAt) + "，每 30 秒刷新；≥" + WARN_PERCENT + "% 标黄"
+                            ? "采样于 " + whenText(state.payload.sampledAt) + "，面板每 30 秒刷新、后台每 30 分钟存一次历史；Δ = 相比上一次采样；≥" + WARN_PERCENT + "% 标黄"
                                 + (active ? "；▸ = " + (picked && picked.derived ? "按引用名尾号匹配的 " : "本会话选择的 ") + picked.route
                                     : (provider ? "；未找到 " + provider + " 对应的账号（按引用名尾号匹配）" : ""))
                             : "等待第一次采样…"),

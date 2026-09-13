@@ -24,6 +24,7 @@ lib/client.js         # 浏览器：往 conversation.input.right 注册胶囊+�
    "error":null}]}
 ```
 
+- 采样：宿主进程内按 `sampleEveryMs`（默认 1800000 = 30 分钟，0 关闭）采样，加载时先立刻采一次；`historyPath`（默认 `%LOCALAPPDATA%\opencode-go-usage\history.jsonl`，超 2 MiB 轮转）、`historyMax`（默认 96 条）。接口返回最近 24 条供面板算「Δ周/Δ月」。
 - 配置（Schemastery，`Config`）：`refs`（要采样的凭据引用，默认 `OPENCODE_API_KEY_1..4`）、`routes`（与 `refs` 对齐的路由名，例如 `opencode-go-1`；省略则按 `routePrefix` 推导）、`routePrefix`（默认 `opencode-go`，置空则不推导）、`path`、`endpoint`、`cacheMs`（默认 30000）、`timeoutMs`（默认 15000）。
 - 账号列表 = 配置里的 `refs`（没 key 也列出，显示 `missing credential`）+ 自动发现的 `autoRefPrefix<n>`（默认 `OPENCODE_API_KEY_1..8`，只收能解析出 key 的），所以往凭据里加一条 key 就会多一行，不必改配置。
 - 单个账号失败只体现在该行的 `error` 上，不会让整块面板空白；缺凭据是 `missing credential`。
