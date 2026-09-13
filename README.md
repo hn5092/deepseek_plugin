@@ -32,6 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps
 - 也想用 DeepSeek 官方模型：`powershell -File scripts\Install-DeepSeek.ps1`（详见「DeepSeek 官方 provider 配置」）
 - 5 路 OpenCode Go 路由（每路独立 key、独立 session header）被 App 写回后，用 `powershell -File scripts\Install-OpenCodeGo.ps1` 一条命令重放（详见「OpenCode Go 五路路由」）
 - 安装器只需要 PowerShell；找不到 node 时会跳过 YAML 校验并保留备份，不影响安装
+- **macOS / Linux 不需要 PowerShell**：同一套安装器有 `.sh` 版本，语义与 `.ps1` 一致（详见「macOS / Linux 安装」）
 
 ## 安装 dsh-opencode-go-usage
 
@@ -46,6 +47,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps
 装完**刷新 DSH 窗口**（`Ctrl+R`；或直接重启 App）。输入框那一行（模型选择器旁）会出现一个胶囊，**跟随你当前选中的 provider**：模型选择器里的 `1/2/3…` 就是路由 `opencode-go-1/2/3…`，选 2 就显示 2 号账号的周/月占用（点开是全部账号的表，`▸` 标出在用账号）；匹配不到时回退显示全部账号最高值。
 
 - 桌面 harness 默认家目录是 `%APPDATA%\dsh-desktop\harness`；CLI harness 用 `-DshHome "$env:USERPROFILE\.dsh"`。
+- profile 名也是按存在的那个挑：Windows 桌面是 `web`，macOS 桌面是 `desktop`，只有一个 profile 时用它；要强制指定用 `-ProfileName`。
 - 账号行来自插件配置里的 `refs`（默认 `OPENCODE_API_KEY_1..4`），可以这样指定：
 
 ```powershell
@@ -57,6 +59,57 @@ powershell -File scripts\Install-DshPlugin.ps1 -Ref OPENCODE_API_KEY_1,OPENCODE_
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1 -Uninstall
 ```
+
+## macOS / Linux 安装
+
+macOS 和 Linux 上 DSH 的 home 是 `$HOME/.dsh`（Desktop 与 CLI 共用），macOS 桌面的 profile 叫
+`desktop`。`scripts/*.sh` 与 `scripts/*.ps1` 是同一套语义，并且互相认得对方写的受管块，可以混用。
+
+```bash
+git clone https://github.com/hn5092/deepseek_plugin.git
+cd deepseek_plugin
+
+scripts/Install-DshPlugin.sh                       # 装插件（profile 自动挑 web → desktop → 唯一的一个）
+scripts/Install-DshPlugin.sh --ref KEY_A,KEY_B     # 指定凭据引用名，一条 ref = 一个账号行
+scripts/Install-DshPlugin.sh --uninstall           # 卸载
+
+scripts/Install-OpenCodeGo.sh                      # 重放五路 OpenCode Go 路由
+scripts/Install-OpenCodeGo.sh --client my-mac --dry-run
+```
+
+- 所有 `.sh` 都支持 `--dry-run`（只打印差异不落盘）、写前时间戳备份、写后用 harness 自带 YAML 解析器
+  校验、失败自动回滚；`--dsh-home` / `--profile` / `--plugin-dir` 可覆盖默认值。
+- 装完刷新窗口：macOS 上是 **`Cmd+R`**（`Ctrl+R` 是 Windows）。插件宿主侧新增路由会热加载，浏览器侧
+  bundle 会重新组合，一般不需要重启 harness。
+- profile 的 `cordis.patch.yml` 若是默认的 `[]` 占位，安装器会把这一行**替换**成受管行再写入：`[]`
+  后面直接跟序列项不是合法 YAML，旧写法（追加）会让写后校验失败并回滚。
+- 只想看数字：`curl -s 127.0.0.1:3080/opencode-go-usage`（只含引用名和 key 尾号），或
+  `pwsh -File scripts/usage-cli.ps1`（`.ps1` 在 macOS 上要装 PowerShell；`usage-cli` 目前尚无 `.sh` 版本）。
+
+## OpenCode Go 五路路由
+
+`provider/opencode-go/` 里是五路并行路由的模板：五条 `opencode-go-1..5`，每条一个 `apiKeyEnv`
+凭据引用、一个 `x-opencode-session`，所以同一个订阅的五个 key 可以各自成路、各自被 UI 选中。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-OpenCodeGo.ps1
+# 指定 client 标签与五条引用名：
+powershell -File scripts\Install-OpenCodeGo.ps1 -Client dsh-desktop-mybox -Ref KEY_A,KEY_B,KEY_C,KEY_D,KEY_E
+# 只看会改什么（会列出将被替换掉的 provider id）：
+powershell -File scripts\Install-OpenCodeGo.ps1 -DryRun
+```
+
+```bash
+scripts/Install-OpenCodeGo.sh --client my-mac                 # macOS / Linux
+scripts/Install-OpenCodeGo.sh --uninstall
+```
+
+- 写的是 `settings.yaml` 的 `llm-pi-ai` 段与 `agent-default-model` 段（后者默认 `opencode-go-2` /
+  `deepseek-v4.1-flash` / `reasoningEffort: max`，可用 `-DefaultRoute/-DefaultModel/-ReasoningEffort` 改）。
+- `-Client` 替换模板里的 `__CLIENT__`：**重放时保持同一个值**，`x-opencode-session` 才稳定。
+- DSH Desktop 改 UI 偏好时会按自己的快照重写 `settings.yaml`，把这一段退回；重跑安装器即恢复，这是设计上的重放路径。
+- 原有的**非受管** `llm-pi-ai` 段也会被整体替换（写前备份 `settings.yaml.bak-<时间戳>`，写后用 harness 的 YAML 解析器校验，失败自动回滚）。所以先跑一次 `-DryRun`。
+- 每条路由要有自己的 key（同名凭据引用或环境变量）；缺 key 的那一路在使用时报 `MISSING_CREDENTIAL`。
 
 ## DeepSeek 官方 provider 配置（一键安装）
 
