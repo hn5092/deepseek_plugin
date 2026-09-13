@@ -8,6 +8,27 @@ DeepSeek Harness（DSH）插件集合。
 | `scripts/Install-DshPlugin.ps1` | 通用安装/卸载脚本：把插件装进 DSH profile |
 | `scripts/usage-cli.ps1` | 纯命令行查用量，不装插件也能用 |
 
+## 给别人的一页说明（可直接转发）
+
+前提：对方已装 **DSH Desktop**（或 DSH CLI），并在自己的 DSH 凭据里配好 OpenCode Go 的 API key。
+
+```powershell
+git clone https://github.com/hn5092/deepseek_plugin.git
+cd deepseek_plugin
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1
+```
+
+装完在 DSH 窗口按 `Ctrl+R` 刷新页面（**不要**按 `Ctrl+Shift+R`，那是重启 harness）。输入框那一行、模型选择器旁边会出现 `GO <月度最高占用>%` 的胶囊，点开就是各账号 5 小时 / 周 / 月占用与重置时间。
+
+- 他们自己的 key 引用名不是 `OPENCODE_API_KEY_1..4` 时，用 `-Ref` 指定（一条 ref = 一个账号行）：
+  `powershell -File scripts\Install-DshPlugin.ps1 -Ref MY_KEY_A,MY_KEY_B`
+- CLI harness：加 `-DshHome "$env:USERPROFILE\.dsh"`
+- 某条 ref 没配 key 时，那一行显示 `missing credential`（不会静默用别人的 key）
+- 卸载（同时清掉 profile patch 里那一行）：
+  `powershell -File scripts\Install-DshPlugin.ps1 -Uninstall`
+- 只想要命令行、不装 UI：`powershell -File scripts\usage-cli.ps1`
+- 安装器只需要 PowerShell；找不到 node 时会跳过 YAML 校验并保留备份，不影响安装
+
 ## 安装 dsh-opencode-go-usage
 
 前置：已装 DSH Desktop（或 DSH CLI），并且已有可用的 OpenCode Go API key。

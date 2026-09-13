@@ -104,7 +104,22 @@ function Write-PatchFile {
     )
     $probePath = Join-Path $env:TEMP 'dsh-plugin-patch-verify.cjs'
     [IO.File]::WriteAllText($probePath, ($probeLines -join "`n"), [Text.UTF8Encoding]::new($false))
-    & node $probePath $yamlModule $patchPath
+    # Resolve node for the validation probe: PATH first, then the DSH Desktop bundled runtime.
+    $nodeExe = $null
+    $fromPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($fromPath) { $nodeExe = $fromPath.Source }
+    if (-not $nodeExe) {
+        $candidates = @(
+            (Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe')
+        )
+        if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
+        foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate) { $nodeExe = $candidate; break } }
+    }
+    if (-not $nodeExe) {
+        Write-Warning 'node was not found (PATH or DSH Desktop bundle); skipped the post-write validation. The backup is kept next to the patch file.'
+        return
+    }
+    & $nodeExe $probePath $yamlModule $patchPath
     $probeExit = $LASTEXITCODE
     Remove-Item $probePath -Force -ErrorAction SilentlyContinue
     if ($probeExit -ne 0) {
