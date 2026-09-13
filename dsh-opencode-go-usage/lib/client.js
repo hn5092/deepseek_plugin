@@ -12,6 +12,12 @@ window.__ModuleLoader__.load({
         const ROUTE = "/opencode-go-usage";
         /** The host caches for 30s, so polling faster would only re-read its cache. */
         const POLL_MS = 30000;
+/**
+         * Click padding around the chip rect, in px. The DSH conversation header has a
+         * cover over the actions slot that swallows direct clicks, so the toggle below is
+         * confirmed geometrically on the capture phase instead of trusting the event target.
+         */
+        const HIT_PAD = 6;
         /** Percent at or above which a window is called out in the warning color. */
         const WARN_PERCENT = 80;
 
@@ -139,6 +145,28 @@ window.__ModuleLoader__.load({
         function OpenCodeUsageAction() {
             const state = useUsage();
             const [open, setOpen] = react.useState(false);
+            const wrapRef = react.useRef(null);
+            const swallowedRef = react.useRef(false);
+
+            const toggle = () => setOpen((value) => !value);
+
+            // Capture-phase hit test: works even when another element in the header sits on
+            // top of the chip, because the decision uses the chip rect, not the event target.
+            react.useEffect(() => {
+                const onDocumentClick = (event) => {
+                    const node = wrapRef.current;
+                    if (!node) return;
+                    const rect = node.getBoundingClientRect();
+                    const inside = event.clientX >= rect.left - HIT_PAD && event.clientX <= rect.right + HIT_PAD
+                        && event.clientY >= rect.top - HIT_PAD && event.clientY <= rect.bottom + HIT_PAD;
+                    if (!inside) return;
+                    swallowedRef.current = true;
+                    window.setTimeout(() => { swallowedRef.current = false; }, 0);
+                    toggle();
+                };
+                document.addEventListener("click", onDocumentClick, true);
+                return () => document.removeEventListener("click", onDocumentClick, true);
+            }, []);
             const accounts = state.payload && Array.isArray(state.payload.accounts) ? state.payload.accounts : [];
 
             let worst = null;
@@ -155,12 +183,15 @@ window.__ModuleLoader__.load({
             const hint = worst ? "月度额度最高：" + worst.account : "OpenCode Go 用量";
             const failures = accounts.filter((row) => row.error);
 
-            return h("span", { className: "dsw-ogu-wrap" },
+            return h("span", { className: "dsw-ogu-wrap", ref: wrapRef },
                 h("button", {
                     type: "button",
                     className: "dsw-ogu-chip",
                     title: hint,
-                    onClick: () => setOpen((value) => !value)
+                    onClick: () => {
+                        if (swallowedRef.current) return;
+                        toggle();
+                    }
                 },
                     h("span", { className: "dsw-ogu-dot", "data-tone": tone, "aria-hidden": true }),
                     h("span", null, label)
