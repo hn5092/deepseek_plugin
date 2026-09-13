@@ -7,6 +7,8 @@ DeepSeek Harness（DSH）插件集合。
 | `dsh-opencode-go-usage/` | 在 DSH Web 客户端显示 OpenCode Go 各账号额度占用（5 小时 / 周 / 月）的插件 |
 | `scripts/Install-DshPlugin.ps1` | 通用安装/卸载脚本：把插件装进 DSH profile |
 | `scripts/usage-cli.ps1` | 纯命令行查用量，不装插件也能用 |
+| `provider/deepseek/` | DeepSeek 官方 provider 配置（模型目录含视觉模态），用 `Install-DeepSeek.ps1` 一键装 |
+| `scripts/Install-DeepSeek.ps1` | 一键装/卸 DeepSeek 配置（桌面 settings 模式 / CLI profile 模式） |
 
 ## 给别人的一页说明（可直接转发）
 
@@ -27,6 +29,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps
 - 卸载（同时清掉 profile patch 里那一行）：
   `powershell -File scripts\Install-DshPlugin.ps1 -Uninstall`
 - 只想要命令行、不装 UI：`powershell -File scripts\usage-cli.ps1`
+- 也想用 DeepSeek 官方模型：`powershell -File scripts\Install-DeepSeek.ps1`（详见「DeepSeek 官方 provider 配置」）
 - 安装器只需要 PowerShell；找不到 node 时会跳过 YAML 校验并保留备份，不影响安装
 
 ## 安装 dsh-opencode-go-usage
@@ -53,6 +56,35 @@ powershell -File scripts\Install-DshPlugin.ps1 -Ref OPENCODE_API_KEY_1,OPENCODE_
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1 -Uninstall
 ```
+
+## DeepSeek 官方 provider 配置（一键安装）
+
+`provider/deepseek/` 里是本机在用的 DeepSeek 配置，两种用法都由一个脚本装好：
+
+```powershell
+# 桌面（写进 %APPDATA%\dsh-desktop\harness\settings.yaml 的模型目录）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DeepSeek.ps1
+
+# CLI：建一个可以直接 dsh --profile deepseek 启动的 profile
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DeepSeek.ps1 -DshHome "$env:USERPROFILE\.dsh" -Scope profile
+
+# 两个都要（比如桌面 home 里也建一份 profile 用 web 界面跑）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DeepSeek.ps1 -Scope both -Surface web
+```
+
+装的是什么：
+
+- **settings 模式**：把 `llm-deepseek` 模型目录（`deepseek-v4-flash` 支持图片输入、`deepseek-v4-pro` 纯文本、`deepseek-v4-flash-vision-exp` 带 `imagePixelBudget`/`imageMaxBytes`）合并进 `settings.yaml`；`apiKeyEnv`/`baseURL` 用插件默认值（`DEEPSEEK_API_KEY` / `https://api.deepseek.com`），所以文件里不长出第二份真源。
+- **profile 模式**：建 `profiles/<名字>/`（`package.json` + `cordis.patch.yml` + 空的 `cordis.yml`），`-Surface web|headless` 决定挂哪个 bundle；`dsh --profile <名字>` 直接可用。
+
+安全与可回滚：
+
+- 写前备份（`settings.yaml.bak-<时间戳>`），写后用 harness 自带 YAML 解析器校验，失败自动回滚；
+- 已有**非受管**的 `llm-deepseek:` 段时明确拒绝覆盖（本机现状就是这种，脚本会提示先手工合并）；
+- 卸载：同一条命令加 `-Uninstall`（同时清掉受管块 / profile 目录）；
+- **脚本不写密钥**：`DEEPSEEK_API_KEY` 由你自己写进 DSH 凭据（`<DshHome>/.credentials.yaml` 的 `refs:`）或用同名环境变量。
+
+Codex CLI 用户：`provider/deepseek/codex/deepseek.config.toml` 可直接复制成 `$CODEX_HOME/deepseek.config.toml`，然后 `codex -p deepseek`。
 
 ## 命令行用法（不需要 UI）
 
