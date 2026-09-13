@@ -35,7 +35,7 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-dot[data-tone=ok]{background:var(--dsw-alias-state-success-primary, #22c55e)}",
             ".dsw-ogu-dot[data-tone=warn]{background:var(--dsw-alias-state-warn-primary, #f59e0b)}",
             ".dsw-ogu-dot[data-tone=error]{background:var(--dsw-alias-state-error-primary, #ef4444)}",
-            ".dsw-ogu-panel{position:absolute;top:calc(100% + 6px);right:0;z-index:60;width:max-content;",
+            ".dsw-ogu-panel{position:absolute;bottom:calc(100% + 6px);right:0;z-index:60;width:max-content;max-height:min(60vh, 420px);overflow:auto;",
             "max-width:min(620px, calc(100vw - 32px));padding:12px 14px;border-radius:12px;",
             "border:1px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));",
             "background:var(--dsw-specific-menu, var(--dsw-alias-bg-layer-3, #353638));pointer-events:auto;-webkit-app-region:no-drag;",
@@ -215,8 +215,8 @@ window.__ModuleLoader__.load({
 
         function apply(ctx) {
             ensureStyles();
-            ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
-                name: "conversation.session.header.actions",
+            ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
+                name: "conversation.input.right",
                 id: "opencode-go-usage",
                 order: 40
             }, OpenCodeUsageAction));

@@ -18,7 +18,7 @@ cd deepseek_plugin
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1
 ```
 
-装完**刷新 DSH 窗口**（`Ctrl+R`；或直接重启 App）。会话头部会出现一个 `GO <月度最高占用>%` 的胶囊，点开是各账号的 5 小时 / 周 / 月占用和重置时间。
+装完**刷新 DSH 窗口**（`Ctrl+R`；或直接重启 App）。输入框那一行（模型选择器旁）会出现一个 `GO <月度最高占用>%` 的胶囊，点开是各账号的 5 小时 / 周 / 月占用和重置时间；面板向上弹出。
 
 - 桌面 harness 默认家目录是 `%APPDATA%\dsh-desktop\harness`；CLI harness 用 `-DshHome "$env:USERPROFILE\.dsh"`。
 - 账号行来自插件配置里的 `refs`（默认 `OPENCODE_API_KEY_1..4`），可以这样指定：
@@ -46,6 +46,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\usage-cli.ps1
 - 端点：`GET https://opencode.ai/zen/go/v1/usage`，用该账号的 API key 鉴权。
 - 官方 Go 文档的额度口径：按月美元额度折算，**5 小时 = 月额度 20%、周 = 50%、月 = 100%**；接口回的是各窗口占用百分比和重置时间。
 - 端点未在公开文档中列出，属于可用但无兼容承诺；返回 404 即失效，改用 OpenCode console 的 usage history。
+
+## 为什么不在会话头部显示
+
+Windows 上 DSH Desktop 使用 `titleBarStyle: hidden` + `titleBarOverlay`，窗口顶部 36 DIP 是标题栏区域，**该带内的点击不会进入网页**。会话头部正好落在这条带里，胶囊放那里只有露在带外的边缘可点。因此插件注册到输入框行（`conversation.input.right`），并用真实鼠标事件验证过可点、面板完整可见。
 
 ## 安全
 
