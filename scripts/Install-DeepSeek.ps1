@@ -42,7 +42,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $DshHome = (Join-Path $env:APPDATA 'dsh-desktop\harness'),
+    [string] $DshHome,
     [ValidateSet('settings', 'profile', 'both')] [string] $Scope = 'settings',
     [string] $ProfileName = 'deepseek',
     [ValidateSet('headless', 'web')] [string] $Surface = 'headless',
@@ -50,6 +50,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($DshHome)) {
+    # DSH Desktop on Windows keeps its harness home under %APPDATA%; on macOS and
+    # Linux both Desktop and the CLI use $HOME/.dsh.
+    $DshHome = if ($env:APPDATA) { Join-Path $env:APPDATA 'dsh-desktop\harness' } else { Join-Path $HOME '.dsh' }
+}
 
 $providerDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'provider\deepseek'
 $settingsTemplate = Join-Path $providerDir 'settings.llm-deepseek.yml'
@@ -65,14 +71,30 @@ function Remove-ReparsePointOrDirectory {
 
     if (-not (Test-Path -LiteralPath $Path)) { return }
     $item = Get-Item -LiteralPath $Path -Force
-    if ($item.LinkType) { cmd /c "rd `"$Path`"" | Out-Null } else { Remove-Item -LiteralPath $Path -Recurse -Force }
+    if ($item.LinkType) {
+        # A junction must be removed without recursing, or its target is deleted too.
+        if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+            cmd /c "rd `"$Path`"" | Out-Null
+        } else {
+            # cmd.exe does not exist off Windows; deleting the link itself leaves the
+            # target alone.
+            [IO.Directory]::Delete($Path, $false)
+        }
+    } else { Remove-Item -LiteralPath $Path -Recurse -Force }
 }
 
 function Resolve-Node {
     $fromPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($fromPath) { return $fromPath.Source }
-    $candidates = @((Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe'))
+    $candidates = @()
+    # Join-Path throws on a null base, and ProgramFiles is unset off Windows.
+    if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
     if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
+    if ($HOME) {
+        # macOS: the Desktop app ships its own node runtime under Application Support.
+        $candidates += (Join-Path $HOME 'Library/Application Support/io.github.hairyf.deepseek-harness-desktop/runtime/bin/node')
+    }
+    $candidates += '/Applications/Deepseek Harness Desktop.app/Contents/Resources/resources/node/bin/node'
     foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate) { return $candidate } }
     return $null
 }
@@ -93,7 +115,7 @@ function Assert-Yaml {
         Write-Warning 'node was not found (PATH or DSH Desktop bundle); skipped the post-write validation'
         return
     }
-    $probePath = Join-Path $env:TEMP 'dsh-deepseek-verify.cjs'
+    $probePath = Join-Path ([IO.Path]::GetTempPath()) 'dsh-deepseek-verify.cjs'
     $probe = @(
         'const fs = require("node:fs");'
         'const yaml = require(process.argv[2]);'

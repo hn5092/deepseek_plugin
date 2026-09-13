@@ -14,10 +14,12 @@
   is backed up and the resulting YAML is parsed before the write is kept.
 
 .PARAMETER DshHome
-  DSH home. Defaults to the DSH Desktop harness home.
+  DSH home. Defaults to the DSH Desktop harness home: %APPDATA%\dsh-desktop\harness on
+  Windows, $HOME/.dsh on macOS and Linux, where Desktop and the CLI share it.
 
 .PARAMETER Profile
-  Profile to patch. Defaults to `web`, the profile the Desktop app boots.
+  Profile to patch. Defaults to the profile that exists: `web` (the Windows Desktop
+  build), else `desktop` (the macOS Desktop build), else the only profile present.
 
 .PARAMETER Ref
   Credential references to sample, one per account row.
@@ -32,8 +34,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $DshHome = (Join-Path $env:APPDATA 'dsh-desktop\harness'),
-    [string] $Profile = 'web',
+    [string] $DshHome,
+    [string] $Profile,
     [string[]] $Ref = @(
         'OPENCODE_API_KEY_1',
         'OPENCODE_API_KEY_2',
@@ -45,9 +47,40 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if ([string]::IsNullOrWhiteSpace($DshHome)) {
+    # DSH Desktop on Windows keeps its harness home under %APPDATA%; on macOS and
+    # Linux both Desktop and the CLI use $HOME/.dsh.
+    $DshHome = if ($env:APPDATA) { Join-Path $env:APPDATA 'dsh-desktop\harness' } else { Join-Path $HOME '.dsh' }
+}
+
 $packageName = 'dsh-opencode-go-usage'
 $rowId = 'opencode-go-usage'
+# As a Skill this script sits next to <skill>/plugin; as a plain checkout the plugin is the
+# dsh-opencode-go-usage folder at the repository root. Take whichever exists.
 $source = Join-Path (Split-Path -Parent $PSScriptRoot) 'plugin'
+if (-not (Test-Path -LiteralPath $source)) {
+    $source = Join-Path (Split-Path -Parent $PSScriptRoot) $packageName
+}
+
+# The profile name is not portable: the Windows Desktop build boots `web`, the macOS
+# Desktop build boots `desktop`, and a CLI-only home may hold either. Pick the profile
+# that exists instead of assuming one.
+if ([string]::IsNullOrWhiteSpace($Profile)) {
+    $profilesRoot = Join-Path $DshHome 'profiles'
+    foreach ($candidate in @('web', 'desktop')) {
+        if (Test-Path -LiteralPath (Join-Path $profilesRoot $candidate)) { $Profile = $candidate; break }
+    }
+    if ([string]::IsNullOrWhiteSpace($Profile) -and (Test-Path -LiteralPath $profilesRoot)) {
+        $found = @(Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'node_modules' })
+        if ($found.Count -eq 1) { $Profile = $found[0].Name }
+    }
+    if ([string]::IsNullOrWhiteSpace($Profile)) {
+        throw "cannot pick a profile under $profilesRoot; pass -Profile"
+    }
+    Write-Host "profile: $Profile"
+}
+
 $profileDir = Join-Path $DshHome "profiles\$Profile"
 $modulesDir = Join-Path $DshHome 'profiles\node_modules'
 $target = Join-Path $modulesDir $packageName
@@ -62,7 +95,13 @@ function Remove-ReparsePointOrDirectory {
     $item = Get-Item -LiteralPath $Path -Force
     if ($item.LinkType) {
         # A junction must be removed without recursing, or its target is deleted too.
-        cmd /c "rd `"$Path`"" | Out-Null
+        if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+            cmd /c "rd `"$Path`"" | Out-Null
+        } else {
+            # cmd.exe does not exist off Windows; deleting the link itself leaves the
+            # target alone.
+            [IO.Directory]::Delete($Path, $false)
+        }
     } else {
         Remove-Item -LiteralPath $Path -Recurse -Force
     }
@@ -115,6 +154,17 @@ $block = @(
 $existing = if (Test-Path -LiteralPath $patchPath) { [IO.File]::ReadAllText($patchPath) } else { '' }
 $managed = "(?ms)^\s*" + [regex]::Escape($beginMarker) + ".*?" + [regex]::Escape($endMarker) + "\r?$"
 $blockText = ($block -join "`n").TrimStart("`n")
+
+# A profile that still ships the default `[]` placeholder must have that line replaced,
+# not appended after: `[]` followed by a sequence item is not valid YAML, so the parse
+# below would reject the file and the write would be rolled back. Comments are kept.
+$effective = (($existing -split "`r?`n") |
+    ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
+    Where-Object { $_ }) -join ''
+if ($effective -eq '[]' -or $effective -eq '') {
+    $existing = [regex]::Replace($existing, '(?m)^\s*\[\s*\]\s*\r?\n?', '')
+}
+
 if ([regex]::IsMatch($existing, $managed)) {
     $updated = [regex]::Replace($existing, $managed, $blockText)
 } else {
@@ -139,15 +189,22 @@ if (Test-Path -LiteralPath $yamlModule) {
         'if (!rows.includes("opencode-go-usage")) { console.error("row missing after write"); process.exit(2); }'
     )
     $probe = $probeLines -join "`n"
-    $probePath = Join-Path $env:TEMP 'ocg-verify-patch.cjs'
+    $probePath = Join-Path ([IO.Path]::GetTempPath()) 'ocg-verify-patch.cjs'
     [IO.File]::WriteAllText($probePath, $probe, [Text.UTF8Encoding]::new($false))
     # Resolve node for the validation probe: PATH first, then the DSH Desktop bundled runtime.
     $nodeExe = $null
     $fromPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($fromPath) { $nodeExe = $fromPath.Source }
     if (-not $nodeExe) {
-        $candidates = @((Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe'))
+        $candidates = @()
+        # Join-Path throws on a null base, and ProgramFiles is unset off Windows.
+        if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
         if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
+        if ($HOME) {
+            # macOS: the Desktop app ships its own node runtime under Application Support.
+            $candidates += (Join-Path $HOME 'Library/Application Support/io.github.hairyf.deepseek-harness-desktop/runtime/bin/node')
+        }
+        $candidates += '/Applications/Deepseek Harness Desktop.app/Contents/Resources/resources/node/bin/node'
         foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate) { $nodeExe = $candidate; break } }
     }
     if (-not $nodeExe) {

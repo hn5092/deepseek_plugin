@@ -19,7 +19,8 @@
   stay in the DSH credential store (or the matching environment variables).
 
 .PARAMETER DshHome
-  DSH home. Defaults to the DSH Desktop harness home; pass "$env:USERPROFILE\.dsh" for the CLI harness.
+  DSH home. Defaults to the DSH Desktop harness home: %APPDATA%\dsh-desktop\harness on
+  Windows, $HOME/.dsh on macOS and Linux, where Desktop and the CLI share it.
 
 .PARAMETER Client
   Client tag used for x-opencode-session and the user agent, in place of __CLIENT__ in the
@@ -44,7 +45,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $DshHome = (Join-Path $env:APPDATA 'dsh-desktop\harness'),
+    [string] $DshHome,
     [string] $Client = 'dsh-opencode-go',
     [string[]] $Ref = @('OPENCODE_API_KEY_1', 'OPENCODE_API_KEY_2', 'OPENCODE_API_KEY_3', 'OPENCODE_API_KEY_4', 'OPENCODE_API_KEY_5'),
     [string] $DefaultRoute = 'opencode-go-2',
@@ -55,6 +56,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($DshHome)) {
+    # DSH Desktop on Windows keeps its harness home under %APPDATA%; on macOS and
+    # Linux both Desktop and the CLI use $HOME/.dsh.
+    $DshHome = if ($env:APPDATA) { Join-Path $env:APPDATA 'dsh-desktop\harness' } else { Join-Path $HOME '.dsh' }
+}
 
 $template = Join-Path (Split-Path -Parent $PSScriptRoot) 'provider\opencode-go\settings.llm-pi-ai.yml'
 $defaultTemplate = Join-Path (Split-Path -Parent $PSScriptRoot) 'provider\opencode-go\settings.agent-default-model.yml'
@@ -147,12 +154,19 @@ $nodeExe = $null
 $fromPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($fromPath) { $nodeExe = $fromPath.Source }
 if (-not $nodeExe) {
-    $candidates = @((Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe'))
+    $candidates = @()
+    # Join-Path throws on a null base, and ProgramFiles is unset off Windows.
+    if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
     if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
+    if ($HOME) {
+        # macOS: the Desktop app ships its own node runtime under Application Support.
+        $candidates += (Join-Path $HOME 'Library/Application Support/io.github.hairyf.deepseek-harness-desktop/runtime/bin/node')
+    }
+    $candidates += '/Applications/Deepseek Harness Desktop.app/Contents/Resources/resources/node/bin/node'
     foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate) { $nodeExe = $candidate; break } }
 }
 if ((Test-Path -LiteralPath $yamlModule) -and $nodeExe) {
-    $probePath = Join-Path $env:TEMP 'dsh-opencode-go-verify.cjs'
+    $probePath = Join-Path ([IO.Path]::GetTempPath()) 'dsh-opencode-go-verify.cjs'
     $probe = @(
         'const fs = require("node:fs");'
         'const yaml = require(process.argv[2]);'
@@ -175,7 +189,7 @@ if ((Test-Path -LiteralPath $yamlModule) -and $nodeExe) {
         'console.log("validated routes:", routes.join(", "));'
     )
     [IO.File]::WriteAllText($probePath, ($probe -join "`n"), [Text.UTF8Encoding]::new($false))
-    $refFile = Join-Path $env:TEMP 'dsh-opencode-go-refs.txt'
+    $refFile = Join-Path ([IO.Path]::GetTempPath()) 'dsh-opencode-go-refs.txt'
     [IO.File]::WriteAllText($refFile, (($refs -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
     & $nodeExe $probePath $yamlModule $settingsPath $refFile $ReasoningEffort
     $code = $LASTEXITCODE

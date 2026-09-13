@@ -12,25 +12,35 @@
 
 .PARAMETER CredentialFile
   One or more .credentials.yaml paths. Defaults to the DSH desktop harness home and the
-  DSH CLI home (%USERPROFILE%\.dsh).
+  DSH CLI home: %APPDATA%\dsh-desktop\harness plus %USERPROFILE%\.dsh on Windows, and
+  $HOME/.dsh on macOS and Linux, where Desktop and the CLI share one home.
 
 .PARAMETER TimeoutSec
   Per-request timeout, default 15.
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File usage.ps1
+.EXAMPLE
+  pwsh -File scripts/usage-cli.ps1
 #>
 [CmdletBinding()]
 param(
-    [string[]] $CredentialFile = @(
-        (Join-Path $env:APPDATA 'dsh-desktop\harness\.credentials.yaml'),
-        (Join-Path $env:USERPROFILE '.dsh\.credentials.yaml')
-    ),
+    [string[]] $CredentialFile,
     [ValidateRange(3, 120)] [int] $TimeoutSec = 15
 )
 
 $ErrorActionPreference = 'Stop'
 $endpoint = 'https://opencode.ai/zen/go/v1/usage'
+
+# Resolved after binding: Join-Path throws on a null base, and APPDATA/USERPROFILE are
+# unset off Windows.
+if (-not $CredentialFile -or $CredentialFile.Count -eq 0) {
+    $cliHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { $null }
+    $candidates = @()
+    if ($env:APPDATA) { $candidates += (Join-Path $env:APPDATA 'dsh-desktop\harness\.credentials.yaml') }
+    if ($cliHome) { $candidates += (Join-Path $cliHome '.dsh\.credentials.yaml') }
+    $CredentialFile = @($candidates)
+}
 
 function Get-Refs {
     param([string] $Path)
