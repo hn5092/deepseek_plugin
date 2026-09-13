@@ -1,0 +1,36 @@
+{
+  "name": "dsh-opencode-go-usage",
+  "version": "0.1.0",
+  "description": "DSH Web UI surface for OpenCode Go per-account usage (5-hour / weekly / monthly windows)",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hn5092/deepseek_plugin.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "opencode-go",
+    "usage",
+    "plugin"
+  ],
+  "license": "MIT"
+}

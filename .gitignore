@@ -1,0 +1,4 @@
+# DSH 安装产物 / 备份
+node_modules/
+*.bak-*
+*.log
