@@ -25,6 +25,13 @@ export const Config = z.object({
      */
     routes: z.array(z.string()).default([]),
     routePrefix: z.string().default("opencode-go"),
+    /**
+     * Also look for `<autoRefPrefix><n>` for n = 1..autoRefMax and report every one that
+     * resolves, so a key added to the credential store shows up without editing this list.
+     * Set autoRefMax to 0 to sample `refs` only.
+     */
+    autoRefPrefix: z.string().default("OPENCODE_API_KEY_"),
+    autoRefMax: z.number().step(1).min(0).default(8),
     /** Exact route the browser half reads. Changing it also means changing lib/client.js. */
     path: z.string().default("/opencode-go-usage"),
     endpoint: z.string().default("https://opencode.ai/zen/go/v1/usage"),
@@ -55,6 +62,37 @@ function windowOf(value) {
  * Resolve one credential reference and read its usage windows. Failures stay on the
  * row so one bad key never blanks the panel.
  */
+/** Trailing number of a reference, else its position; used to name the matching route. */
+function routeNumber(ref, index) {
+    const match = /(\d+)\s*$/.exec(ref);
+    return match ? match[1] : String(index + 1);
+}
+
+/**
+ * Configured references plus every `<autoRefPrefix><n>` that currently resolves, so adding a
+ * key to the credential store is enough for it to appear. Configured entries keep their order
+ * and stay listed even when their key is missing.
+ */
+async function collectRefs(ctx, config) {
+    const refs = [...config.refs];
+    const seen = new Set(refs);
+    const max = config.autoRefMax ?? 0;
+    if (!config.autoRefPrefix || max <= 0) return refs;
+    for (let index = 1; index <= max; index++) {
+        const ref = config.autoRefPrefix + index;
+        if (seen.has(ref)) continue;
+        try {
+            const hit = await ctx.credentials.resolve(credentialRef(ref));
+            if (hit && typeof hit.value === "string" && hit.value.length > 0) {
+                refs.push(ref);
+                seen.add(ref);
+            }
+        } catch {
+            // An unresolvable probe is simply not an account.
+        }
+    }
+    return refs;
+}
 async function readAccount(ctx, ref, config, route) {
     const row = { account: ref, route: route ?? null, key: null, rolling: null, weekly: null, monthly: null, error: null };
     let key;
@@ -97,8 +135,10 @@ export function apply(ctx, config) {
 
     const snapshot = async () => {
         if (cache.payload !== null && Date.now() - cache.at < config.cacheMs) return cache.payload;
-        const routes = config.refs.map((_, index) => config.routes[index] ?? (config.routePrefix ? `${config.routePrefix}-${index + 1}` : null));
-        const accounts = await Promise.all(config.refs.map((ref, index) => readAccount(ctx, ref, config, routes[index])));
+        const refs = await collectRefs(ctx, config);
+        const routes = refs.map((ref, index) => config.routes[index]
+            ?? (config.routePrefix ? `${config.routePrefix}-${routeNumber(ref, index)}` : null));
+        const accounts = await Promise.all(refs.map((ref, index) => readAccount(ctx, ref, config, routes[index])));
         const payload = { sampledAt: new Date().toISOString(), accounts };
         cache = { at: Date.now(), payload };
         return payload;

@@ -1,72 +1,59 @@
 <#
 .SYNOPSIS
-  Install (or remove) a DSH plugin package from this repository into a DSH profile.
+  Install (or remove) the OpenCode Go usage UI plugin in a DSH profile.
 
 .DESCRIPTION
-  Copies <PluginDir> into <DshHome>\profiles\node_modules\<package name> and writes one
-  managed row into <DshHome>\profiles\<ProfileName>\cordis.patch.yml, which is what makes
-  the DSH Loader load the plugin and the Web client pick up its browser half.
+  The plugin source lives in this Skill at ../plugin and is installed as the package
+  `dsh-opencode-go-usage` under <Home>\profiles\node_modules plus one managed row in the
+  profile patch layer <Home>\profiles\<Profile>\cordis.patch.yml. The DSH Web client then
+  shows a `GO <月度最大占用>%` chip in the conversation header; clicking it opens the
+  per-account 5-hour / weekly / monthly table.
 
-  The patch file is backed up before every write, and the result is parsed with the
-  harness's own YAML parser; a failed parse restores the backup. Re-running the script
-  updates the managed row in place instead of appending a second one. A pre-existing row
-  for the same package that this script did not write is refused, so a stale copy must be
-  removed first (its installer's -Uninstall, or by hand).
+  The copy under profiles\node_modules is the installed artifact; ../plugin stays the
+  single source of truth, so re-run this script after editing the plugin. The patch file
+  is backed up and the resulting YAML is parsed before the write is kept.
 
 .PARAMETER DshHome
-  DSH home. Defaults to the DSH Desktop harness home; pass "$env:USERPROFILE\.dsh" for the CLI harness.
+  DSH home. Defaults to the DSH Desktop harness home.
 
-.PARAMETER ProfileName
+.PARAMETER Profile
   Profile to patch. Defaults to `web`, the profile the Desktop app boots.
 
-.PARAMETER PluginDir
-  Plugin package directory. Defaults to `dsh-opencode-go-usage` at this repository's root.
-
 .PARAMETER Ref
-  Optional credential references to sample, one per account row of the usage plugin.
-  Omitted, the plugin's own defaults apply. Accepts `-Ref a,b` and `-Ref a b`.
+  Credential references to sample, one per account row.
 
 .PARAMETER Uninstall
-  Remove the managed row and the installed copy.
+  Remove the managed patch block and the installed copy.
 
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File Install-UiPlugin.ps1
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1 -Ref OPENCODE_API_KEY_1,OPENCODE_API_KEY_2
-.EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1 -Uninstall
+  powershell -NoProfile -ExecutionPolicy Bypass -File Install-UiPlugin.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
     [string] $DshHome = (Join-Path $env:APPDATA 'dsh-desktop\harness'),
-    [string] $ProfileName = 'web',
-    [string] $PluginDir,
-    [string[]] $Ref,
+    [string] $Profile = 'web',
+    [string[]] $Ref = @(
+        'OPENCODE_API_KEY_1',
+        'OPENCODE_API_KEY_2',
+        'OPENCODE_API_KEY_3',
+        'OPENCODE_API_KEY_4'
+    ),
     [switch] $Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
 
-# $PSScriptRoot is not available while parameters bind, so the default is resolved here.
-if ([string]::IsNullOrWhiteSpace($PluginDir)) {
-    $PluginDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'dsh-opencode-go-usage'
-}
-# `-File script.ps1 -Ref a,b` binds one string, so split commas here.
-$refs = @($Ref | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-
-if (-not (Test-Path -LiteralPath $PluginDir)) { throw "plugin directory not found: $PluginDir" }
-$manifestPath = Join-Path $PluginDir 'package.json'
-if (-not (Test-Path -LiteralPath $manifestPath)) { throw "package.json not found in: $PluginDir" }
-$manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$packageName = [string]$manifest.name
-if ([string]::IsNullOrWhiteSpace($packageName)) { throw "package.json has no name: $manifestPath" }
-
-$profileDir = Join-Path $DshHome "profiles\$ProfileName"
+$packageName = 'dsh-opencode-go-usage'
+$rowId = 'opencode-go-usage'
+$source = Join-Path (Split-Path -Parent $PSScriptRoot) 'plugin'
+$profileDir = Join-Path $DshHome "profiles\$Profile"
 $modulesDir = Join-Path $DshHome 'profiles\node_modules'
 $target = Join-Path $modulesDir $packageName
 $patchPath = Join-Path $profileDir 'cordis.patch.yml'
-$beginMarker = "# >>> dsh-plugin: $packageName"
-$endMarker = "# <<< dsh-plugin: $packageName"
+$beginMarker = '# >>> opencode-go-usage UI plugin'
+$endMarker = '# <<< opencode-go-usage UI plugin'
 
 function Remove-ReparsePointOrDirectory {
     param([string] $Path)
@@ -81,37 +68,85 @@ function Remove-ReparsePointOrDirectory {
     }
 }
 
-function Write-PatchFile {
-    param([string] $Text)
+if (-not (Test-Path -LiteralPath $profileDir)) { throw "profile not found: $profileDir" }
 
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if ($Uninstall) {
+    Remove-ReparsePointOrDirectory -Path $target
     if (Test-Path -LiteralPath $patchPath) {
-        Copy-Item -LiteralPath $patchPath -Destination "$patchPath.bak-$stamp" -Force
+        $text = [IO.File]::ReadAllText($patchPath)
+        $pattern = "(?ms)^\s*" + [regex]::Escape($beginMarker) + ".*?" + [regex]::Escape($endMarker) + "\r?\n?"
+        if ([regex]::IsMatch($text, $pattern)) {
+            $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            Copy-Item -LiteralPath $patchPath -Destination "$patchPath.bak-$stamp" -Force
+            [IO.File]::WriteAllText($patchPath, ([regex]::Replace($text, $pattern, '').TrimEnd() + "`n"), [Text.UTF8Encoding]::new($false))
+            Write-Host "removed the profile patch row (backup: cordis.patch.yml.bak-$stamp)"
+        } else {
+            Write-Warning "no managed patch block found in $patchPath"
+        }
     }
-    [IO.File]::WriteAllText($patchPath, ($Text.TrimEnd() + "`n"), [Text.UTF8Encoding]::new($false))
+    Write-Host "uninstalled $packageName"
+    return
+}
 
-    $yamlModule = Join-Path $modulesDir 'yaml'
-    if (-not (Test-Path -LiteralPath $yamlModule)) {
-        Write-Warning "yaml parser not found at $yamlModule; skipped the post-write validation"
-        return
-    }
+# `-File script.ps1 -Ref a,b` binds one string, so split commas here.
+$refs = @($Ref | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+if (-not (Test-Path -LiteralPath $source)) { throw "plugin source not found: $source" }
+
+# 1) Installed copy: the artifact DSH resolves from the profile.
+Remove-ReparsePointOrDirectory -Path $target
+Copy-Item -LiteralPath $source -Destination $target -Recurse -Force
+$fileCount = (Get-ChildItem -LiteralPath $target -Recurse -File | Measure-Object).Count
+Write-Host "installed $packageName -> $target ($fileCount files)"
+
+# 2) Managed profile patch block, delimited so uninstall finds exactly what was written.
+$block = @(
+    ''
+    '# >>> opencode-go-usage UI plugin (managed by .agents/skills/opencode-go-usage/scripts/Install-UiPlugin.ps1)'
+    '- insert:'
+    "    - id: $rowId"
+    "      name: '$packageName'"
+    '      config:'
+    '        refs:'
+) + ($refs | ForEach-Object { "          - $_" }) + @(
+    '# <<< opencode-go-usage UI plugin'
+)
+
+$existing = if (Test-Path -LiteralPath $patchPath) { [IO.File]::ReadAllText($patchPath) } else { '' }
+$managed = "(?ms)^\s*" + [regex]::Escape($beginMarker) + ".*?" + [regex]::Escape($endMarker) + "\r?$"
+$blockText = ($block -join "`n").TrimStart("`n")
+if ([regex]::IsMatch($existing, $managed)) {
+    $updated = [regex]::Replace($existing, $managed, $blockText)
+} else {
+    $trimmed = $existing.TrimEnd()
+    $updated = $(if ($trimmed.Length -gt 0) { $trimmed + "`n`n" } else { '' }) + $blockText
+}
+
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if (Test-Path -LiteralPath $patchPath) { Copy-Item -LiteralPath $patchPath -Destination "$patchPath.bak-$stamp" -Force }
+[IO.File]::WriteAllText($patchPath, ($updated.TrimEnd() + "`n"), [Text.UTF8Encoding]::new($false))
+
+# 3) Parse the written YAML with the harness parser before trusting the write.
+$yamlModule = Join-Path $modulesDir 'yaml'
+if (Test-Path -LiteralPath $yamlModule) {
     $probeLines = @(
         'const fs = require("node:fs");'
         'const yaml = require(process.argv[2]);'
         'const document = yaml.parse(fs.readFileSync(process.argv[3], "utf8"));'
-        'if (document !== null && document !== undefined && !Array.isArray(document)) { console.error("patch file is not a YAML list"); process.exit(2); }'
-        'console.log("patch rows:", document === null || document === undefined ? 0 : document.length);'
+        'const rows = [];'
+        'for (const entry of document) for (const row of (entry.insert || [])) rows.push(row.id);'
+        'console.log("parsed rows:", rows.join(", "));'
+        'if (!rows.includes("opencode-go-usage")) { console.error("row missing after write"); process.exit(2); }'
     )
-    $probePath = Join-Path $env:TEMP 'dsh-plugin-patch-verify.cjs'
-    [IO.File]::WriteAllText($probePath, ($probeLines -join "`n"), [Text.UTF8Encoding]::new($false))
+    $probe = $probeLines -join "`n"
+    $probePath = Join-Path $env:TEMP 'ocg-verify-patch.cjs'
+    [IO.File]::WriteAllText($probePath, $probe, [Text.UTF8Encoding]::new($false))
     # Resolve node for the validation probe: PATH first, then the DSH Desktop bundled runtime.
     $nodeExe = $null
     $fromPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($fromPath) { $nodeExe = $fromPath.Source }
     if (-not $nodeExe) {
-        $candidates = @(
-            (Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe')
-        )
+        $candidates = @((Join-Path $env:ProgramFiles 'DSH Desktop\resources\app\node_modules\node\bin\node.exe'))
         if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} 'DSH Desktop\resources\app\node_modules\node\bin\node.exe') }
         foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate) { $nodeExe = $candidate; break } }
     }
@@ -126,57 +161,9 @@ function Write-PatchFile {
         Copy-Item -LiteralPath "$patchPath.bak-$stamp" -Destination $patchPath -Force
         throw 'the patched profile file did not parse; the backup was restored'
     }
-    Write-Host "patched $patchPath (backup: cordis.patch.yml.bak-$stamp)"
-}
-
-if (-not (Test-Path -LiteralPath $profileDir)) { throw "profile not found: $profileDir (pass -DshHome / -ProfileName)" }
-
-$existing = if (Test-Path -LiteralPath $patchPath) { [IO.File]::ReadAllText($patchPath) } else { '' }
-$managedPattern = '(?ms)^\s*' + [regex]::Escape($beginMarker) + '.*?' + [regex]::Escape($endMarker) + '\r?\n?'
-
-if ($Uninstall) {
-    Remove-ReparsePointOrDirectory -Path $target
-    if ([regex]::IsMatch($existing, $managedPattern)) {
-        Write-PatchFile -Text ([regex]::Replace($existing, $managedPattern, ''))
-    } else {
-        Write-Warning "no managed row for $packageName in $patchPath; only the installed copy was removed"
-    }
-    Write-Host "uninstalled $packageName"
-    return
-}
-
-# Refuse an unmanaged row for the same package: two rows would load the plugin twice.
-if (-not [regex]::IsMatch($existing, $managedPattern)) {
-    $unmanaged = '(?m)^\s*name:\s*' + [regex]::Escape("'$packageName'") + '\s*$'
-    if ([regex]::IsMatch($existing, $unmanaged)) {
-        throw "an unmanaged row for $packageName already exists in $patchPath; remove it (or run the installer that wrote it with -Uninstall) before installing from this repository"
-    }
-}
-
-Remove-ReparsePointOrDirectory -Path $target
-Copy-Item -LiteralPath $PluginDir -Destination $target -Recurse -Force
-$fileCount = (Get-ChildItem -LiteralPath $target -Recurse -File | Measure-Object).Count
-Write-Host "installed $packageName -> $target ($fileCount files)"
-
-$block = @(
-    ''
-    "$beginMarker (managed by scripts/Install-DshPlugin.ps1)"
-    '- insert:'
-    "    - id: $packageName"
-    "      name: '$packageName'"
-)
-if ($refs.Count -gt 0) {
-    $block += @('      config:') + @('        refs:') + ($refs | ForEach-Object { "          - $_" })
-}
-$block += @($endMarker)
-$blockText = ($block -join "`n").TrimStart("`n")
-
-if ([regex]::IsMatch($existing, $managedPattern)) {
-    Write-PatchFile -Text ([regex]::Replace($existing, $managedPattern, $blockText))
 } else {
-    $trimmed = $existing.TrimEnd()
-    $prefix = if ($trimmed.Length -gt 0) { $trimmed + "`n`n" } else { '' }
-    Write-PatchFile -Text ($prefix + $blockText)
+    Write-Warning "yaml parser not found at $yamlModule; skipped the post-write validation"
 }
 
-Write-Host 'Reload the DSH window (or restart the app) if the plugin surface does not appear; profile patches usually reload live.'
+Write-Host "patched $patchPath (backup: cordis.patch.yml.bak-$stamp)"
+Write-Host 'The GO chip sits in the composer row next to the model picker; press Ctrl+R in the DSH window if it does not appear (Ctrl+Shift+R restarts the harness instead).'
