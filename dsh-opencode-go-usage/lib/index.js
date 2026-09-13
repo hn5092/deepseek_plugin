@@ -42,7 +42,7 @@ export const Config = z.object({
     sampleEveryMs: z.number().step(1).min(0).default(1800000),
     /** Bounded history kept for the trend column and for trend questions. */
     historyMax: z.number().step(1).min(0).default(96),
-    /** JSONL history file; empty uses %LOCALAPPDATA%\opencode-go-usage\history.jsonl. */
+    /** JSONL history file; empty uses the per-user state directory (see stateDir). */
     historyPath: z.string().default(""),
     /** Reuse one upstream snapshot for this long; the browser polls every 30s. */
     cacheMs: z.number().step(1).min(0).default(30000),
@@ -71,11 +71,25 @@ function windowOf(value) {
  * Resolve one credential reference and read its usage windows. Failures stay on the
  * row so one bad key never blanks the panel.
  */
-/** Resolved history file: configured path, else the LocalAppData folder beside the old log. */
+/**
+ * Writable state directory for the history log: %LOCALAPPDATA% on Windows,
+ * ~/Library/Application Support on macOS, $XDG_STATE_HOME (else ~/.local/state) elsewhere.
+ * The temp directory is only the last resort - the OS clears it, which would silently drop
+ * the trend the Δ column is computed from.
+ */
+function stateDir() {
+    if (process.env.LOCALAPPDATA) return process.env.LOCALAPPDATA;
+    const home = os.homedir();
+    if (process.platform === "darwin" && home) return path.join(home, "Library", "Application Support");
+    if (process.env.XDG_STATE_HOME) return process.env.XDG_STATE_HOME;
+    if (home) return path.join(home, ".local", "state");
+    return os.tmpdir();
+}
+
+/** Resolved history file: configured path, else the per-user state directory. */
 function historyFile(config) {
     if (config.historyPath) return config.historyPath;
-    const base = process.env.LOCALAPPDATA || os.tmpdir();
-    return path.join(base, "opencode-go-usage", "history.jsonl");
+    return path.join(stateDir(), "opencode-go-usage", "history.jsonl");
 }
 
 /** One compact history line: the windows only, no credentials, no key material. */
