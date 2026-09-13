@@ -1,6 +1,6 @@
 # dsh-opencode-go-usage
 
-DSH 插件：输入框那一行（模型选择器旁）一个 `GO <月度最高占用>%` 胶囊，点开显示各账号的 5 小时 / 周 / 月额度占用与重置时间，30 秒刷新一次。
+DSH 插件：输入框那一行（模型选择器旁）一个胶囊，**跟随当前会话选中的 provider 账号**显示它的周/月占用（例如选中模型选择器里的 `2` 就显示 `GO 2 · 周 34% · 月 17%`）；点开是全部账号的表（`▸` 标出在用账号），30 秒刷新一次。
 
 ## 结构
 
@@ -24,12 +24,12 @@ lib/client.js         # 浏览器：往 conversation.input.right 注册胶囊+�
    "error":null}]}
 ```
 
-- 配置（Schemastery，`Config`）：`refs`（要采样的凭据引用，默认 `OPENCODE_API_KEY_1..4`）、`path`、`endpoint`、`cacheMs`（默认 30000）、`timeoutMs`（默认 15000）。
+- 配置（Schemastery，`Config`）：`refs`（要采样的凭据引用，默认 `OPENCODE_API_KEY_1..4`）、`routes`（与 `refs` 对齐的路由名，例如 `opencode-go-1`；省略则按 `routePrefix` 推导）、`routePrefix`（默认 `opencode-go`，置空则不推导）、`path`、`endpoint`、`cacheMs`（默认 30000）、`timeoutMs`（默认 15000）。
 - 单个账号失败只体现在该行的 `error` 上，不会让整块面板空白；缺凭据是 `missing credential`。
 
 ## 浏览器侧
 
-- 只依赖客户端服务 `slots`，注册到 `conversation.input.right`（`order: 40`）；面板向上弹出（`bottom: calc(100% + 6px)`）并限高滚动。
+- 胶囊读会话投影 `modelSelection.lastUsed.provider`（插槽传来 `sessionId`/`useSessions`）来挑选账号；宿主没给 `route` 时按引用名尾号推导，匹配不到就回退显示全部账号最高值。（`order: 40`）；面板向上弹出（`bottom: calc(100% + 6px)`）并限高滚动。
 - 不放会话头部的原因见根 README「为什么不在会话头部显示」：Windows 标题栏覆盖层会吞掉顶部 36 DIP 的点击。
 - 样式走 DSH 的主题变量（`--dsw-specific-menu`、`--dsw-alias-label-*`、`--dsw-alias-state-warn-*` 等），自动跟随浅色/深色主题；≥80% 的窗口标黄。
 - 点击目标做了三处加固：胶囊本身 28px 高并加大内边距、`z-index:2` 抬到同级之上、`::after` 上下各外扩 4px 命中区，同时 `-webkit-app-region:no-drag` 让它在 Electron 里不被拖拽区吞掉点击。

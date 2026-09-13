@@ -18,6 +18,13 @@ export const Config = z.object({
         "OPENCODE_API_KEY_3",
         "OPENCODE_API_KEY_4"
     ]),
+    /**
+     * Provider route names aligned with `refs`, so the browser half can match the account a
+     * session has selected (pi-ai routes live in llm-pi-ai.providers). Omitted entries fall
+     * back to `<routePrefix>-<index>`; set routePrefix empty to disable route matching.
+     */
+    routes: z.array(z.string()).default([]),
+    routePrefix: z.string().default("opencode-go"),
     /** Exact route the browser half reads. Changing it also means changing lib/client.js. */
     path: z.string().default("/opencode-go-usage"),
     endpoint: z.string().default("https://opencode.ai/zen/go/v1/usage"),
@@ -48,8 +55,8 @@ function windowOf(value) {
  * Resolve one credential reference and read its usage windows. Failures stay on the
  * row so one bad key never blanks the panel.
  */
-async function readAccount(ctx, ref, config) {
-    const row = { account: ref, key: null, rolling: null, weekly: null, monthly: null, error: null };
+async function readAccount(ctx, ref, config, route) {
+    const row = { account: ref, route: route ?? null, key: null, rolling: null, weekly: null, monthly: null, error: null };
     let key;
     try {
         const hit = await ctx.credentials.resolve(credentialRef(ref));
@@ -90,7 +97,8 @@ export function apply(ctx, config) {
 
     const snapshot = async () => {
         if (cache.payload !== null && Date.now() - cache.at < config.cacheMs) return cache.payload;
-        const accounts = await Promise.all(config.refs.map((ref) => readAccount(ctx, ref, config)));
+        const routes = config.refs.map((_, index) => config.routes[index] ?? (config.routePrefix ? `${config.routePrefix}-${index + 1}` : null));
+        const accounts = await Promise.all(config.refs.map((ref, index) => readAccount(ctx, ref, config, routes[index])));
         const payload = { sampledAt: new Date().toISOString(), accounts };
         cache = { at: Date.now(), payload };
         return payload;

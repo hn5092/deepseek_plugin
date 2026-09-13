@@ -1,0 +1,206 @@
+# OpenCode Go: five parallel routes over one subscription, one credential
+# reference per route so the whole set can be replayed after the app rewrites
+# settings.yaml. __CLIENT__ is replaced by the installer (-Client) and keeps each
+# route's x-opencode-session stable and distinct; it is not a secret.
+llm-pi-ai:
+  providers:
+    opencode-go-1:
+      displayName: "1"
+      apiKeyEnv: OPENCODE_API_KEY_1
+      api: openai-completions
+      baseURL: https://opencode.ai/zen/go/v1
+      headers:
+        x-opencode-session: __CLIENT__-1
+        user-agent: __CLIENT__-1/1.0
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 65536
+      defaultInput:
+        - text
+      compat:
+        supportsStore: false
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        requiresReasoningContentOnAssistantMessages: true
+        thinkingFormat: deepseek
+      models:
+        - id: deepseek-v4.1-flash
+          name: DeepSeek V4.1 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
+        - id: deepseek-v4.1-pro
+          name: DeepSeek V4.1 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            high: high
+            max: max
+    opencode-go-2:
+      displayName: "2"
+      apiKeyEnv: OPENCODE_API_KEY_2
+      api: openai-completions
+      baseURL: https://opencode.ai/zen/go/v1
+      headers:
+        x-opencode-session: __CLIENT__-2
+        user-agent: __CLIENT__-2/1.0
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 65536
+      defaultInput:
+        - text
+      compat:
+        supportsStore: false
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        requiresReasoningContentOnAssistantMessages: true
+        thinkingFormat: deepseek
+      models:
+        - id: deepseek-v4.1-flash
+          name: DeepSeek V4.1 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
+        - id: deepseek-v4.1-pro
+          name: DeepSeek V4.1 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            high: high
+            max: max
+    opencode-go-3:
+      displayName: "3"
+      apiKeyEnv: OPENCODE_API_KEY_3
+      api: openai-completions
+      baseURL: https://opencode.ai/zen/go/v1
+      headers:
+        x-opencode-session: __CLIENT__-3
+        user-agent: __CLIENT__-3/1.0
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 65536
+      defaultInput:
+        - text
+      compat:
+        supportsStore: false
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        requiresReasoningContentOnAssistantMessages: true
+        thinkingFormat: deepseek
+      models:
+        - id: deepseek-v4.1-flash
+          name: DeepSeek V4.1 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
+        - id: deepseek-v4.1-pro
+          name: DeepSeek V4.1 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            high: high
+            max: max
+    opencode-go-4:
+      displayName: "4"
+      apiKeyEnv: OPENCODE_API_KEY_4
+      api: openai-completions
+      baseURL: https://opencode.ai/zen/go/v1
+      headers:
+        x-opencode-session: __CLIENT__-4
+        user-agent: __CLIENT__-4/1.0
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 65536
+      defaultInput:
+        - text
+      compat:
+        supportsStore: false
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        requiresReasoningContentOnAssistantMessages: true
+        thinkingFormat: deepseek
+      models:
+        - id: deepseek-v4.1-flash
+          name: DeepSeek V4.1 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
+        - id: deepseek-v4.1-pro
+          name: DeepSeek V4.1 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            high: high
+            max: max
+    opencode-go-5:
+      displayName: "5"
+      apiKeyEnv: OPENCODE_API_KEY_5
+      api: openai-completions
+      baseURL: https://opencode.ai/zen/go/v1
+      headers:
+        x-opencode-session: __CLIENT__-5
+        user-agent: __CLIENT__-5/1.0
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 65536
+      defaultInput:
+        - text
+      compat:
+        supportsStore: false
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        requiresReasoningContentOnAssistantMessages: true
+        thinkingFormat: deepseek
+      models:
+        - id: deepseek-v4.1-flash
+          name: DeepSeek V4.1 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
+        - id: deepseek-v4.1-pro
+          name: DeepSeek V4.1 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            high: high
+            max: max

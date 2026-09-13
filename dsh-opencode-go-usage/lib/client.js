@@ -18,6 +18,8 @@ window.__ModuleLoader__.load({
          * confirmed geometrically on the capture phase instead of trusting the event target.
          */
         const HIT_PAD = 6;
+        /** Route prefix used when a row carries no explicit route (see routeOf). */
+        const ROUTE_PREFIX = "opencode-go";
         /** Percent at or above which a window is called out in the warning color. */
         const WARN_PERCENT = 80;
 
@@ -50,6 +52,8 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-table td{color:var(--dsw-alias-label-secondary, inherit);text-align:right;padding:4px 8px;white-space:nowrap}",
             ".dsw-ogu-table td:first-child{color:var(--dsw-alias-label-primary, inherit)}",
             ".dsw-ogu-table td[data-warn=true]{color:var(--dsw-alias-state-warn-label, #f59e0b);font-weight:600}",
+            ".dsw-ogu-table tr[data-active=true] td{background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.08))}",
+            ".dsw-ogu-table tr[data-active=true] td:first-child{font-weight:600}",
             ".dsw-ogu-meta{margin-top:8px;color:var(--dsw-alias-label-caption, inherit);font-size:11px}",
             ".dsw-ogu-error{margin-top:6px;color:var(--dsw-alias-state-error-primary, #ef4444);font-size:11px;word-break:break-all}"
         ].join("");
@@ -118,9 +122,51 @@ window.__ModuleLoader__.load({
             return h("td", warn ? { "data-warn": "true" } : null, windowText(entry));
         }
 
-        function AccountRows({ accounts }) {
-            const rows = accounts.map((row) => h("tr", { key: row.account },
-                h("td", null, row.account),
+        /** Store reader used when a host surface does not pass the sessions store. */
+        const fallbackUseSessions = () => undefined;
+
+        function worstOf(accounts, window) {
+            let worst = null;
+            for (const row of accounts) {
+                const percent = percentOf(row[window]);
+                if (percent === null) continue;
+                if (worst === null || percent > worst.percent) worst = { percent, account: row.account };
+            }
+            return worst;
+        }
+
+        /**
+         * Route a row belongs to: the host sends `route` explicitly; without it (older host
+         * build, before the next harness restart) the trailing number of the credential
+         * reference is used, which is how this deployment names its routes.
+         */
+        function routeOf(row) {
+            if (row.route) return { route: row.route, derived: false };
+            const match = /(\d+)\s*$/.exec(row.account || "");
+            return match ? { route: ROUTE_PREFIX + "-" + match[1], derived: true } : null;
+        }
+
+        function selectedRoute(accounts, provider) {
+            if (!provider) return null;
+            for (const row of accounts) {
+                const found = routeOf(row);
+                if (found && found.route === provider) return { row: row, route: found.route, derived: found.derived };
+            }
+            return null;
+        }
+
+        /** "opencode-go-2" -> "2"; the model picker labels providers with the same number. */
+        function routeLabel(route) {
+            const match = /(\d+)\s*$/.exec(route || "");
+            return match ? match[1] : route;
+        }
+
+        function AccountRows({ accounts, activeAccount }) {
+            const rows = accounts.map((row) => h("tr", {
+                key: row.account,
+                "data-active": row.account === activeAccount ? "true" : null
+            },
+                h("td", null, (row.account === activeAccount ? "▸ " : "") + row.account),
                 h("td", null, row.key || "—"),
                 percentCell(row.rolling),
                 percentCell(row.weekly),
@@ -142,16 +188,24 @@ window.__ModuleLoader__.load({
             );
         }
 
-        function OpenCodeUsageAction() {
+        function OpenCodeUsageAction({ sessionId, useSessions }) {
             const state = useUsage();
             const [open, setOpen] = react.useState(false);
             const wrapRef = react.useRef(null);
             const swallowedRef = react.useRef(false);
 
+            // The composer surfaces pass the sessions store; without it the chip falls back to
+            // the highest usage across accounts.
+            const readSessions = typeof useSessions === "function" ? useSessions : fallbackUseSessions;
+            const selection = readSessions((store) => (sessionId && store && store.byId
+                ? store.byId[sessionId]?.projectionValues?.modelSelection
+                : undefined));
+            const provider = selection && selection.lastUsed ? selection.lastUsed.provider : null;
+
             const toggle = () => setOpen((value) => !value);
 
-            // Capture-phase hit test: works even when another element in the header sits on
-            // top of the chip, because the decision uses the chip rect, not the event target.
+            // Capture-phase hit test: works even when another element sits on top of the chip,
+            // because the decision uses the chip rect, not the event target.
             react.useEffect(() => {
                 const onDocumentClick = (event) => {
                     const node = wrapRef.current;
@@ -167,27 +221,65 @@ window.__ModuleLoader__.load({
                 document.addEventListener("click", onDocumentClick, true);
                 return () => document.removeEventListener("click", onDocumentClick, true);
             }, []);
-            const accounts = state.payload && Array.isArray(state.payload.accounts) ? state.payload.accounts : [];
 
-            let worst = null;
-            let failed = 0;
-            for (const row of accounts) {
-                if (row.error) failed += 1;
-                const percent = percentOf(row.monthly);
-                if (percent === null) continue;
-                if (worst === null || percent > worst.percent) worst = { percent, account: row.account };
+            const accounts = state.payload && Array.isArray(state.payload.accounts) ? state.payload.accounts : [];
+            const picked = selectedRoute(accounts, provider);
+            const active = picked ? picked.row : null;
+
+            let headline;
+            if (active) {
+                headline = {
+                    scope: routeLabel(picked.route),
+                    rolling: percentOf(active.rolling),
+                    weekly: percentOf(active.weekly),
+                    monthly: percentOf(active.monthly)
+                };
+            } else {
+                const weekly = worstOf(accounts, "weekly");
+                const monthly = worstOf(accounts, "monthly");
+                const rolling = worstOf(accounts, "rolling");
+                headline = {
+                    scope: null,
+                    rolling: rolling ? rolling.percent : null,
+                    weekly: weekly ? weekly.percent : null,
+                    monthly: monthly ? monthly.percent : null,
+                    sources: { rolling, weekly, monthly }
+                };
             }
 
-            const tone = state.error && !state.payload ? "error" : (failed > 0 || (worst && worst.percent >= WARN_PERCENT) ? "warn" : "ok");
-            const label = worst ? "GO " + worst.percent + "%" : "GO 用量";
-            const hint = worst ? "月度额度最高：" + worst.account : "OpenCode Go 用量";
+            let worst = 0;
+            for (const value of [headline.rolling, headline.weekly, headline.monthly]) {
+                if (typeof value === "number" && value > worst) worst = value;
+            }
             const failures = accounts.filter((row) => row.error);
+            const tone = state.error && !state.payload ? "error" : (failures.length > 0 || worst >= WARN_PERCENT ? "warn" : "ok");
+
+            const parts = [];
+            if (typeof headline.weekly === "number") parts.push("周 " + headline.weekly + "%");
+            if (typeof headline.monthly === "number") parts.push("月 " + headline.monthly + "%");
+            const label = (headline.scope ? "GO " + headline.scope + " · " : "GO ") + (parts.length > 0 ? parts.join(" · ") : "用量");
+
+            const hint = active
+                ? [
+                    "在用 " + picked.route + "（" + active.account + "）",
+                    "5 小时 " + windowText(active.rolling) + " · 周 " + windowText(active.weekly) + " · 月 " + windowText(active.monthly),
+                    active.weekly && active.weekly.resetsAt ? "周重置 " + whenText(active.weekly.resetsAt) : null
+                ].filter(Boolean).join("；")
+                : (headline.sources && (headline.sources.weekly || headline.sources.monthly || headline.sources.rolling)
+                    ? [
+                        "未匹配到本会话选择的账号，显示全部账号的最高值",
+                        headline.sources.rolling ? "5 小时 " + headline.sources.rolling.percent + "%（" + headline.sources.rolling.account + "）" : null,
+                        headline.sources.weekly ? "周 " + headline.sources.weekly.percent + "%（" + headline.sources.weekly.account + "）" : null,
+                        headline.sources.monthly ? "月 " + headline.sources.monthly.percent + "%（" + headline.sources.monthly.account + "）" : null
+                    ].filter(Boolean).join("；")
+                    : "OpenCode Go 用量");
 
             return h("span", { className: "dsw-ogu-wrap", ref: wrapRef },
                 h("button", {
                     type: "button",
                     className: "dsw-ogu-chip",
                     title: hint,
+                    "data-active": active ? "true" : null,
                     onClick: () => {
                         if (swallowedRef.current) return;
                         toggle();
@@ -198,19 +290,21 @@ window.__ModuleLoader__.load({
                 ),
                 open ? h("div", { className: "dsw-ogu-panel" },
                     h("div", { className: "dsw-ogu-title" }, "OpenCode Go 用量（5 小时 / 周 / 月）"),
-                    h(AccountRows, { accounts }),
+                    h(AccountRows, { accounts, activeAccount: active ? active.account : null }),
                     failures.length > 0 ? h("div", { className: "dsw-ogu-error" },
                         failures.map((row) => row.account + ": " + row.error).join("；")) : null,
                     h("div", { className: "dsw-ogu-meta" },
                         state.payload && state.payload.sampledAt
                             ? "采样于 " + whenText(state.payload.sampledAt) + "，每 30 秒刷新；≥" + WARN_PERCENT + "% 标黄"
+                                + (active ? "；▸ = " + (picked && picked.derived ? "按引用名尾号匹配的 " : "本会话选择的 ") + picked.route
+                                    : (provider ? "；未找到 " + provider + " 对应的账号（按引用名尾号匹配）" : ""))
                             : "等待第一次采样…"),
                     state.error ? h("div", { className: "dsw-ogu-error" }, "读取失败：" + state.error) : null
                 ) : null
             );
         }
 
-        /** Client services required before the header action can register. */
+        /** Client services required before the composer-row action can register. */
         const inject = ["slots"];
 
         function apply(ctx) {

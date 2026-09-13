@@ -30,6 +30,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps
   `powershell -File scripts\Install-DshPlugin.ps1 -Uninstall`
 - 只想要命令行、不装 UI：`powershell -File scripts\usage-cli.ps1`
 - 也想用 DeepSeek 官方模型：`powershell -File scripts\Install-DeepSeek.ps1`（详见「DeepSeek 官方 provider 配置」）
+- 5 路 OpenCode Go 路由（每路独立 key、独立 session header）被 App 写回后，用 `powershell -File scripts\Install-OpenCodeGo.ps1` 一条命令重放（详见「OpenCode Go 五路路由」）
 - 安装器只需要 PowerShell；找不到 node 时会跳过 YAML 校验并保留备份，不影响安装
 
 ## 安装 dsh-opencode-go-usage
@@ -42,7 +43,7 @@ cd deepseek_plugin
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1
 ```
 
-装完**刷新 DSH 窗口**（`Ctrl+R`；或直接重启 App）。输入框那一行（模型选择器旁）会出现一个 `GO <月度最高占用>%` 的胶囊，点开是各账号的 5 小时 / 周 / 月占用和重置时间；面板向上弹出。
+装完**刷新 DSH 窗口**（`Ctrl+R`；或直接重启 App）。输入框那一行（模型选择器旁）会出现一个胶囊，**跟随你当前选中的 provider**：模型选择器里的 `1/2/3…` 就是路由 `opencode-go-1/2/3…`，选 2 就显示 2 号账号的周/月占用（点开是全部账号的表，`▸` 标出在用账号）；匹配不到时回退显示全部账号最高值。
 
 - 桌面 harness 默认家目录是 `%APPDATA%\dsh-desktop\harness`；CLI harness 用 `-DshHome "$env:USERPROFILE\.dsh"`。
 - 账号行来自插件配置里的 `refs`（默认 `OPENCODE_API_KEY_1..4`），可以这样指定：
