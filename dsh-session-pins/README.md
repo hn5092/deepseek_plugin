@@ -1,15 +1,21 @@
 # dsh-session-pins
 
-DSH 插件：在左侧栏「工作区」上方加一个**置顶区域**，把常用会话固定在最上面（类似 Codex 的 Pinned）。
-点击置顶项直接打开会话；悬停出现「取消置顶」；「＋」打开会话选择器（搜索 + 最近会话）。
-置顶状态存在宿主侧，重启 App、清浏览器缓存都还在。
+DSH 插件：把常用会话置顶（类似 Codex 的 Pinned）。置顶状态存在宿主侧，重启 App、清浏览器缓存都还在。
+
+三个入口：
+
+| 入口 | 位置 | 接缝 |
+| --- | --- | --- |
+| 置顶区 | 左侧栏「工作区」上方：点击打开会话、悬停「×」取消、点标题旁的图钉项 | DOM 锚点 `[data-slot="sidebar.workspaces"]` |
+| 行菜单项 | 会话行 `···` 菜单里的「置顶 / 取消置顶」 | 包装共享 `Menu` 原语（DSH 没有行菜单 slot） |
+| 头部按钮 | 会话头部工具栏的图钉（当前会话已置顶时高亮） | 官方 slot `conversation.session.header.actions` |
 
 ## 结构
 
 ```
-package.json          # dsh.client 声明（platform=web，依赖侧栏与会话控制器的客户端半）
+package.json          # dsh.client 声明（platform=web，依赖侧栏/会话/会话控制器/原语的客户端半）
 lib/index.js          # 宿主：GET/POST /session-pins，落盘持久化
-lib/client.js         # 浏览器：注入侧栏 DOM 锚点 + 置顶区 UI
+lib/client.js         # 浏览器：置顶区 + 行菜单项 + 头部按钮
 ```
 
 ## 安装
@@ -55,9 +61,29 @@ DSH 的 slot 体系**不支持「在已有区域里再插一个区域」**，这
 每个 slot 都会被包一层 `<div data-slot="…">`，本插件锚定 `[data-slot="sidebar.workspaces"]`，
 不依赖任何哈希类名；侧栏折叠（宽度小于 120px）时整块不渲染；锚点一直不出现时只告警、不影响原侧栏。
 
+## 会话行菜单项怎么加进去的
+
+`···` 菜单同样没有扩展点：工作区插件把固定的 `items` 数组（`rename` / `fork` / `archive`）交给共享原语
+`primitives.Menu` 渲染（`dsh-client-ui-workspace/lib/client.js`）。所以本插件**包装了那个原语**：
+
+- 只当 `items` 里出现 `fork` 或 `archive` 时追加一项，工作区行的菜单（`rename`/`delete`）不受影响；
+- 点击时先调用原来的 `onClose`，再走自己的 `id`，因此不需要改动工作区插件；
+- 会话 id 的取得顺序：菜单 `anchor` 的 `aria-label` → 在 DOM 里找到同一个触发按钮 → `closest('[role="treeitem"]')`
+  → 沿 React props 链找带 `id` 的 `node`/`session`；全都失败时**不猜**，只在置顶区显示「没能识别这一行的会话」；
+- 插件卸载时会把原语还原。
+
+代价：依赖共享原语可被包装、行上有 `role="treeitem"`、React props 可读这三条非官方前提。DSH 升级后若失效，
+表现为菜单项不出现或该提示出现，**头部按钮（官方 slot）不受影响**，这是保留它的原因。
+
+`conversation.session.header.actions` 是 `list` + `scope: "session"` 的官方 slot，`sessionId` 由框架传入
+（`dsh-client-ui-jobs` 同样用法），所以那条路径零 hack。
+
 ## 已知限制
 
 - 锚点与注入位置依赖 DSH 渲染 `data-slot` 属性这一约定；DSH 大版本改动该约定时，本区域会退化为「不渲染」。
+- 行菜单项依赖上面三条非官方前提（见上）；失效时用头部按钮或置顶区的「＋」。
 - 置顶后原会话仍留在工作区列表里（本插件不隐藏原条目）。
 - 置顶项若被删除/归档，会以删除线显示并在选择器里消失，但不会自动移除；点「×」即可清理。
 - 会话标题在置顶时快照进文件；列表里存在同 id 会话时以实时标题为准。
+- 改 `package.json` 的 `dsh.client.inject` 只在 harness 重新启动后反映到 boot 模块图（实测：改 patch 内容不会刷新该描述符）。
+  不影响功能——客户端 `require` 的静态模块（如 `primitives`）按需解析，`dsh-client-ui-agent-preset` 就是没声明也能用。

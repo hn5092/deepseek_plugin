@@ -53,7 +53,11 @@ window.__ModuleLoader__.load({
             `.dsw-pins-item{display:flex;align-items:center;gap:6px;height:30px;padding:0 8px;border-radius:8px;cursor:pointer}`,
             `.dsw-pins-item:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
             `.dsw-pins-note{padding:6px 8px;color:var(--dsw-alias-label-tertiary);font-size:12px}`,
-            `.dsw-pins-error{padding:2px 8px 4px;color:var(--dsw-alias-state-error-primary, #ef4444);font-size:11px;line-height:16px;word-break:break-all}`
+            `.dsw-pins-error{padding:2px 8px 4px;color:var(--dsw-alias-state-error-primary, #ef4444);font-size:11px;line-height:16px;word-break:break-all}`,
+            `.dsw-pins-chip{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:none;border-radius:6px;background:transparent;`,
+            `color:var(--dsw-alias-label-tertiary, inherit);cursor:pointer}`,
+            `.dsw-pins-chip:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary, inherit)}`,
+            `.dsw-pins-chip[data-pinned=true]{color:var(--dsw-alias-state-business-primary, #4d6bfe)}`
         ].join("");
 
         const STYLE_TAG_ID = "dsh-session-pins/area.css";
@@ -112,6 +116,201 @@ window.__ModuleLoader__.load({
             return body;
         }
 
+        // ---- shared pin state ----------------------------------------------------------
+        // The pinned area, the conversation-header button and the row-menu item all read the
+        // same list. The menu item is rendered outside React, so the last fetched document is
+        // cached here and every mutation notifies the mounted readers.
+
+        /** Id of the item appended to a session row's menu. */
+        const PIN_ITEM_ID = "dsh-session-pins:toggle";
+        let pinsCache = [];
+        let externalError = null;
+        const pinListeners = new Set();
+
+        function notifyPinReaders() {
+            for (const listener of [...pinListeners]) {
+                try {
+                    listener();
+                } catch {
+                    // One broken reader must not stop the others.
+                }
+            }
+        }
+
+        function reportActionError(message) {
+            externalError = message;
+            notifyPinReaders();
+        }
+
+        function acceptPins(pins) {
+            pinsCache = Array.isArray(pins) ? pins : [];
+            externalError = null;
+        }
+
+        async function togglePin(sessionId, title) {
+            const pinned = pinsCache.some((pin) => pin.sessionId === sessionId);
+            const body = await mutate(pinned ? "unpin" : "pin", { sessionId, title: title || "" });
+            acceptPins(body && body.pins);
+            notifyPinReaders();
+            return !pinned;
+        }
+
+        /** Live session summary for an id, from the same store the sidebar reads. */
+        function summaryOf(sessions, sessionId) {
+            try {
+                const store = sessions && sessions.list;
+                const snapshot = store && typeof store.getSnapshot === "function" ? store.getSnapshot() : null;
+                return (snapshot && snapshot.byId && snapshot.byId[sessionId]) || null;
+            } catch {
+                return null;
+            }
+        }
+
+        // ---- session-row menu item -----------------------------------------------------
+        // DSH declares no slot for the row menu: the workspace plugin hands a fixed `items`
+        // array to the shared Menu primitive, so that module export is the only extension
+        // point. Wrapping it keeps the native menu markup, and dispose restores it.
+
+        /** Row whose menu the pointer most recently opened; the fallback when the anchor is unknown. */
+        let lastPointerRow = null;
+
+        function reactFiberOf(node) {
+            for (const key of Object.keys(node)) {
+                if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")) return node[key];
+            }
+            return null;
+        }
+
+        /** Walk the React tree above a row element looking for the session object it renders. */
+        function sessionIdFromRow(row) {
+            let fiber = reactFiberOf(row);
+            let depth = 0;
+            while (fiber && depth < 40) {
+                const props = fiber.memoizedProps;
+                if (props && typeof props === "object") {
+                    for (const key of ["node", "session", "row"]) {
+                        const candidate = props[key];
+                        if (candidate && typeof candidate.id === "string" && candidate.id.length > 0) return candidate.id;
+                    }
+                }
+                fiber = fiber.return;
+                depth += 1;
+            }
+            return null;
+        }
+
+        /** The row a menu belongs to: its anchor trigger carries the row's aria-label. */
+        function rowForMenuAnchor(anchor) {
+            const label = anchor && anchor.props ? anchor.props["aria-label"] : void 0;
+            if (typeof label === "string" && label.length > 0) {
+                for (const button of document.querySelectorAll("button[aria-label]")) {
+                    if (button.getAttribute("aria-label") !== label) continue;
+                    const row = button.closest('[role="treeitem"]');
+                    if (row) return row;
+                }
+            }
+            if (lastPointerRow !== null && lastPointerRow.isConnected) return lastPointerRow;
+            return null;
+        }
+
+        function patchSessionMenu(ctx, sessions) {
+            let primitives;
+            try {
+                primitives = require("@deepseek-ai/dsh-client-ui-primitives");
+            } catch (error) {
+                ctx.logger.warn("session-pins: primitives module unavailable, no row-menu item: %s", messageOf(error));
+                return null;
+            }
+            const original = primitives && primitives.Menu;
+            if (typeof original !== "function") {
+                ctx.logger.warn("session-pins: Menu primitive not found, no row-menu item");
+                return null;
+            }
+            if (original.__dshSessionPins === true) return null;
+
+            const Patched = function Menu(props) {
+                const items = props && Array.isArray(props.items) ? props.items : null;
+                // Only the session-row menu offers fork/archive; workspace rows keep their own.
+                const isSessionMenu = items !== null && items.some((item) => item && (item.id === "fork" || item.id === "archive"));
+                // Render the original as an element, never call it: it owns hooks, so calling it
+                // here would move those hooks into this component's list.
+                if (!isSessionMenu) return h(original, props);
+                const row = rowForMenuAnchor(props.anchor);
+                const sessionId = row === null ? null : sessionIdFromRow(row);
+                const pinned = sessionId !== null && pinsCache.some((pin) => pin.sessionId === sessionId);
+                const withPin = items.concat([{
+                    id: PIN_ITEM_ID,
+                    label: pinned ? "取消置顶" : "置顶",
+                    icon: h(PinIcon, { size: 16 })
+                }]);
+                const onSelect = (id) => {
+                    if (id !== PIN_ITEM_ID) {
+                        if (typeof props.onSelect === "function") props.onSelect(id);
+                        return;
+                    }
+                    if (typeof props.onClose === "function") props.onClose();
+                    if (sessionId === null) {
+                        reportActionError("置顶：没能识别这一行的会话，请用置顶区的「＋」");
+                        return;
+                    }
+                    const summary = summaryOf(sessions, sessionId);
+                    void togglePin(sessionId, (summary && summary.title) || (row && row.textContent) || "").catch((error) => {
+                        reportActionError("置顶失败：" + messageOf(error));
+                    });
+                };
+                return h(original, { ...props, items: withPin, onSelect });
+            };
+            Patched.__dshSessionPins = true;
+
+            const onPointerDown = (event) => {
+                const target = event.target;
+                const row = target && target.closest ? target.closest('[role="treeitem"]') : null;
+                if (row) lastPointerRow = row;
+            };
+            document.addEventListener("pointerdown", onPointerDown, true);
+            primitives.Menu = Patched;
+            return () => {
+                document.removeEventListener("pointerdown", onPointerDown, true);
+                if (primitives.Menu === Patched) primitives.Menu = original;
+            };
+        }
+
+        /** Pin toggle for the conversation header (a declared, session-scoped slot). */
+        function PinHeaderAction({ sessionId, useSessions }) {
+            const [state, refresh] = usePins();
+            const snapshot = typeof useSessions === "function" ? useSessions((value) => value) : null;
+            const summary = snapshot && snapshot.byId ? snapshot.byId[sessionId] : null;
+            const title = (summary && summary.title) || "";
+            const pinned = state.pins.some((pin) => pin.sessionId === sessionId);
+            const [busy, setBusy] = react.useState(false);
+            const [error, setError] = react.useState(null);
+            const onClick = async () => {
+                setBusy(true);
+                try {
+                    const body = await mutate(pinned ? "unpin" : "pin", { sessionId, title });
+                    acceptPins(body && body.pins);
+                    await refresh();
+                    notifyPinReaders();
+                    setError(null);
+                } catch (failure) {
+                    setError(messageOf(failure));
+                } finally {
+                    setBusy(false);
+                }
+            };
+            const label = pinned ? "取消置顶" : "置顶这个会话";
+            return h("button", {
+                type: "button",
+                className: "dsw-pins-chip",
+                "data-pinned": pinned ? "true" : null,
+                title: label + (error === null ? "" : "（失败：" + error + "）"),
+                "aria-label": label,
+                "aria-pressed": pinned,
+                disabled: busy,
+                onClick
+            }, h(PinIcon, { size: 16 }));
+        }
+
         /** Host half document (pins) with its own refresh, so a mutation is visible immediately. */
         function usePins() {
             const [state, setState] = react.useState({ pins: [], error: null, loaded: false });
@@ -120,8 +319,9 @@ window.__ModuleLoader__.load({
                     const response = await fetch(ROUTE, { headers: { accept: "application/json" } });
                     if (!response.ok) throw new Error("HTTP " + response.status);
                     const body = await response.json();
+                    acceptPins(body && body.pins);
                     setState({
-                        pins: Array.isArray(body && body.pins) ? body.pins : [],
+                        pins: pinsCache,
                         error: (body && body.error) || null,
                         loaded: true
                     });
@@ -132,10 +332,18 @@ window.__ModuleLoader__.load({
             react.useEffect(() => {
                 let alive = true;
                 const run = () => { if (alive) void refresh(); };
+                const onShared = () => {
+                    if (!alive) return;
+                    // Another entry point (menu item, header button) changed the document.
+                    run();
+                    setState((previous) => ({ ...previous, sharedError: externalError }));
+                };
+                pinListeners.add(onShared);
                 run();
                 const timer = window.setInterval(run, POLL_MS);
                 return () => {
                     alive = false;
+                    pinListeners.delete(onShared);
                     window.clearInterval(timer);
                 };
             }, [refresh]);
@@ -277,6 +485,7 @@ window.__ModuleLoader__.load({
                     )),
                 actionError !== null ? h("div", { className: "dsw-pins-error" }, actionError) : null,
                 state.error !== null ? h("div", { className: "dsw-pins-error" }, "置顶服务：" + state.error) : null,
+                state.sharedError ? h("div", { className: "dsw-pins-error" }, state.sharedError) : null,
                 pickerOpen ? h("div", { className: "dsw-pins-picker" },
                     h("input", {
                         className: "dsw-pins-input",
@@ -379,11 +588,32 @@ window.__ModuleLoader__.load({
                 attach();
             }, 500);
 
+            // The row-menu item and the conversation-header button: the menu is a patched
+            // shared primitive (no slot exists for it), the header button is a declared slot.
+            let unpatchMenu = null;
+            try {
+                unpatchMenu = patchSessionMenu(ctx, sessions);
+            } catch (error) {
+                ctx.logger.warn("session-pins: could not patch the row menu: %s", messageOf(error));
+            }
+            ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
+                name: "conversation.session.header.actions",
+                id: "session-pins",
+                order: 40
+            }, PinHeaderAction));
+
             ctx.effect(() => () => {
                 window.clearInterval(retry);
                 if (frame !== 0) window.cancelAnimationFrame(frame);
                 observer.disconnect();
                 if (resize !== null) resize.disconnect();
+                if (typeof unpatchMenu === "function") {
+                    try {
+                        unpatchMenu();
+                    } catch {
+                        // Restoring an overwritten export is best effort.
+                    }
+                }
                 const mounted = root;
                 root = null;
                 if (mounted) {
@@ -399,7 +629,7 @@ window.__ModuleLoader__.load({
         }
 
         /** Client services required before the area can mount. */
-        const inject = ["sessions"];
+        const inject = ["sessions", "slots"];
 
         exports.apply = apply;
         exports.inject = inject;

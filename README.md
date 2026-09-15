@@ -5,7 +5,7 @@ DeepSeek Harness（DSH）插件集合。
 | 目录 | 说明 |
 | --- | --- |
 | `dsh-opencode-go-usage/` | 在 DSH Web 客户端显示 OpenCode Go 各账号额度占用（5 小时 / 周 / 月）的插件 |
-| `dsh-session-pins/` | 在左侧栏「工作区」上方加置顶区域的插件：把常用会话固定在最上面（类似 Codex 的 Pinned） |
+| `dsh-session-pins/` | 置顶常用会话（类似 Codex 的 Pinned）：左侧栏置顶区 + 会话行 `···` 菜单的「置顶」+ 会话头部图钉按钮 |
 | `scripts/Install-DshPlugin.ps1` | 通用安装/卸载脚本：把插件装进 DSH profile（`-PluginDir` 指定任意插件目录） |
 | `scripts/Install-DshPlugin.sh` | 同上，macOS / Linux 用的 POSIX 版本（`--plugin-dir`） |
 | `scripts/usage-cli.ps1` | 纯命令行查用量，不装插件也能用 |
