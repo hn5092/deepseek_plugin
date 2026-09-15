@@ -1,17 +1,19 @@
 <#
 .SYNOPSIS
-  Install (or remove) the OpenCode Go usage UI plugin in a DSH profile.
+  Install (or remove) a DSH plugin package from this repository into a DSH profile.
 
 .DESCRIPTION
-  The plugin source lives in this Skill at ../plugin and is installed as the package
-  `dsh-opencode-go-usage` under <Home>\profiles\node_modules plus one managed row in the
-  profile patch layer <Home>\profiles\<Profile>\cordis.patch.yml. The DSH Web client then
-  shows a `GO <月度最大占用>%` chip in the conversation header; clicking it opens the
-  per-account 5-hour / weekly / monthly table.
+  Copies the plugin package into <Home>\profiles\node_modules\<package name> and writes one
+  managed row into the profile patch layer <Home>\profiles\<Profile>\cordis.patch.yml,
+  which is what makes the DSH Loader load the plugin and the Web client pick up its browser
+  half. The package name is read from the plugin's own package.json, so this installer is
+  not tied to one plugin.
 
-  The copy under profiles\node_modules is the installed artifact; ../plugin stays the
-  single source of truth, so re-run this script after editing the plugin. The patch file
-  is backed up and the resulting YAML is parsed before the write is kept.
+  The copy under profiles\node_modules is the installed artifact; the repository folder
+  stays the single source of truth, so re-run this script after editing the plugin. The
+  patch file is backed up and the resulting YAML is parsed before the write is kept; a
+  pre-existing unmanaged row for the same package is replaced by the managed block, and
+  the managed block is what -Uninstall removes.
 
 .PARAMETER DshHome
   DSH home. Defaults to the DSH Desktop harness home: %APPDATA%\dsh-desktop\harness on
@@ -21,6 +23,11 @@
   Profile to patch. Defaults to the profile that exists: `web` (the Windows Desktop
   build), else `desktop` (the macOS Desktop build), else the only profile present.
 
+.PARAMETER PluginDir
+  Plugin package directory. Defaults to `plugin` next to this script when it exists (the
+  Skill layout), else `dsh-opencode-go-usage` at the repository root. The package name comes
+  from that directory's package.json, so any plugin in this repository can be installed.
+
 .PARAMETER Ref
   Credential references to sample, one per account row.
 
@@ -28,14 +35,17 @@
   Remove the managed patch block and the installed copy.
 
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File Install-UiPlugin.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File Install-UiPlugin.ps1 -Uninstall
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1 -PluginDir dsh-session-pins
+.EXAMPLE
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
     [string] $DshHome,
     [string] $Profile,
+    [string] $PluginDir,
     [string[]] $Ref = @(
         'OPENCODE_API_KEY_1',
         'OPENCODE_API_KEY_2',
@@ -53,14 +63,23 @@ if ([string]::IsNullOrWhiteSpace($DshHome)) {
     $DshHome = if ($env:APPDATA) { Join-Path $env:APPDATA 'dsh-desktop\harness' } else { Join-Path $HOME '.dsh' }
 }
 
-$packageName = 'dsh-opencode-go-usage'
-$rowId = 'opencode-go-usage'
-# As a Skill this script sits next to <skill>/plugin; as a plain checkout the plugin is the
-# dsh-opencode-go-usage folder at the repository root. Take whichever exists.
-$source = Join-Path (Split-Path -Parent $PSScriptRoot) 'plugin'
-if (-not (Test-Path -LiteralPath $source)) {
-    $source = Join-Path (Split-Path -Parent $PSScriptRoot) $packageName
+# As a Skill this script sits next to <skill>/plugin; as a plain checkout the plugin is a
+# folder at the repository root. Take whichever exists, or the explicit -PluginDir.
+if ([string]::IsNullOrWhiteSpace($PluginDir)) {
+    $PluginDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'plugin'
+    if (-not (Test-Path -LiteralPath $PluginDir)) {
+        $PluginDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'dsh-opencode-go-usage'
+    }
 }
+if (-not (Test-Path -LiteralPath $PluginDir)) { throw "plugin directory not found: $PluginDir" }
+$manifestPath = Join-Path $PluginDir 'package.json'
+if (-not (Test-Path -LiteralPath $manifestPath)) { throw "package.json not found in: $PluginDir" }
+$packageName = [string](Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json).name
+if ([string]::IsNullOrWhiteSpace($packageName)) { throw "package.json has no name: $manifestPath" }
+# Keyed by package name, so the PowerShell and POSIX installers recognize each other's rows.
+$rowId = $packageName
+$beginMarker = "# >>> dsh-plugin: $packageName"
+$endMarker = "# <<< dsh-plugin: $packageName"
 
 # The profile name is not portable: the Windows Desktop build boots `web`, the macOS
 # Desktop build boots `desktop`, and a CLI-only home may hold either. Pick the profile
@@ -85,8 +104,6 @@ $profileDir = Join-Path $DshHome "profiles\$Profile"
 $modulesDir = Join-Path $DshHome 'profiles\node_modules'
 $target = Join-Path $modulesDir $packageName
 $patchPath = Join-Path $profileDir 'cordis.patch.yml'
-$beginMarker = '# >>> opencode-go-usage UI plugin'
-$endMarker = '# <<< opencode-go-usage UI plugin'
 
 function Remove-ReparsePointOrDirectory {
     param([string] $Path)
@@ -130,25 +147,25 @@ if ($Uninstall) {
 # `-File script.ps1 -Ref a,b` binds one string, so split commas here.
 $refs = @($Ref | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-if (-not (Test-Path -LiteralPath $source)) { throw "plugin source not found: $source" }
+if (-not (Test-Path -LiteralPath $PluginDir)) { throw "plugin source not found: $PluginDir" }
 
 # 1) Installed copy: the artifact DSH resolves from the profile.
 Remove-ReparsePointOrDirectory -Path $target
-Copy-Item -LiteralPath $source -Destination $target -Recurse -Force
+Copy-Item -LiteralPath $PluginDir -Destination $target -Recurse -Force
 $fileCount = (Get-ChildItem -LiteralPath $target -Recurse -File | Measure-Object).Count
 Write-Host "installed $packageName -> $target ($fileCount files)"
 
 # 2) Managed profile patch block, delimited so uninstall finds exactly what was written.
 $block = @(
     ''
-    '# >>> opencode-go-usage UI plugin (managed by .agents/skills/opencode-go-usage/scripts/Install-UiPlugin.ps1)'
+    "$beginMarker (managed by scripts/Install-DshPlugin.ps1)"
     '- insert:'
     "    - id: $rowId"
     "      name: '$packageName'"
     '      config:'
     '        refs:'
 ) + ($refs | ForEach-Object { "          - $_" }) + @(
-    '# <<< opencode-go-usage UI plugin'
+    $endMarker
 )
 
 $existing = if (Test-Path -LiteralPath $patchPath) { [IO.File]::ReadAllText($patchPath) } else { '' }
@@ -168,8 +185,23 @@ if ($effective -eq '[]' -or $effective -eq '') {
 if ([regex]::IsMatch($existing, $managed)) {
     $updated = [regex]::Replace($existing, $managed, $blockText)
 } else {
-    $trimmed = $existing.TrimEnd()
-    $updated = $(if ($trimmed.Length -gt 0) { $trimmed + "`n`n" } else { '' }) + $blockText
+    # A row written by an older marker scheme still names this package: replace that block
+    # instead of appending a second one, which would load the plugin twice.
+    $legacy = $null
+    foreach ($candidate in [regex]::Matches($existing, '(?ms)^[ \t]*# >>>.*?^[ \t]*# <<<[^\n]*\r?\n?')) {
+        if ($candidate.Value -match ("(?m)name:\s*'?" + [regex]::Escape($packageName) + "'?\s*$")) { $legacy = $candidate; break }
+    }
+    if ($null -ne $legacy) {
+        $updated = $existing.Substring(0, $legacy.Index) + $blockText + "`n" + $existing.Substring($legacy.Index + $legacy.Length)
+        Write-Host "replaced the row for $packageName written by an older installer"
+    } else {
+        $unmanaged = '(?m)^\s*name:\s*' + [regex]::Escape("'$packageName'") + '\s*$'
+        if ([regex]::IsMatch($existing, $unmanaged)) {
+            throw "an unmanaged row for $packageName already exists in $patchPath; remove it by hand before installing from this repository"
+        }
+        $trimmed = $existing.TrimEnd()
+        $updated = $(if ($trimmed.Length -gt 0) { $trimmed + "`n`n" } else { '' }) + $blockText
+    }
 }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -186,7 +218,7 @@ if (Test-Path -LiteralPath $yamlModule) {
         'const rows = [];'
         'for (const entry of document) for (const row of (entry.insert || [])) rows.push(row.id);'
         'console.log("parsed rows:", rows.join(", "));'
-        'if (!rows.includes("opencode-go-usage")) { console.error("row missing after write"); process.exit(2); }'
+        "if (!rows.includes('$rowId')) { console.error('row missing after write'); process.exit(2); }"
     )
     $probe = $probeLines -join "`n"
     $probePath = Join-Path ([IO.Path]::GetTempPath()) 'ocg-verify-patch.cjs'

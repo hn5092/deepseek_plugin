@@ -141,8 +141,43 @@ TARGET="$PROFILES_DIR/node_modules/$PACKAGE_NAME"
 PATCH="$PROFILES_DIR/$PROFILE_NAME/cordis.patch.yml"
 BEGIN_MARKER="# >>> dsh-plugin: $PACKAGE_NAME"
 END_MARKER="# <<< dsh-plugin: $PACKAGE_NAME"
+# Markers actually in force for this run. A row written by an older installer for the same
+# package is replaced in place: appending a second row would load the plugin twice.
+ACTIVE_BEGIN="$BEGIN_MARKER"
+ACTIVE_END="$END_MARKER"
 
 [ -d "$PROFILES_DIR/$PROFILE_NAME" ] || die "profile not found: $PROFILES_DIR/$PROFILE_NAME (pass --dsh-home / --profile)"
+
+has_marker() { grep -q -F "$2" "$1"; }
+
+# A row for this package written under a different marker scheme: prints "<begin>\t<end>".
+legacy_markers() { # file
+    awk -v pkg="$PACKAGE_NAME" '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (index(line, "# >>>") == 1) { begin = line; block = line; next }
+            if (begin != "") block = block "\n" line
+            if (index(line, "# <<<") == 1) {
+                if (index(block, "name:") > 0 && index(block, pkg) > 0) { print begin "\t" line; exit }
+                begin = ""
+                block = ""
+            }
+        }
+    ' "$1"
+}
+
+# Point ACTIVE_BEGIN/ACTIVE_END at an older row for this package when one is present.
+resolve_active_markers() { # file
+    [ -f "$1" ] || return 0
+    if has_marker "$1" "$BEGIN_MARKER"; then return 0; fi
+    legacy=$(legacy_markers "$1")
+    if [ -n "$legacy" ]; then
+        ACTIVE_BEGIN=$(printf '%s' "$legacy" | cut -f1)
+        ACTIVE_END=$(printf '%s' "$legacy" | cut -f2)
+        echo "replacing the row for $PACKAGE_NAME written by an older installer"
+    fi
+}
 
 strip_managed() { # infile begin end -> stdout without the managed row
     awk -v b="$2" -v e="$3" '
@@ -185,8 +220,8 @@ write_patch() { # replacement-file
     else
         : > "$tmp"
     fi
-    if has_marker "$tmp" "$BEGIN_MARKER"; then
-        strip_managed "$tmp" "$BEGIN_MARKER" "$END_MARKER" > "$tmp.next"
+    if has_marker "$tmp" "$ACTIVE_BEGIN"; then
+        strip_managed "$tmp" "$ACTIVE_BEGIN" "$ACTIVE_END" > "$tmp.next"
         mv "$tmp.next" "$tmp"
     fi
     trim_trailing_blanks "$tmp" > "$tmp.trimmed"
@@ -199,8 +234,6 @@ write_patch() { # replacement-file
     validate_patch "$stamp"
     echo "patched $PATCH (backup: cordis.patch.yml.bak-$stamp)"
 }
-
-has_marker() { grep -q -F "$2" "$1"; }
 
 validate_patch() { # backup stamp
     yaml_module="$PROFILES_DIR/node_modules/yaml"
@@ -243,9 +276,10 @@ if [ "$UNINSTALL" -eq 1 ]; then
         exit 0
     fi
     rm -rf "$TARGET"
-    if [ -f "$PATCH" ] && has_marker "$PATCH" "$BEGIN_MARKER"; then
+    [ -f "$PATCH" ] && resolve_active_markers "$PATCH"
+    if [ -f "$PATCH" ] && has_marker "$PATCH" "$ACTIVE_BEGIN"; then
         tmp=$(mktemp "${TMPDIR:-/tmp}/dsh-plugin-patch.XXXXXX")
-        strip_managed "$PATCH" "$BEGIN_MARKER" "$END_MARKER" > "$tmp"
+        strip_managed "$PATCH" "$ACTIVE_BEGIN" "$ACTIVE_END" > "$tmp"
         stamp=$(date +%Y%m%d-%H%M%S)
         cp -p "$PATCH" "$PATCH.bak-$stamp"
         trim_trailing_blanks "$tmp" > "$tmp.trimmed"
@@ -259,10 +293,14 @@ if [ "$UNINSTALL" -eq 1 ]; then
     exit 0
 fi
 
-# Refuse an unmanaged row for the same package: two rows would load the plugin twice.
-if [ -f "$PATCH" ] && ! has_marker "$PATCH" "$BEGIN_MARKER"; then
-    if grep -q "^[[:space:]]*name:[[:space:]]*'$PACKAGE_NAME'[[:space:]]*$" "$PATCH"; then
-        die "an unmanaged row for $PACKAGE_NAME already exists in $PATCH; remove it (or run the installer that wrote it with --uninstall) before installing from this repository"
+# Claim an older row for this package when one exists, then refuse only a truly unmanaged
+# row: two rows for one package would load the plugin twice.
+if [ -f "$PATCH" ]; then
+    resolve_active_markers "$PATCH"
+    if [ "$ACTIVE_BEGIN" = "$BEGIN_MARKER" ] && ! has_marker "$PATCH" "$BEGIN_MARKER"; then
+        if grep -q "^[[:space:]]*name:[[:space:]]*'$PACKAGE_NAME'[[:space:]]*$" "$PATCH"; then
+            die "an unmanaged row for $PACKAGE_NAME already exists in $PATCH; remove it (or run the installer that wrote it with --uninstall) before installing from this repository"
+        fi
     fi
 fi
 

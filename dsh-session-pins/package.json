@@ -1,0 +1,36 @@
+{
+  "name": "dsh-session-pins",
+  "version": "0.1.0",
+  "description": "DSH Web UI surface: a pinned-conversation area above the sidebar session list",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-api-session-controller"
+      ],
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hn5092/deepseek_plugin.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "sidebar",
+    "pins"
+  ],
+  "license": "MIT"
+}
