@@ -11,6 +11,8 @@ window.__ModuleLoader__.load({
 
         /** Exact route registered by the host half; keep in sync with lib/index.js `path`. */
         const ROUTE = "/session-pins";
+        /** Bumped whenever the browser half changes: the host echo tells which build a page runs. */
+        const BUILD = "pins-2";
         /** Re-read the host document occasionally so two windows do not drift apart. */
         const POLL_MS = 30000;
         /**
@@ -73,6 +75,22 @@ window.__ModuleLoader__.load({
 
         function messageOf(error) {
             return String((error && error.message) || error);
+        }
+
+        /**
+         * Report one breadcrumb to the host half (readable from `GET <ROUTE>`). Diagnostics
+         * must never break the UI, so every failure here is swallowed.
+         */
+        function note(message) {
+            try {
+                void fetch(ROUTE, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ action: "note", note: String(message).slice(0, 200) })
+                }).catch(() => {});
+            } catch {
+                // Ignored on purpose.
+            }
         }
 
         /** Compact "2 分钟 / 3 小时 / 2 天" stamp, matching the session list's own style. */
@@ -167,11 +185,19 @@ window.__ModuleLoader__.load({
         }
 
         // ---- session-row menu item -----------------------------------------------------
-        // DSH declares no slot for the row menu: the workspace plugin hands a fixed `items`
-        // array to the shared Menu primitive, so that module export is the only extension
-        // point. Wrapping it keeps the native menu markup, and dispose restores it.
+        // DSH declares no slot for the row menu, and that menu's primitive lives in a frozen
+        // platform seed namespace (`Object.freeze(...)` in the shell bundle), so the item
+        // cannot be added by wrapping a module. The popup is portaled to <body> as
+        // `div[role="menu"]` and its rows come from the workspace plugin's own array, so the
+        // item is injected into that popup instead: the last item is cloned (keeping the
+        // primitive's markup, classes and hover behaviour), relabelled, re-iconed and wired
+        // to this plugin. Nothing else in the menu is touched.
 
-        /** Row whose menu the pointer most recently opened; the fallback when the anchor is unknown. */
+        /** Marks an item this plugin injected, so a re-render cannot duplicate it. */
+        const MENU_ITEM_ATTR = "data-dsh-session-pins-item";
+        /** Fallback signal when geometry cannot link a popup to a row (both locales). */
+        const SESSION_MENU_LABELS = ["分叉会话", "归档会话", "Fork session", "Archive session", "Fork Session", "Archive Session"];
+        /** Row whose trigger the pointer last pressed; the first candidate for a popup. */
         let lastPointerRow = null;
 
         function reactFiberOf(node) {
@@ -199,79 +225,136 @@ window.__ModuleLoader__.load({
             return null;
         }
 
-        /** The row a menu belongs to: its anchor trigger carries the row's aria-label. */
-        function rowForMenuAnchor(anchor) {
-            const label = anchor && anchor.props ? anchor.props["aria-label"] : void 0;
-            if (typeof label === "string" && label.length > 0) {
-                for (const button of document.querySelectorAll("button[aria-label]")) {
-                    if (button.getAttribute("aria-label") !== label) continue;
-                    const row = button.closest('[role="treeitem"]');
-                    if (row) return row;
+        /** Session row a popup belongs to: the row whose trigger was pressed, else the nearest. */
+        function rowForPopup(menu) {
+            let rect;
+            try {
+                rect = menu.getBoundingClientRect();
+            } catch {
+                return lastPointerRow !== null && lastPointerRow.isConnected ? lastPointerRow : null;
+            }
+            if (rect.height === 0 && rect.width === 0) return lastPointerRow !== null && lastPointerRow.isConnected ? lastPointerRow : null;
+            const near = (row) => {
+                const box = row.getBoundingClientRect();
+                return rect.top >= box.top - 120 && rect.top <= box.bottom + 120;
+            };
+            if (lastPointerRow !== null && lastPointerRow.isConnected && near(lastPointerRow)) return lastPointerRow;
+            let best = null;
+            let bestDistance = Infinity;
+            for (const row of document.querySelectorAll('[role="treeitem"]')) {
+                const box = row.getBoundingClientRect();
+                const distance = Math.abs(box.top - rect.top);
+                if (distance < bestDistance && near(row)) {
+                    bestDistance = distance;
+                    best = row;
                 }
             }
-            if (lastPointerRow !== null && lastPointerRow.isConnected) return lastPointerRow;
-            return null;
+            return best;
         }
 
-        function patchSessionMenu(ctx, sessions) {
-            let primitives;
-            try {
-                primitives = require("@deepseek-ai/dsh-client-ui-primitives");
-            } catch (error) {
-                ctx.logger.warn("session-pins: primitives module unavailable, no row-menu item: %s", messageOf(error));
-                return null;
-            }
-            const original = primitives && primitives.Menu;
-            if (typeof original !== "function") {
-                ctx.logger.warn("session-pins: Menu primitive not found, no row-menu item");
-                return null;
-            }
-            if (original.__dshSessionPins === true) return null;
+        /** Whether the popup looks like a session menu, used when no row can be matched. */
+        function looksLikeSessionMenu(menu) {
+            const labels = [...menu.querySelectorAll('button[role="menuitem"]')].map((button) => (button.textContent || "").trim());
+            return labels.some((label) => SESSION_MENU_LABELS.includes(label));
+        }
 
-            const Patched = function Menu(props) {
-                const items = props && Array.isArray(props.items) ? props.items : null;
-                // Only the session-row menu offers fork/archive; workspace rows keep their own.
-                const isSessionMenu = items !== null && items.some((item) => item && (item.id === "fork" || item.id === "archive"));
-                // Render the original as an element, never call it: it owns hooks, so calling it
-                // here would move those hooks into this component's list.
-                if (!isSessionMenu) return h(original, props);
-                const row = rowForMenuAnchor(props.anchor);
-                const sessionId = row === null ? null : sessionIdFromRow(row);
-                const pinned = sessionId !== null && pinsCache.some((pin) => pin.sessionId === sessionId);
-                const withPin = items.concat([{
-                    id: PIN_ITEM_ID,
-                    label: pinned ? "取消置顶" : "置顶",
-                    icon: h(PinIcon, { size: 16 })
-                }]);
-                const onSelect = (id) => {
-                    if (id !== PIN_ITEM_ID) {
-                        if (typeof props.onSelect === "function") props.onSelect(id);
-                        return;
+        /** Close the popup the way the primitive does (it listens for Escape on the document). */
+        function closeMenu() {
+            document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        }
+
+        /** The pin mark as a DOM node, so the cloned item can carry the same icon. */
+        function pinSvgNode(size) {
+            const ns = "http://www.w3.org/2000/svg";
+            const svg = document.createElementNS(ns, "svg");
+            for (const [name, value] of Object.entries({
+                width: String(size), height: String(size), viewBox: "0 0 16 16", fill: "none",
+                stroke: "currentColor", "stroke-width": "1.5", "stroke-linecap": "round", "aria-hidden": "true"
+            })) svg.setAttribute(name, value);
+            const circle = document.createElementNS(ns, "circle");
+            for (const [name, value] of Object.entries({ cx: "8", cy: "6", r: "2.6" })) circle.setAttribute(name, value);
+            const path = document.createElementNS(ns, "path");
+            path.setAttribute("d", "M8 8.6V14");
+            svg.appendChild(circle);
+            svg.appendChild(path);
+            return svg;
+        }
+
+        function labelElement(button) {
+            return button.querySelector('[class*="itemLabel"]') || button.lastElementChild;
+        }
+
+        function injectIntoMenu(ctx, sessions, menu) {
+            if (menu.querySelector("[" + MENU_ITEM_ATTR + "]") !== null) return;
+            const viewport = menu.querySelector('[role="presentation"]') || menu;
+            const templates = [...viewport.children].filter((child) => child.querySelector && child.querySelector('button[role="menuitem"]') !== null);
+            if (templates.length === 0) return;
+            const row = rowForPopup(menu);
+            if (row === null && !looksLikeSessionMenu(menu)) return;
+
+            const sessionId = row === null ? null : sessionIdFromRow(row);
+            const pinned = sessionId !== null && pinsCache.some((pin) => pin.sessionId === sessionId);
+            const clone = templates[templates.length - 1].cloneNode(true);
+            clone.setAttribute(MENU_ITEM_ATTR, "1");
+            const button = clone.querySelector('button[role="menuitem"]') || clone;
+            const label = labelElement(button);
+            if (label !== null) label.textContent = pinned ? "取消置顶" : "置顶";
+            const icon = button.querySelector('[class*="itemIcon"]');
+            if (icon !== null) icon.replaceChildren(pinSvgNode(16));
+            clone.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                // Resolve before closing: once the popup is gone its geometry is unusable.
+                const targetRow = rowForPopup(menu);
+                const id = targetRow === null ? sessionId : (sessionIdFromRow(targetRow) || sessionId);
+                closeMenu();
+                if (id === null) {
+                    reportActionError("置顶：没能识别这一行的会话，请用置顶区的「＋」");
+                    return;
+                }
+                const summary = summaryOf(sessions, id);
+                note("menu item clicked: sessionId=" + id);
+                void togglePin(id, (summary && summary.title) || (targetRow && targetRow.textContent) || "").catch((error) => {
+                    reportActionError("置顶失败：" + messageOf(error));
+                });
+            }, true);
+            templates[templates.length - 1].insertAdjacentElement("afterend", clone);
+            note("menu item injected: " + (pinned ? "unpin" : "pin") + " row=" + (row === null ? "geometry" : "matched"));
+        }
+
+        /** Watch for the row popup appearing (it is portaled to <body> on every open). */
+        function watchSessionMenus(ctx, sessions) {
+            const seen = new WeakSet();
+            const consider = (node) => {
+                if (!(node instanceof Element)) return;
+                const menus = [];
+                if (node.matches('[role="menu"]')) menus.push(node);
+                if (node.querySelectorAll) menus.push(...node.querySelectorAll('[role="menu"]'));
+                for (const menu of menus) {
+                    if (seen.has(menu)) continue;
+                    seen.add(menu);
+                    try {
+                        injectIntoMenu(ctx, sessions, menu);
+                    } catch (error) {
+                        note("menu inject failed: " + messageOf(error));
                     }
-                    if (typeof props.onClose === "function") props.onClose();
-                    if (sessionId === null) {
-                        reportActionError("置顶：没能识别这一行的会话，请用置顶区的「＋」");
-                        return;
-                    }
-                    const summary = summaryOf(sessions, sessionId);
-                    void togglePin(sessionId, (summary && summary.title) || (row && row.textContent) || "").catch((error) => {
-                        reportActionError("置顶失败：" + messageOf(error));
-                    });
-                };
-                return h(original, { ...props, items: withPin, onSelect });
+                }
             };
-            Patched.__dshSessionPins = true;
-
+            const observer = new MutationObserver((records) => {
+                for (const record of records) {
+                    for (const node of record.addedNodes) consider(node);
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
             const onPointerDown = (event) => {
                 const target = event.target;
                 const row = target && target.closest ? target.closest('[role="treeitem"]') : null;
                 if (row) lastPointerRow = row;
             };
             document.addEventListener("pointerdown", onPointerDown, true);
-            primitives.Menu = Patched;
             return () => {
+                observer.disconnect();
                 document.removeEventListener("pointerdown", onPointerDown, true);
-                if (primitives.Menu === Patched) primitives.Menu = original;
             };
         }
 
@@ -459,7 +542,7 @@ window.__ModuleLoader__.load({
                     }, h("span", { style: { fontSize: "14px", lineHeight: "14px" } }, pickerOpen ? "×" : "+"))
                 ),
                 rows.length === 0
-                    ? h("div", { className: "dsw-pins-empty" }, "把常用会话置顶，随时点开")
+                    ? h("div", { className: "dsw-pins-empty" }, "把常用会话置顶，随时点开 · " + BUILD)
                     : rows.map((row) => h("div", {
                         key: row.sessionId,
                         className: "dsw-pins-row",
@@ -588,13 +671,14 @@ window.__ModuleLoader__.load({
                 attach();
             }, 500);
 
-            // The row-menu item and the conversation-header button: the menu is a patched
-            // shared primitive (no slot exists for it), the header button is a declared slot.
-            let unpatchMenu = null;
+            // The row-menu item is injected into the popup the primitive portals to <body>;
+            // the header button uses the declared, session-scoped header slot.
+            let stopMenuWatch = null;
             try {
-                unpatchMenu = patchSessionMenu(ctx, sessions);
+                stopMenuWatch = watchSessionMenus(ctx, sessions);
             } catch (error) {
-                ctx.logger.warn("session-pins: could not patch the row menu: %s", messageOf(error));
+                ctx.logger.warn("session-pins: could not watch the row menus: %s", messageOf(error));
+                note("menu watch failed: " + messageOf(error));
             }
             ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
                 name: "conversation.session.header.actions",
@@ -602,16 +686,20 @@ window.__ModuleLoader__.load({
                 order: 40
             }, PinHeaderAction));
 
+            note("build " + BUILD + " applied: area=" + (container !== null && container.isConnected ? "mounted" : "pending") +
+                " menuWatch=" + (typeof stopMenuWatch === "function" ? "active" : "offline") +
+                " headerSlot=" + (ctx.slots ? "on" : "off"));
+
             ctx.effect(() => () => {
                 window.clearInterval(retry);
                 if (frame !== 0) window.cancelAnimationFrame(frame);
                 observer.disconnect();
                 if (resize !== null) resize.disconnect();
-                if (typeof unpatchMenu === "function") {
+                if (typeof stopMenuWatch === "function") {
                     try {
-                        unpatchMenu();
+                        stopMenuWatch();
                     } catch {
-                        // Restoring an overwritten export is best effort.
+                        // Detaching observers is best effort.
                     }
                 }
                 const mounted = root;

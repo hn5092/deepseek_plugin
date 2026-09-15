@@ -63,17 +63,26 @@ DSH 的 slot 体系**不支持「在已有区域里再插一个区域」**，这
 
 ## 会话行菜单项怎么加进去的
 
-`···` 菜单同样没有扩展点：工作区插件把固定的 `items` 数组（`rename` / `fork` / `archive`）交给共享原语
-`primitives.Menu` 渲染（`dsh-client-ui-workspace/lib/client.js`）。所以本插件**包装了那个原语**：
+`···` 菜单同样没有扩展点，而且**不能靠包装模块**：工作区插件把固定的 `items` 数组交给共享原语
+`primitives.Menu` 渲染，但那个模块是加载器的**平台种子模块**，在 shell 里就是
+`const Fp = Object.freeze(Object.defineProperty({…, Menu: …}, Symbol.toStringTag, …))` ——
+冻结对象上给 `Menu` 赋值会静默失败（非严格模式），所以第一版「包装导出」的做法永远不生效。
 
-- 只当 `items` 里出现 `fork` 或 `archive` 时追加一项，工作区行的菜单（`rename`/`delete`）不受影响；
-- 点击时先调用原来的 `onClose`，再走自己的 `id`，因此不需要改动工作区插件；
-- 会话 id 的取得顺序：菜单 `anchor` 的 `aria-label` → 在 DOM 里找到同一个触发按钮 → `closest('[role="treeitem"]')`
-  → 沿 React props 链找带 `id` 的 `node`/`session`；全都失败时**不猜**，只在置顶区显示「没能识别这一行的会话」；
-- 插件卸载时会把原语还原。
+最终做法是**往弹层里注入一项**。弹层由原语 `createPortal` 挂到 `<body>`，结构是
+`div[role="menu"] > div[role="presentation"] > div(每项) > button[role="menuitem"]`（内含 `itemIcon` / `itemLabel` 两个 span）：
 
-代价：依赖共享原语可被包装、行上有 `role="treeitem"`、React props 可读这三条非官方前提。DSH 升级后若失效，
-表现为菜单项不出现或该提示出现，**头部按钮（官方 slot）不受影响**，这是保留它的原因。
+- 用 `MutationObserver` 监听 `<body>` 新增的 `[role="menu"]`；
+- 命中会话菜单的判断：**优先按位置**（弹层顶部与 `[role="treeitem"]` 行重叠/相邻，配合最后一次按下指针的行），
+  位置判不出来时再退回文案（`分叉会话` / `归档会话` / 对应英文）；
+- 克隆**最后一项**（连同原语的 class 与 hover 行为），改文案与图标，挂自己的 click（capture，`stopPropagation`），
+  插到它后面；克隆节点没有原语的事件处理器，所以不会误触原来的动作；
+- 会话 id 的取得顺序：该行 → 沿 React props 链找带 `id` 的 `node`/`session`；失败时**不猜**，
+  只在置顶区提示「没能识别这一行的会话」；
+- 关闭弹层用原语自己的方式：向 document 派发 `Escape`（原语监听 `keydown` 里的 Escape）；
+- 弹层每次打开都是新节点，注入项随之消失，不需要清理。
+
+仍然依赖三条非官方前提：弹层 `role="menu"` / 行 `role="treeitem"` / React props 可读。DSH 升级后若失效，
+表现为菜单项不出现或出现上述提示，**头部按钮（官方 slot）不受影响**——这是保留它的原因。
 
 `conversation.session.header.actions` 是 `list` + `scope: "session"` 的官方 slot，`sessionId` 由框架传入
 （`dsh-client-ui-jobs` 同样用法），所以那条路径零 hack。

@@ -139,13 +139,17 @@ export function apply(ctx, config) {
     const file = pinsFile(config);
     let pins = readPins(file, config.maxTitleLength);
     let lastError = null;
+    // In-memory breadcrumbs from the browser half: the only cheap way to see what the page
+    // actually did when a DOM/primitive seam does not behave. Never persisted.
+    const notes = [];
 
     const payload = () => ({
         pins,
         store: file,
         maxPins: config.maxPins,
         sampledAt: new Date().toISOString(),
-        error: lastError
+        error: lastError,
+        notes
     });
 
     const pin = (body) => {
@@ -200,6 +204,15 @@ export function apply(ctx, config) {
                 body = raw.length > 0 ? JSON.parse(raw) : {};
             } catch {
                 send(400, { error: "body is not JSON" });
+                return;
+            }
+            if (body?.action === "note") {
+                const text = typeof body.note === "string" ? body.note.slice(0, 200) : "";
+                if (text) {
+                    notes.push({ at: new Date().toISOString(), text });
+                    while (notes.length > 20) notes.shift();
+                }
+                send(200, { ok: true, ...payload() });
                 return;
             }
             const before = pins;
