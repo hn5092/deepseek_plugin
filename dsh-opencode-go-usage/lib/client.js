@@ -57,7 +57,7 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-table tr[data-active=true] td{background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.08))}",
             ".dsw-ogu-table tr[data-active=true] td:first-child{font-weight:600}",
             ".dsw-ogu-meta{margin-top:8px;color:var(--dsw-alias-label-caption, inherit);font-size:11px}",
-            ".dsw-ogu-error{margin-top:6px;color:var(--dsw-alias-state-error-primary, #ef4444);font-size:11px;word-break:break-all}"
+            ".dsw-ogu-error{margin-top:6px;color:var(--dsw-alias-label-tertiary, #adb2b8);font-size:11px;line-height:16px;word-break:break-word}"
         ].join("");
 
         const STYLE_TAG_ID = "dsh-opencode-go-usage/panel.css";
@@ -375,7 +375,7 @@ window.__ModuleLoader__.load({
                     h("div", { className: "dsw-ogu-title" }, "用量（5 小时 / 周 / 月）· OpenCode Go + CommandCode"),
                     h(AccountRows, { accounts, activeAccount: active ? active.account : null, previous: previousSample(state.payload) }),
                     failures.length > 0 ? h("div", { className: "dsw-ogu-error" },
-                        failures.map((row) => row.account + ": " + row.error).join("；")) : null,
+                        "⚠ " + failures.map((row) => row.account + " " + row.error).join("；")) : null,
                     h("div", { className: "dsw-ogu-meta" },
                         state.payload && state.payload.sampledAt
                             ? "采样于 " + whenText(state.payload.sampledAt) + "，面板每 30 秒刷新、后台每 30 分钟存一次历史；Δ = 相比上一次采样；≥" + WARN_PERCENT + "% 标黄"
@@ -383,7 +383,7 @@ window.__ModuleLoader__.load({
                                 + (active ? "；▸ = " + (picked && picked.derived ? "按引用名尾号匹配的 " : "本会话选择的 ") + picked.route
                                     : (provider ? "；未找到 " + provider + " 对应的账号（按引用名尾号匹配）" : ""))
                             : "等待第一次采样…"),
-                    state.error ? h("div", { className: "dsw-ogu-error" }, "读取失败：" + state.error) : null
+                    state.error ? h("div", { className: "dsw-ogu-error" }, "⚠ 读取失败 " + state.error) : null
                 ) : null
             );
         }
