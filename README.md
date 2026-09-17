@@ -144,6 +144,14 @@ scripts/Install-CommandCode.sh --uninstall
 - **套餐必须是 GOAT 或以上**。除 Go 套餐外都有 API 权限；Go 套餐的 key 打
   `/provider/v1/chat/completions` 会返回 `403 upgrade_required`（但 `/provider/v1/models` 仍返回 200，
   别用这个判断）。
+- 图片输入按模型分别声明（**模型能力必须声明，声明错了附件会被静默丢掉**）。实测：
+
+  | 模型 | 图片 |
+  | --- | --- |
+  | `deepseek/deepseek-v4.1-flash` | ✅ |
+  | `deepseek/deepseek-v4-flash` | ✅ |
+  | `deepseek/deepseek-v4-pro` | ❌ 纯文本（上游回 *I can't read the image*） |
+
 - 模板**默认不带** `x-cmd-zdr`；要零留存加 `--zdr`。**但开 ZDR 会明显更贵**，官方 ZDR 页面写得很明确：
   > *Metered at the default allowance: ZDR requests use your plan's default allowance, even if a model normally has a higher boosted allowance. That means $20 on GOAT … the same credits buy fewer ZDR requests than regular ones.*
 
