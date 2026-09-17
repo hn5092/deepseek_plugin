@@ -144,9 +144,12 @@ scripts/Install-CommandCode.sh --uninstall
 - **套餐必须是 GOAT 或以上**。除 Go 套餐外都有 API 权限；Go 套餐的 key 打
   `/provider/v1/chat/completions` 会返回 `403 upgrade_required`（但 `/provider/v1/models` 仍返回 200，
   别用这个判断）。
-- 模板带 `x-cmd-zdr: "1"`，强制零数据留存。开了之后，**没有 ZDR 上游的模型会以 HTTP 422
-  `cmd_zdr_no_providers` 失败**，而不是悄悄回退到非 ZDR 路由。上面三个模型都实测支持 ZDR；要接
-  ZDR 不支持的模型，去掉这个 header。
+- 模板**默认不带** `x-cmd-zdr`；要零留存加 `--zdr`。**但开 ZDR 会明显更贵**，官方 ZDR 页面写得很明确：
+  > *Metered at the default allowance: ZDR requests use your plan's default allowance, even if a model normally has a higher boosted allowance. That means $20 on GOAT … the same credits buy fewer ZDR requests than regular ones.*
+
+  具体到 `deepseek-v4.1-flash`：不开 → 额度 **$60**；开了 → 被压到默认额度 **$20**（**少 3 倍**），
+  而且 ZDR 可能路由到更贵的上游，单价也更高。**所以除非确实需要零留存，否则不要开。**
+- 开了 ZDR 之后，没有 ZDR 上游的模型会以 HTTP 422 `cmd_zdr_no_providers` 失败，而不是悄悄回退。
 - 思考档位上游接受 `low | medium | high | xhigh`，`max` 也接受，**`none` 返回 HTTP 400**，所以模板里没有声明 `none`。
 
 ## DeepSeek 官方 provider 配置（一键安装）

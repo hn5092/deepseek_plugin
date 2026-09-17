@@ -29,6 +29,7 @@ DSH_HOME="${DSH_HOME:-}"
 REF="$DEFAULT_REF"
 SET_DEFAULT=0
 DEFAULT_EFFORT="max"
+ZDR=0
 DRY_RUN=0
 UNINSTALL=0
 
@@ -45,6 +46,12 @@ Options:
                      (default: COMMANDCODE_API_KEY)
   --set-default      also point agent-default-model at this route
   --effort <level>   reasoningEffort used by --set-default (default: max)
+  --zdr              enable x-cmd-zdr: "1" (zero data retention).
+                     WARNING: this costs real money. Per Command Code's ZDR page,
+                     a ZDR request is metered at the plan's DEFAULT allowance even
+                     when the model has a boosted one ($20 instead of $60 for
+                     deepseek-v4.1-flash on GOAT), and it may route to a pricier
+                     upstream. Same credits, fewer requests. Off by default.
   --dry-run          report what would change, write nothing
   --uninstall        remove the managed route block
   -h, --help         this help
@@ -77,6 +84,7 @@ while [ $# -gt 0 ]; do
         --set-default) SET_DEFAULT=1; shift ;;
         --effort) [ $# -ge 2 ] || die "--effort needs a value"; DEFAULT_EFFORT="$2"; shift 2 ;;
         --effort=*) DEFAULT_EFFORT="${1#*=}"; shift ;;
+        --zdr) ZDR=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help) usage 0 ;;
@@ -237,8 +245,16 @@ if has_section "llm-pi-ai"; then
 fi
 
 block_body=$(mktemp "${TMPDIR:-/tmp}/dsh-commandcode-block.XXXXXX")
+# `#[zdr]`-prefixed lines are the opt-in ZDR header: dropped unless --zdr is
+# given, and unwrapped into real YAML when it is.
 sed "s|$TEMPLATE_REF|$(escape_sed "$REF")|g" "$TEMPLATE" \
-    | trim_trailing_blanks /dev/stdin > "$block_body"
+    | awk -v zdr="$ZDR" '
+        /^[[:space:]]*#\[zdr\]/ {
+            if (zdr == 1) { line = $0; sub(/#\[zdr\]/, "", line); print line }
+            next
+        }
+        { print }
+    ' | trim_trailing_blanks /dev/stdin > "$block_body"
 
 grep -q -F "$TEMPLATE_REF" "$block_body" \
     && { rm -f "$block_body"; die "template still contains $TEMPLATE_REF after substitution"; }
