@@ -1,0 +1,75 @@
+# CommandCode provider route for the DSH llm-pi-ai adapter.
+#
+# Endpoint: https://api.commandcode.ai/provider/v1  (OpenAI Chat Completions)
+#
+# Plan requirement: GOAT or higher. Every plan except Go has API access; a Go
+# plan key fails with `403 upgrade_required` on /provider/v1/chat/completions
+# even though /provider/v1/models still answers 200.
+#
+# __REF__ is substituted by scripts/Install-CommandCode.sh with the credential
+# reference name. The key itself is never written by that script: it stays in the
+# DSH credential store (~/.dsh/.credentials.yaml, `refs:` section) or in the
+# matching environment variable. Keep the value out of this file and out of git.
+#
+# x-cmd-zdr: "1" enforces zero data retention on every request. With it set, a
+# request whose model has no ZDR-capable upstream fails with HTTP 422
+# `cmd_zdr_no_providers` rather than silently falling back to a non-ZDR route.
+# All three models below were verified ZDR-capable on 2026-09-17.
+#
+# reasoningEfforts: the upstream accepts `low`, `medium`, `high` and `xhigh`, and
+# also accepts `max`. `none` returns HTTP 400, so it is deliberately not declared.
+#
+# This fragment is a route body only, not a whole llm-pi-ai section: the installer
+# inserts it under the existing `llm-pi-ai.providers` mapping, so it coexists with
+# route sets written by scripts/Install-OpenCodeGo.sh instead of replacing them.
+    commandcode:
+      displayName: CommandCode
+      apiKeyEnv: __REF__
+      api: openai-completions
+      baseURL: https://api.commandcode.ai/provider/v1
+      headers:
+        x-cmd-zdr: "1"
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 65536
+      defaultInput:
+        - text
+      compat:
+        supportsStore: false
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        requiresReasoningContentOnAssistantMessages: true
+        thinkingFormat: deepseek
+      models:
+        - id: deepseek/deepseek-v4.1-flash
+          name: DeepSeek V4.1 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+            max: max
+        - id: deepseek/deepseek-v4-flash
+          name: DeepSeek V4 Flash
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+            max: max
+        - id: deepseek/deepseek-v4-pro
+          name: DeepSeek V4 Pro
+          contextWindow: 1000000
+          maxTokens: 65536
+          input:
+            - text
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+            max: max

@@ -11,6 +11,8 @@ DeepSeek Harness（DSH）插件集合。
 | `scripts/usage-cli.ps1` | 纯命令行查用量，不装插件也能用 |
 | `provider/deepseek/` | DeepSeek 官方 provider 配置（模型目录含视觉模态），用 `Install-DeepSeek.ps1` 一键装 |
 | `scripts/Install-DeepSeek.ps1` | 一键装/卸 DeepSeek 配置（桌面 settings 模式 / CLI profile 模式） |
+| `provider/commandcode/` | CommandCode provider 路由模板（DeepSeek V4.1 Flash / V4 Flash / V4 Pro，带 ZDR 开关） |
+| `scripts/Install-CommandCode.sh` | 一键装/卸 CommandCode 路由，与 OpenCode Go 路由共存（macOS / Linux） |
 
 ## 给别人的一页说明（可直接转发）
 
@@ -33,6 +35,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-DshPlugin.ps
 - 只想要命令行、不装 UI：`powershell -File scripts\usage-cli.ps1`
 - 也想用 DeepSeek 官方模型：`powershell -File scripts\Install-DeepSeek.ps1`（详见「DeepSeek 官方 provider 配置」）
 - 5 路 OpenCode Go 路由（每路独立 key、独立 session header）被 App 写回后，用 `powershell -File scripts\Install-OpenCodeGo.ps1` 一条命令重放（详见「OpenCode Go 五路路由」）
+- 也要用 CommandCode 的 DeepSeek V4.1 Flash：`scripts/Install-CommandCode.sh`（需 GOAT 或以上套餐，详见「CommandCode 路由」）
 - 安装器只需要 PowerShell；找不到 node 时会跳过 YAML 校验并保留备份，不影响安装
 - **macOS / Linux 不需要 PowerShell**：同一套安装器有 `.sh` 版本，语义与 `.ps1` 一致（详见「macOS / Linux 安装」）
 
@@ -112,6 +115,39 @@ scripts/Install-OpenCodeGo.sh --uninstall
 - DSH Desktop 改 UI 偏好时会按自己的快照重写 `settings.yaml`，把这一段退回；重跑安装器即恢复，这是设计上的重放路径。
 - 原有的**非受管** `llm-pi-ai` 段也会被整体替换（写前备份 `settings.yaml.bak-<时间戳>`，写后用 harness 的 YAML 解析器校验，失败自动回滚）。所以先跑一次 `-DryRun`。
 - 每条路由要有自己的 key（同名凭据引用或环境变量）；缺 key 的那一路在使用时报 `MISSING_CREDENTIAL`。
+
+## CommandCode 路由（DeepSeek V4.1 Flash 等）
+
+`provider/commandcode/` 里是一条 CommandCode 路由的模板：`commandcode`，一个 `apiKeyEnv`
+凭据引用（默认 `COMMANDCODE_API_KEY`），三个模型 `deepseek/deepseek-v4.1-flash`、
+`deepseek/deepseek-v4-flash`、`deepseek/deepseek-v4-pro`。
+
+```bash
+scripts/Install-CommandCode.sh                    # macOS / Linux
+scripts/Install-CommandCode.sh --ref MY_CMD_KEY   # 换凭据引用名
+scripts/Install-CommandCode.sh --set-default      # 顺便把 agent-default-model 指过来
+scripts/Install-CommandCode.sh --dry-run          # 只看会改什么，不写盘
+scripts/Install-CommandCode.sh --uninstall
+```
+
+- **和 OpenCode Go 路由共存**：本脚本只动自己 `# >>> dsh-commandcode route` /
+  `# <<< dsh-commandcode route` 之间的块，插在现有 `llm-pi-ai.providers` 映射里，不重写整个
+  `llm-pi-ai` 段，所以 `Install-OpenCodeGo.sh` 的重放不会互相冲掉。
+- 段不存在时会自己创建 `llm-pi-ai:` + `providers:`；块已存在时原地替换，重复运行结果一致（幂等）。
+- 写前备份 `settings.yaml.bak-<时间戳>`，写后用 harness 的 YAML 解析器校验，失败自动回滚。
+- **脚本从不写 key**：模板里的 `__REF__` 只替换成凭据引用名，key 留在 DSH 凭据存储
+  （`~/.dsh/.credentials.yaml` 的 `refs:` 段）或同名环境变量里。
+- 设置按请求重新读取，**新增路由无需重启**。
+
+要点（2026-09-17 实测）：
+
+- **套餐必须是 GOAT 或以上**。除 Go 套餐外都有 API 权限；Go 套餐的 key 打
+  `/provider/v1/chat/completions` 会返回 `403 upgrade_required`（但 `/provider/v1/models` 仍返回 200，
+  别用这个判断）。
+- 模板带 `x-cmd-zdr: "1"`，强制零数据留存。开了之后，**没有 ZDR 上游的模型会以 HTTP 422
+  `cmd_zdr_no_providers` 失败**，而不是悄悄回退到非 ZDR 路由。上面三个模型都实测支持 ZDR；要接
+  ZDR 不支持的模型，去掉这个 header。
+- 思考档位上游接受 `low | medium | high | xhigh`，`max` 也接受，**`none` 返回 HTTP 400**，所以模板里没有声明 `none`。
 
 ## DeepSeek 官方 provider 配置（一键安装）
 
