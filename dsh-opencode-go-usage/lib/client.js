@@ -211,15 +211,9 @@ window.__ModuleLoader__.load({
             return row ? row[window] : "—";
         }
         function AccountRows({ accounts, activeAccount, previous }) {
-            // CommandCode windows carry money, OpenCode windows only carry a percent, so the
-            // same cell renders the unit the row actually reports instead of faking one.
-            const valueCell = (row, entry) => {
-                if (isCommandCode(row)) {
-                    const warn = entry && typeof entry.percent === "number" && entry.percent >= WARN_PERCENT;
-                    return h("td", warn ? { "data-warn": "true" } : null, moneyText(entry));
-                }
-                return percentCell(entry);
-            };
+            // Both readers report window percentages, so every row uses the same percent
+            // cells; the CommandCode money view stays available in the tooltip.
+            const valueCell = (row, entry) => percentCell(entry);
             const rows = accounts.map((row) => h("tr", {
                 key: row.account,
                 "data-active": row.account === activeAccount ? "true" : null
@@ -346,6 +340,7 @@ window.__ModuleLoader__.load({
                 ? [
                     "在用 " + picked.route + "（" + active.account + "）",
                     isCommandCode(active) && active.planId ? "套餐 " + active.planId : null,
+                    isCommandCode(active) ? "金额 5h " + moneyText(active.rolling) + " · 周 " + moneyText(active.weekly) + " · 月 " + moneyText(active.monthly) + (active.monthly && typeof active.monthly.remaining === "number" ? "（剩 $" + active.monthly.remaining.toFixed(2) + "）" : "") : null,
                     "5 小时 " + windowText(active.rolling) + " · 周 " + windowText(active.weekly) + " · 月 " + windowText(active.monthly),
                     isCommandCode(active) && typeof active.spend === "number" ? "本周期已花 $" + active.spend.toFixed(2) : null,
                     active.weekly && active.weekly.resetsAt ? "周重置 " + whenText(active.weekly.resetsAt) : null
