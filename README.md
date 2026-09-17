@@ -11,8 +11,67 @@ DeepSeek Harness（DSH）插件集合。
 | `scripts/usage-cli.ps1` | 纯命令行查用量，不装插件也能用 |
 | `provider/deepseek/` | DeepSeek 官方 provider 配置（模型目录含视觉模态），用 `Install-DeepSeek.ps1` 一键装 |
 | `scripts/Install-DeepSeek.ps1` | 一键装/卸 DeepSeek 配置（桌面 settings 模式 / CLI profile 模式） |
-| `provider/commandcode/` | CommandCode provider 路由模板（DeepSeek V4.1 Flash / V4 Flash / V4 Pro，带 ZDR 开关） |
+| `provider/commandcode/` | CommandCode provider 路由模板（DeepSeek V4.1 Flash / V4 Flash / V4 Pro，ZDR 默认关闭） |
 | `scripts/Install-CommandCode.sh` | 一键装/卸 CommandCode 路由，与 OpenCode Go 路由共存（macOS / Linux） |
+
+> ⚠️ **配 CommandCode 前先读下面的「踩坑」一节** —— 默认开 ZDR 会让额度砍到 1/3。
+
+## ⚠️ 先读这个：配 CommandCode 时踩过的坑
+
+这四条都是真实踩过的，其中前两条直接造成了金钱和功能损失。**配之前先看，能省很多事。**
+
+### 1. 不要默认开 `x-cmd-zdr` —— 额度直接砍到 1/3
+
+CommandCode 官方 ZDR 页面原文：
+
+> **Metered at the default allowance**: ZDR requests use your plan's default allowance,
+> **even if a model normally has a higher boosted allowance**. That means **$20 on GOAT** …
+> the same credits buy fewer ZDR requests than regular ones.
+
+| `deepseek-v4.1-flash` 月额度（GOAT） | |
+| --- | --- |
+| 不开 ZDR | **$60** |
+| **开 ZDR** | **$20** ← 少 3 倍 |
+
+而且 ZDR 可能路由到更贵的上游，单价也更高。**当初把它设成默认值，直接导致额度砍到 1/3、
+消耗速度远超 OpenCode Go。** 模板现在默认不带这个头，要开得显式加 `--zdr`。
+
+### 2. 模型能力必须声明对，否则附件被静默丢弃
+
+模板曾把三个模型**全部**声明成 `input: [text]`，于是 DSH 在**发请求前**就把图片丢掉了 ——
+模型明明能看图，却表现得像纯文本，而且**不报错**。
+
+声明前必须实测（同一张已知内容的图）：
+
+| 模型 | 图片 |
+| --- | --- |
+| `deepseek/deepseek-v4.1-flash` | ✅ |
+| `deepseek/deepseek-v4-flash` | ✅ |
+| `deepseek/deepseek-v4-pro` | ❌ 上游回 *I can't read the image* |
+
+反过来也危险：给不支持的模型声明 `image`，附件同样会被静默丢掉。**别声明模型没有的能力。**
+
+### 3. 诊断性能问题：先配对实验，别拿单次采样下结论
+
+排查上面的额度问题时，曾用 **n=1 的单次请求**得出「ZDR 导致 prompt cache 失效、贵 35 倍」的结论，
+并据此改了配置 —— **这个结论是错的**。后来做 16 轮配对实验：
+
+```
+带 ZDR    命中 16/16   中位 99.2%
+不带 ZDR  命中 15/16   中位 99.2%
+```
+
+缓存和 ZDR 无关。真正原因是第 1 条的额度降级。当时那次 0% 命中，是因为上游在多个后端间负载均衡
+（每次响应的 `system_fingerprint` 都不同），**偶然落到了冷后端**。
+
+> 教训：判断缓存/性能这类有抖动的指标，先做足够轮次的配对实验；单次 `0%` 或 `100%` 都不构成证据。
+
+### 4. 改 `settings.yaml` 的脚本要隔离测试，并防止误写真机
+
+安装器最初写了 `DSH_HOME=""`，把外部传入的 `DSH_HOME` 环境变量覆盖掉了 —— 于是本该写进
+`/tmp` 沙箱的测试，**直接写进了真实 `~/.dsh/settings.yaml`**（幸好有自动备份，且结果良性）。
+
+写 `settings.yaml` 的脚本务必：继承外部 `DSH_HOME`、写前备份、写后回读校验、提供 `--dry-run`。
 
 ## 给别人的一页说明（可直接转发）
 
@@ -152,11 +211,7 @@ scripts/Install-CommandCode.sh --uninstall
   | `deepseek/deepseek-v4-flash` | ✅ |
   | `deepseek/deepseek-v4-pro` | ❌ 纯文本（上游回 *I can't read the image*） |
 
-- 模板**默认不带** `x-cmd-zdr`；要零留存加 `--zdr`。**但开 ZDR 会明显更贵**，官方 ZDR 页面写得很明确：
-  > *Metered at the default allowance: ZDR requests use your plan's default allowance, even if a model normally has a higher boosted allowance. That means $20 on GOAT … the same credits buy fewer ZDR requests than regular ones.*
-
-  具体到 `deepseek-v4.1-flash`：不开 → 额度 **$60**；开了 → 被压到默认额度 **$20**（**少 3 倍**），
-  而且 ZDR 可能路由到更贵的上游，单价也更高。**所以除非确实需要零留存，否则不要开。**
+- 模板**默认不带** `x-cmd-zdr`；要零留存才加 `--zdr`。**开 ZDR 会让额度砍到 1/3，详见开头「踩坑」第 1 条。**
 - 开了 ZDR 之后，没有 ZDR 上游的模型会以 HTTP 422 `cmd_zdr_no_providers` 失败，而不是悄悄回退。
 - 思考档位上游接受 `low | medium | high | xhigh`，`max` 也接受，**`none` 返回 HTTP 400**，所以模板里没有声明 `none`。
 
