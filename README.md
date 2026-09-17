@@ -13,6 +13,7 @@ DeepSeek Harness（DSH）插件集合。
 | `scripts/Install-DeepSeek.ps1` | 一键装/卸 DeepSeek 配置（桌面 settings 模式 / CLI profile 模式） |
 | `provider/commandcode/` | CommandCode provider 路由模板（DeepSeek V4.1 Flash / V4 Flash / V4 Pro，ZDR 默认关闭） |
 | `scripts/Install-CommandCode.sh` | 一键装/卸 CommandCode 路由，与 OpenCode Go 路由共存（macOS / Linux） |
+| `scripts/Install-CommandCode.ps1` | 同上的 **Windows / PowerShell** 版（同标记同插入点，两个脚本可互相接管；`-Ref` 默认 `COMMANDCODE_API_KEY`） |
 
 > ⚠️ **配 CommandCode 前先读下面的「踩坑」一节** —— 默认开 ZDR 会让额度砍到 1/3。
 
