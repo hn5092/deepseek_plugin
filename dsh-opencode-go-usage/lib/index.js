@@ -371,9 +371,13 @@ async function readCommandCodeAccount(ctx, ref, config, route) {
  * (provider/commandcode in the settings.yaml), so the browser half can match it against the
  * session's selected provider exactly like the numbered OpenCode routes.
  */
-function readCommandCodeRoute() {
-    return "commandcode";
-}
+    function readCommandCodeRoute(ref) {
+        // One route per account, numbered like the OpenCode routes: COMMANDCODE_API_KEY_2 is
+        // served by commandcode-2. The first account keeps the unsuffixed id so an existing
+        // single-route install keeps working.
+        const match = /(\d+)\s*$/.exec(ref ?? "");
+        return match && match[1] !== "1" ? "commandcode-" + match[1] : "commandcode";
+    }
 
 /** CommandCode references: the configured list plus discoverable `<prefix>` / `<prefix>_<n>`. */
 async function collectCommandCodeRefs(ctx, config) {
