@@ -53,7 +53,7 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-table th:nth-child(2),.dsw-ogu-table td:nth-child(2){text-align:left}",
             ".dsw-ogu-table td{color:var(--dsw-alias-label-secondary, inherit);text-align:right;padding:4px 8px;white-space:nowrap}",
             ".dsw-ogu-table td:first-child{color:var(--dsw-alias-label-primary, inherit)}",
-            ".dsw-ogu-table td[data-warn=true]{color:var(--dsw-alias-state-warn-label, #f59e0b);font-weight:600}",
+            ".dsw-ogu-table td[data-warn=true]{font-weight:600}",
             ".dsw-ogu-table tr[data-active=true] td{background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.08))}",
             ".dsw-ogu-table tr[data-active=true] td:first-child{font-weight:600}",
             ".dsw-ogu-meta{margin-top:8px;color:var(--dsw-alias-label-caption, inherit);font-size:11px}",
@@ -71,10 +71,13 @@ window.__ModuleLoader__.load({
             document.head.appendChild(tag);
         }
 
+        /** One decimal is plenty for a quota window; raw floats read as noise. */
+        function round1(value) { return Math.round(value * 10) / 10; }
+
         function windowText(entry) {
             if (!entry) return "—";
             if (typeof entry.percent !== "number") return entry.status || "—";
-            return entry.percent + "%";
+            return round1(entry.percent) + "%";
         }
 
         function percentOf(entry) {
@@ -202,7 +205,7 @@ window.__ModuleLoader__.load({
             if (typeof current !== "number" || typeof previous !== "number") return "—";
             const delta = current - previous;
             if (delta === 0) return "0%";
-            return (delta > 0 ? "+" : "") + delta + "%";
+            return (delta > 0 ? "+" : "") + round1(delta) + "%";
         }
 
         function rowDelta(previous, account, window) {
@@ -332,8 +335,8 @@ window.__ModuleLoader__.load({
             const tone = state.error && !state.payload ? "error" : (failures.length > 0 || worst >= WARN_PERCENT ? "warn" : "ok");
 
             const parts = [];
-            if (typeof headline.weekly === "number") parts.push("周 " + headline.weekly + "%");
-            if (typeof headline.monthly === "number") parts.push("月 " + headline.monthly + "%");
+            if (typeof headline.weekly === "number") parts.push("周 " + round1(headline.weekly) + "%");
+            if (typeof headline.monthly === "number") parts.push("月 " + round1(headline.monthly) + "%");
             const label = (headline.scope ? (active && isCommandCode(active) ? "CMD " : "GO ") + headline.scope + " · " : "GO ") + (parts.length > 0 ? parts.join(" · ") : "用量");
 
             const hint = active
@@ -348,9 +351,9 @@ window.__ModuleLoader__.load({
                 : (headline.sources && (headline.sources.weekly || headline.sources.monthly || headline.sources.rolling)
                     ? [
                         "未匹配到本会话选择的账号，显示全部账号的最高值",
-                        headline.sources.rolling ? "5 小时 " + headline.sources.rolling.percent + "%（" + headline.sources.rolling.account + "）" : null,
-                        headline.sources.weekly ? "周 " + headline.sources.weekly.percent + "%（" + headline.sources.weekly.account + "）" : null,
-                        headline.sources.monthly ? "月 " + headline.sources.monthly.percent + "%（" + headline.sources.monthly.account + "）" : null
+                        headline.sources.rolling ? "5 小时 " + round1(headline.sources.rolling.percent) + "%（" + headline.sources.rolling.account + "）" : null,
+                        headline.sources.weekly ? "周 " + round1(headline.sources.weekly.percent) + "%（" + headline.sources.weekly.account + "）" : null,
+                        headline.sources.monthly ? "月 " + round1(headline.sources.monthly.percent) + "%（" + headline.sources.monthly.account + "）" : null
                     ].filter(Boolean).join("；")
                     : "OpenCode Go 用量");
 
