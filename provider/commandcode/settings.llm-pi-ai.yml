@@ -1,6 +1,11 @@
 # CommandCode provider route for the DSH llm-pi-ai adapter.
 # Endpoint: https://api.commandcode.ai/provider/v1  (OpenAI Chat Completions)
 # Requires the GOAT plan or higher: a Go plan key gets 403 upgrade_required.
+#
+# Image input is declared per model, measured 2026-09-17 against this endpoint:
+# deepseek-v4.1-flash and deepseek-v4-flash both read a test PNG correctly,
+# while deepseek-v4-pro replies "I can't read the image" - so it stays text-only.
+# Declaring a capability the model lacks is what silently drops an attachment.
 # __REF__ is replaced by scripts/Install-CommandCode.sh with the credential
 # reference name; the key itself stays in the DSH credential store.
 #
@@ -40,6 +45,7 @@
           maxTokens: 65536
           input:
             - text
+            - image
           reasoningEfforts:
             low: low
             medium: medium
@@ -51,6 +57,7 @@
           maxTokens: 65536
           input:
             - text
+            - image
           reasoningEfforts:
             low: low
             medium: medium
