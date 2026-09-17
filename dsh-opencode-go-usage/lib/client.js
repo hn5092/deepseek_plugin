@@ -20,6 +20,8 @@ window.__ModuleLoader__.load({
         const HIT_PAD = 6;
         /** Route prefix used when a row carries no explicit route (see routeOf). */
         const ROUTE_PREFIX = "opencode-go";
+        /** Route name of the CommandCode row; must match readCommandCodeRoute in lib/index.js. */
+        const COMMANDCODE_ROUTE = "commandcode";
         /** Percent at or above which a window is called out in the warning color. */
         const WARN_PERCENT = 80;
 
@@ -142,6 +144,7 @@ window.__ModuleLoader__.load({
          */
         function routeOf(row) {
             if (row.route) return { route: row.route, derived: false };
+            if (isCommandCode(row)) return { route: COMMANDCODE_ROUTE, derived: false };
             const match = /(\d+)\s*$/.exec(row.account || "");
             return match ? { route: ROUTE_PREFIX + "-" + match[1], derived: true } : null;
         }
@@ -159,6 +162,30 @@ window.__ModuleLoader__.load({
         function routeLabel(route) {
             const match = /(\d+)\s*$/.exec(route || "");
             return match ? match[1] : route;
+        }
+
+        /** True for a row produced by the CommandCode reader (different columns apply). */
+        function isCommandCode(row) {
+            return row && row.source === "commandcode";
+        }
+
+        /** "$5.07 / $70 · 剩 $64.85" for a window that reports money, else the percent text. */
+        function moneyText(entry) {
+            if (!entry) return "—";
+            const money = (value) => (typeof value === "number" ? "$" + value.toFixed(2) : null);
+            const used = money(entry.used);
+            const cap = money(entry.cap);
+            if (used === null || cap === null) return windowText(entry);
+            return used + " / " + cap;
+        }
+
+        /** Compact token count: 76203851 -> "76.2M". */
+        function tokenText(value) {
+            if (typeof value !== "number") return "—";
+            if (value >= 1e9) return (value / 1e9).toFixed(1) + "B";
+            if (value >= 1e6) return (value / 1e6).toFixed(1) + "M";
+            if (value >= 1e3) return (value / 1e3).toFixed(1) + "K";
+            return String(value);
         }
 
         /** Most recent history sample that is not the one being displayed. */
@@ -184,18 +211,31 @@ window.__ModuleLoader__.load({
             return row ? row[window] : "—";
         }
         function AccountRows({ accounts, activeAccount, previous }) {
+            // CommandCode windows carry money, OpenCode windows only carry a percent, so the
+            // same cell renders the unit the row actually reports instead of faking one.
+            const valueCell = (row, entry) => {
+                if (isCommandCode(row)) {
+                    const warn = entry && typeof entry.percent === "number" && entry.percent >= WARN_PERCENT;
+                    return h("td", warn ? { "data-warn": "true" } : null, moneyText(entry));
+                }
+                return percentCell(entry);
+            };
             const rows = accounts.map((row) => h("tr", {
                 key: row.account,
                 "data-active": row.account === activeAccount ? "true" : null
             },
-                h("td", null, (row.account === activeAccount ? "▸ " : "") + row.account),
+                h("td", null, (row.account === activeAccount ? "▸ " : "") + row.account
+                    + (isCommandCode(row) && row.planId ? " (" + row.planId.replace(/^individual-/, "") + ")" : "")),
                 h("td", null, row.key || "—"),
-                percentCell(row.rolling),
-                percentCell(row.weekly),
-                percentCell(row.monthly),
+                valueCell(row, row.rolling),
+                valueCell(row, row.weekly),
+                valueCell(row, row.monthly),
                 h("td", null, whenText(row.weekly && row.weekly.resetsAt)),
                 h("td", null, deltaText(percentOf(row.weekly), rowDelta(previous, row.account, "weekly"))
-                    + " / " + deltaText(percentOf(row.monthly), rowDelta(previous, row.account, "monthly")))
+                    + " / " + deltaText(percentOf(row.monthly), rowDelta(previous, row.account, "monthly"))),
+                h("td", null, isCommandCode(row)
+                    ? tokenText(row.tokensIn) + "→" + tokenText(row.tokensOut) + " · " + (typeof row.requests === "number" ? row.requests : "—")
+                    : "—")
             ));
             return h("table", { className: "dsw-ogu-table" },
                 h("thead", null,
@@ -206,7 +246,8 @@ window.__ModuleLoader__.load({
                         h("th", null, "周"),
                         h("th", null, "月"),
                         h("th", null, "周重置"),
-                        h("th", null, "Δ周/Δ月")
+                        h("th", null, "Δ周/Δ月"),
+                        h("th", null, "Tokens入→出 · 请求")
                     )
                 ),
                 h("tbody", null, ...rows)
@@ -299,12 +340,14 @@ window.__ModuleLoader__.load({
             const parts = [];
             if (typeof headline.weekly === "number") parts.push("周 " + headline.weekly + "%");
             if (typeof headline.monthly === "number") parts.push("月 " + headline.monthly + "%");
-            const label = (headline.scope ? "GO " + headline.scope + " · " : "GO ") + (parts.length > 0 ? parts.join(" · ") : "用量");
+            const label = (headline.scope ? (active && isCommandCode(active) ? "CMD " : "GO ") + headline.scope + " · " : "GO ") + (parts.length > 0 ? parts.join(" · ") : "用量");
 
             const hint = active
                 ? [
                     "在用 " + picked.route + "（" + active.account + "）",
+                    isCommandCode(active) && active.planId ? "套餐 " + active.planId : null,
                     "5 小时 " + windowText(active.rolling) + " · 周 " + windowText(active.weekly) + " · 月 " + windowText(active.monthly),
+                    isCommandCode(active) && typeof active.spend === "number" ? "本周期已花 $" + active.spend.toFixed(2) : null,
                     active.weekly && active.weekly.resetsAt ? "周重置 " + whenText(active.weekly.resetsAt) : null
                 ].filter(Boolean).join("；")
                 : (headline.sources && (headline.sources.weekly || headline.sources.monthly || headline.sources.rolling)
@@ -331,13 +374,14 @@ window.__ModuleLoader__.load({
                     h("span", null, label)
                 ),
                 open ? h("div", { className: "dsw-ogu-panel" },
-                    h("div", { className: "dsw-ogu-title" }, "OpenCode Go 用量（5 小时 / 周 / 月）"),
+                    h("div", { className: "dsw-ogu-title" }, "用量（5 小时 / 周 / 月）· OpenCode Go + CommandCode"),
                     h(AccountRows, { accounts, activeAccount: active ? active.account : null, previous: previousSample(state.payload) }),
                     failures.length > 0 ? h("div", { className: "dsw-ogu-error" },
                         failures.map((row) => row.account + ": " + row.error).join("；")) : null,
                     h("div", { className: "dsw-ogu-meta" },
                         state.payload && state.payload.sampledAt
                             ? "采样于 " + whenText(state.payload.sampledAt) + "，面板每 30 秒刷新、后台每 30 分钟存一次历史；Δ = 相比上一次采样；≥" + WARN_PERCENT + "% 标黄"
+                                + "；Go 行为百分比，CMD 行为美元金额（已用/额度）"
                                 + (active ? "；▸ = " + (picked && picked.derived ? "按引用名尾号匹配的 " : "本会话选择的 ") + picked.route
                                     : (provider ? "；未找到 " + provider + " 对应的账号（按引用名尾号匹配）" : ""))
                             : "等待第一次采样…"),
