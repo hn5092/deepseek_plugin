@@ -6,19 +6,13 @@ import z from "@deepseek-ai/schemastery";
 /** Cordis plugin name; the profile patch row id stays independent of it. */
 export const name = "session-pins";
 
-/** Host services required before the pins route can register. */
+/** Host services required before the diagnostics route can register. */
 export const inject = ["webServer"];
 
 /** Refuse oversized request bodies instead of buffering them. */
 const MAX_BODY_BYTES = 64 * 1024;
-/** Session ids are short opaque strings; anything longer is junk, not a session. */
-const MAX_SESSION_ID_LENGTH = 200;
 
-/**
- * Writable state directory: %LOCALAPPDATA% on Windows, ~/Library/Application Support on
- * macOS, $XDG_STATE_HOME (else ~/.local/state) elsewhere, and only then the temp directory,
- * which the OS clears.
- */
+/** State directory used only to read the retired legacy file listed in the diagnostics. */
 function stateDir() {
     if (process.env.LOCALAPPDATA) return process.env.LOCALAPPDATA;
     const home = os.homedir();
@@ -28,20 +22,17 @@ function stateDir() {
     return os.tmpdir();
 }
 
-/** Resolved pins file: the configured path, else the per-user state directory. */
-function pinsFile(config) {
-    if (config.pinsPath) return config.pinsPath;
+/** Where the pre-native build kept its own pin document, if it is still on disk. */
+function legacyPinsFile() {
     return path.join(stateDir(), "session-pins", "pins.json");
 }
 
 export const Config = z.object({
-    /** Exact route the browser half reads and writes. Changing it also means changing lib/client.js. */
+    /** Exact route the browser half posts its breadcrumbs to. Changing it also means changing lib/client.js. */
     path: z.string().default("/session-pins"),
-    /** JSONL-free single document; empty uses the per-user state directory. */
+    /** Retired: pin state lives in the shell now. Kept so an existing patch row still validates. */
     pinsPath: z.string().default(""),
-    /** Upper bound on pinned conversations, so a runaway client cannot grow the file. */
     maxPins: z.number().step(1).min(1).default(50),
-    /** Longest stored title; longer ones are truncated instead of rejected. */
     maxTitleLength: z.number().step(1).min(1).default(200)
 });
 
@@ -49,58 +40,7 @@ function messageOf(error) {
     return error instanceof Error ? error.message : String(error);
 }
 
-/** One stored pin, or null when the record is unusable. */
-function normalizePin(value, maxTitleLength) {
-    if (!value || typeof value !== "object") return null;
-    const sessionId = typeof value.sessionId === "string" ? value.sessionId.trim() : "";
-    if (!sessionId || sessionId.length > MAX_SESSION_ID_LENGTH) return null;
-    const title = typeof value.title === "string" ? value.title.slice(0, maxTitleLength) : "";
-    const workspaceId = typeof value.workspaceId === "string" ? value.workspaceId : null;
-    const pinnedAt = typeof value.pinnedAt === "string" ? value.pinnedAt : new Date().toISOString();
-    return { sessionId, title, workspaceId, pinnedAt };
-}
-
-/** Read the document; an absent or unreadable file is an empty pin list, never a throw. */
-function readPins(file, maxTitleLength) {
-    let text;
-    try {
-        text = fs.readFileSync(file, "utf8");
-    } catch {
-        return [];
-    }
-    let parsed;
-    try {
-        parsed = JSON.parse(text);
-    } catch {
-        // A corrupted document must not take the sidebar down; keep the file for inspection.
-        return [];
-    }
-    const rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.pins) ? parsed.pins : [];
-    const pins = [];
-    const seen = new Set();
-    for (const row of rows) {
-        const pin = normalizePin(row, maxTitleLength);
-        if (pin === null || seen.has(pin.sessionId)) continue;
-        seen.add(pin.sessionId);
-        pins.push(pin);
-    }
-    return pins;
-}
-
-/** Write the document atomically (temp + rename) and read it back before trusting it. */
-function writePins(file, pins) {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify({ version: 1, pins }, null, 2) + "\n", "utf8");
-    fs.renameSync(tmp, file);
-    const readBack = readPins(file, Number.MAX_SAFE_INTEGER);
-    if (readBack.length !== pins.length) {
-        throw new Error(`pins file did not read back (${readBack.length} of ${pins.length} rows)`);
-    }
-    return readBack;
-}
-
-/** Buffer a request body with a hard cap, or reject. */
+/** Read a request body with a hard byte ceiling. */
 function readBody(request) {
     return new Promise((resolve, reject) => {
         let size = 0;
@@ -131,47 +71,31 @@ function sameOrigin(request) {
 }
 
 /**
- * Pinned-conversation store behind the sidebar area. The browser half owns the pixels and
- * the session titles; this half owns durability, so pins survive a reload, a restart and a
- * cleared browser profile.
+ * Diagnostics endpoint for the pinned-conversation area.
+ *
+ * This half holds NO pin state. Pinning is a shell capability: `uiWorkspace` owns the document
+ * (`workspaces.list.pinnedSessionIds`) and the writes. A second store here would be a competing
+ * source of truth that the sidebar, the row hover button and the row menu could not agree with,
+ * which is exactly what an earlier revision of this plugin suffered from. What remains is the
+ * breadcrumb channel the browser half reports through, so a page-side failure can be read from
+ * the host without a devtools session.
  */
 export function apply(ctx, config) {
-    const file = pinsFile(config);
-    let pins = readPins(file, config.maxTitleLength);
-    let lastError = null;
-    // In-memory breadcrumbs from the browser half: the only cheap way to see what the page
-    // actually did when a DOM/primitive seam does not behave. Never persisted.
     const notes = [];
+    let lastError = null;
 
     const payload = () => ({
-        pins,
-        store: file,
+        /** Always empty: the shell owns pins. Kept so callers can tell this half is inert. */
+        pins: [],
+        /** Document the retired build wrote, reported for cleanup awareness only. */
+        legacyStore: legacyPinsFile(),
+        legacyStorePresent: fs.existsSync(legacyPinsFile()),
+        owner: "uiWorkspace",
         maxPins: config.maxPins,
         sampledAt: new Date().toISOString(),
         error: lastError,
         notes
     });
-
-    const pin = (body) => {
-        const sessionId = typeof body?.sessionId === "string" ? body.sessionId.trim() : "";
-        if (!sessionId || sessionId.length > MAX_SESSION_ID_LENGTH) throw new Error("sessionId is required");
-        const title = typeof body?.title === "string" ? body.title.slice(0, config.maxTitleLength) : "";
-        const workspaceId = typeof body?.workspaceId === "string" ? body.workspaceId : null;
-        const existing = pins.find((row) => row.sessionId === sessionId);
-        if (existing) {
-            // Re-pinning refreshes the stored metadata instead of moving the row.
-            pins = pins.map((row) => (row.sessionId === sessionId ? { ...row, title: title || row.title, workspaceId: workspaceId ?? row.workspaceId } : row));
-            return;
-        }
-        if (pins.length >= config.maxPins) throw new Error(`at most ${config.maxPins} conversations can be pinned`);
-        pins = [{ sessionId, title, workspaceId, pinnedAt: new Date().toISOString() }, ...pins];
-    };
-
-    const unpin = (body) => {
-        const sessionId = typeof body?.sessionId === "string" ? body.sessionId.trim() : "";
-        if (!sessionId) throw new Error("sessionId is required");
-        pins = pins.filter((row) => row.sessionId !== sessionId);
-    };
 
     const handler = async (request, response) => {
         const send = (status, body) => {
@@ -215,27 +139,10 @@ export function apply(ctx, config) {
                 send(200, { ok: true, ...payload() });
                 return;
             }
-            const before = pins;
-            if (body?.action === "pin") pin(body);
-            else if (body?.action === "unpin") unpin(body);
-            else {
-                send(400, { error: "action must be 'pin' or 'unpin'" });
-                return;
-            }
-            try {
-                pins = writePins(file, pins);
-                lastError = null;
-            } catch (error) {
-                // Keep serving the previous state rather than a half-applied one.
-                pins = before;
-                lastError = messageOf(error);
-                ctx.logger.warn("session-pins: could not persist %s: %s", file, lastError);
-                send(500, { error: lastError, ...payload() });
-                return;
-            }
-            send(200, payload());
+            send(400, { error: "this half is diagnostics-only; pinning is owned by uiWorkspace" });
         } catch (error) {
-            send(400, { error: messageOf(error) });
+            lastError = messageOf(error);
+            send(400, { error: lastError, ...payload() });
         }
     };
 

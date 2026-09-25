@@ -9,12 +9,10 @@ window.__ModuleLoader__.load({
         const { createRoot } = require("react-dom/client");
         const h = react.createElement;
 
-        /** Exact route registered by the host half; keep in sync with lib/index.js `path`. */
+        /** Diagnostics route registered by the host half. Holds no pin state. */
         const ROUTE = "/session-pins";
         /** Bumped whenever the browser half changes: the host echo tells which build a page runs. */
-        const BUILD = "pins-2";
-        /** Re-read the host document occasionally so two windows do not drift apart. */
-        const POLL_MS = 30000;
+        const BUILD = "pins-3-native";
         /**
          * Slot outlet the area is injected next to. The renderer wraps every slot in
          * `<div data-slot="<key>">`, which is a stable hook; nothing here depends on the
@@ -27,7 +25,7 @@ window.__ModuleLoader__.load({
         const MIN_WIDTH = 120;
         /** Candidates offered by the picker. */
         const MAX_CANDIDATES = 40;
-        const EMPTY_SNAPSHOT = Object.freeze({ ids: Object.freeze([]), byId: Object.freeze({}) });
+        const EMPTY_SNAPSHOT = Object.freeze({ ids: Object.freeze([]), byId: Object.freeze({}), pinnedSessionIds: Object.freeze([]) });
 
         const CSS = [
             `.dsw-pins{padding:2px 8px 0;font-size:14px;line-height:20px;color:var(--dsw-alias-label-primary)}`,
@@ -41,6 +39,11 @@ window.__ModuleLoader__.load({
             `.dsw-pins-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}`,
             `.dsw-pins-row[data-missing=true] .dsw-pins-title{color:var(--dsw-alias-label-tertiary);text-decoration:line-through}`,
             `.dsw-pins-time{flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:20px}`,
+            // The short Session id, so an external agent (Codex) can name the exact conversation.
+            `.dsw-pins-id{flex:none;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10px;line-height:16px;`,
+            `color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-interactive-bg-hover);border-radius:4px;padding:0 5px;cursor:copy}`,
+            `.dsw-pins-id:hover{color:var(--dsw-alias-label-primary)}`,
+            `.dsw-pins-id[data-copied=true]{color:var(--dsw-alias-state-business-primary, #4d6bfe)}`,
             `.dsw-pins-row:hover .dsw-pins-time{display:none}`,
             `.dsw-pins-remove{display:none;flex:none}`,
             `.dsw-pins-row:hover .dsw-pins-remove{display:inline-flex}`,
@@ -129,257 +132,90 @@ window.__ModuleLoader__.load({
             }, h("circle", { cx: 8, cy: 6, r: 2.6 }), h("path", { d: "M8 8.6V14" }));
         }
 
-        async function mutate(action, payload) {
-            const response = await fetch(ROUTE, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ action, ...payload })
-            });
-            const body = await response.json().catch(() => null);
-            if (!response.ok) throw new Error((body && body.error) || "HTTP " + response.status);
-            return body;
+        /** Session ids are `session-<uuid>`; the first uuid block is enough to name one. */
+        function shortId(sessionId) {
+            const raw = String(sessionId || "").replace(/^session-/, "");
+            return raw.slice(0, 8);
         }
 
-        // ---- shared pin state ----------------------------------------------------------
-        // The pinned area, the conversation-header button and the row-menu item all read the
-        // same list. The menu item is rendered outside React, so the last fetched document is
-        // cached here and every mutation notifies the mounted readers.
-
-        /** Id of the item appended to a session row's menu. */
-        const PIN_ITEM_ID = "dsh-session-pins:toggle";
-        let pinsCache = [];
-        let externalError = null;
-        const pinListeners = new Set();
-
-        function notifyPinReaders() {
-            for (const listener of [...pinListeners]) {
+        /** Subscribe to one of the shell's snapshot stores without breaking React's identity rule. */
+        function useSnapshotStore(store) {
+            const subscribe = react.useCallback((listener) => {
+                if (store && typeof store.subscribe === "function") return store.subscribe(listener);
+                return () => {};
+            }, [store]);
+            const getSnapshot = react.useCallback(() => {
                 try {
-                    listener();
+                    const snapshot = store && typeof store.getSnapshot === "function" ? store.getSnapshot() : null;
+                    return snapshot || EMPTY_SNAPSHOT;
                 } catch {
-                    // One broken reader must not stop the others.
+                    return EMPTY_SNAPSHOT;
                 }
-            }
+            }, [store]);
+            return react.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
         }
 
-        function reportActionError(message) {
-            externalError = message;
-            notifyPinReaders();
+        /**
+         * The shell owns pinning: `uiWorkspace.workspaces.list` is the authoritative snapshot and
+         * `pinSession`/`unpinSession` the only writes. This plugin never stores a pin itself, so
+         * the sidebar area, the row hover button and the row menu cannot disagree.
+         */
+        function pinStoreOf(workspace) {
+            return workspace && workspace.workspaces && workspace.workspaces.list ? workspace.workspaces.list : null;
         }
 
-        function acceptPins(pins) {
-            pinsCache = Array.isArray(pins) ? pins : [];
-            externalError = null;
+        function usePinnedIds(workspace) {
+            const snapshot = useSnapshotStore(pinStoreOf(workspace));
+            const ids = snapshot && Array.isArray(snapshot.pinnedSessionIds) ? snapshot.pinnedSessionIds : EMPTY_SNAPSHOT.pinnedSessionIds;
+            return ids;
         }
 
-        async function togglePin(sessionId, title) {
-            const pinned = pinsCache.some((pin) => pin.sessionId === sessionId);
-            const body = await mutate(pinned ? "unpin" : "pin", { sessionId, title: title || "" });
-            acceptPins(body && body.pins);
-            notifyPinReaders();
-            return !pinned;
+        /** Live session catalog from the shell: titles, recency, current selection. */
+        function useSessions(sessions) {
+            return useSnapshotStore(sessions && sessions.list);
         }
 
-        /** Live session summary for an id, from the same store the sidebar reads. */
-        function summaryOf(sessions, sessionId) {
-            try {
-                const store = sessions && sessions.list;
-                const snapshot = store && typeof store.getSnapshot === "function" ? store.getSnapshot() : null;
-                return (snapshot && snapshot.byId && snapshot.byId[sessionId]) || null;
-            } catch {
-                return null;
-            }
-        }
-
-        // ---- session-row menu item -----------------------------------------------------
-        // DSH declares no slot for the row menu, and that menu's primitive lives in a frozen
-        // platform seed namespace (`Object.freeze(...)` in the shell bundle), so the item
-        // cannot be added by wrapping a module. The popup is portaled to <body> as
-        // `div[role="menu"]` and its rows come from the workspace plugin's own array, so the
-        // item is injected into that popup instead: the last item is cloned (keeping the
-        // primitive's markup, classes and hover behaviour), relabelled, re-iconed and wired
-        // to this plugin. Nothing else in the menu is touched.
-
-        /** Marks an item this plugin injected, so a re-render cannot duplicate it. */
-        const MENU_ITEM_ATTR = "data-dsh-session-pins-item";
-        /** Fallback signal when geometry cannot link a popup to a row (both locales). */
-        const SESSION_MENU_LABELS = ["分叉会话", "归档会话", "Fork session", "Archive session", "Fork Session", "Archive Session"];
-        /** Row whose trigger the pointer last pressed; the first candidate for a popup. */
-        let lastPointerRow = null;
-
-        function reactFiberOf(node) {
-            for (const key of Object.keys(node)) {
-                if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")) return node[key];
-            }
-            return null;
-        }
-
-        /** Walk the React tree above a row element looking for the session object it renders. */
-        function sessionIdFromRow(row) {
-            let fiber = reactFiberOf(row);
-            let depth = 0;
-            while (fiber && depth < 40) {
-                const props = fiber.memoizedProps;
-                if (props && typeof props === "object") {
-                    for (const key of ["node", "session", "row"]) {
-                        const candidate = props[key];
-                        if (candidate && typeof candidate.id === "string" && candidate.id.length > 0) return candidate.id;
-                    }
-                }
-                fiber = fiber.return;
-                depth += 1;
-            }
-            return null;
-        }
-
-        /** Session row a popup belongs to: the row whose trigger was pressed, else the nearest. */
-        function rowForPopup(menu) {
-            let rect;
-            try {
-                rect = menu.getBoundingClientRect();
-            } catch {
-                return lastPointerRow !== null && lastPointerRow.isConnected ? lastPointerRow : null;
-            }
-            if (rect.height === 0 && rect.width === 0) return lastPointerRow !== null && lastPointerRow.isConnected ? lastPointerRow : null;
-            const near = (row) => {
-                const box = row.getBoundingClientRect();
-                return rect.top >= box.top - 120 && rect.top <= box.bottom + 120;
-            };
-            if (lastPointerRow !== null && lastPointerRow.isConnected && near(lastPointerRow)) return lastPointerRow;
-            let best = null;
-            let bestDistance = Infinity;
-            for (const row of document.querySelectorAll('[role="treeitem"]')) {
-                const box = row.getBoundingClientRect();
-                const distance = Math.abs(box.top - rect.top);
-                if (distance < bestDistance && near(row)) {
-                    bestDistance = distance;
-                    best = row;
-                }
-            }
-            return best;
-        }
-
-        /** Whether the popup looks like a session menu, used when no row can be matched. */
-        function looksLikeSessionMenu(menu) {
-            const labels = [...menu.querySelectorAll('button[role="menuitem"]')].map((button) => (button.textContent || "").trim());
-            return labels.some((label) => SESSION_MENU_LABELS.includes(label));
-        }
-
-        /** Close the popup the way the primitive does (it listens for Escape on the document). */
-        function closeMenu() {
-            document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-        }
-
-        /** The pin mark as a DOM node, so the cloned item can carry the same icon. */
-        function pinSvgNode(size) {
-            const ns = "http://www.w3.org/2000/svg";
-            const svg = document.createElementNS(ns, "svg");
-            for (const [name, value] of Object.entries({
-                width: String(size), height: String(size), viewBox: "0 0 16 16", fill: "none",
-                stroke: "currentColor", "stroke-width": "1.5", "stroke-linecap": "round", "aria-hidden": "true"
-            })) svg.setAttribute(name, value);
-            const circle = document.createElementNS(ns, "circle");
-            for (const [name, value] of Object.entries({ cx: "8", cy: "6", r: "2.6" })) circle.setAttribute(name, value);
-            const path = document.createElementNS(ns, "path");
-            path.setAttribute("d", "M8 8.6V14");
-            svg.appendChild(circle);
-            svg.appendChild(path);
-            return svg;
-        }
-
-        function labelElement(button) {
-            return button.querySelector('[class*="itemLabel"]') || button.lastElementChild;
-        }
-
-        function injectIntoMenu(ctx, sessions, menu) {
-            if (menu.querySelector("[" + MENU_ITEM_ATTR + "]") !== null) return;
-            const viewport = menu.querySelector('[role="presentation"]') || menu;
-            const templates = [...viewport.children].filter((child) => child.querySelector && child.querySelector('button[role="menuitem"]') !== null);
-            if (templates.length === 0) return;
-            const row = rowForPopup(menu);
-            if (row === null && !looksLikeSessionMenu(menu)) return;
-
-            const sessionId = row === null ? null : sessionIdFromRow(row);
-            const pinned = sessionId !== null && pinsCache.some((pin) => pin.sessionId === sessionId);
-            const clone = templates[templates.length - 1].cloneNode(true);
-            clone.setAttribute(MENU_ITEM_ATTR, "1");
-            const button = clone.querySelector('button[role="menuitem"]') || clone;
-            const label = labelElement(button);
-            if (label !== null) label.textContent = pinned ? "取消置顶" : "置顶";
-            const icon = button.querySelector('[class*="itemIcon"]');
-            if (icon !== null) icon.replaceChildren(pinSvgNode(16));
-            clone.addEventListener("click", (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                // Resolve before closing: once the popup is gone its geometry is unusable.
-                const targetRow = rowForPopup(menu);
-                const id = targetRow === null ? sessionId : (sessionIdFromRow(targetRow) || sessionId);
-                closeMenu();
-                if (id === null) {
-                    reportActionError("置顶：没能识别这一行的会话，请用置顶区的「＋」");
-                    return;
-                }
-                const summary = summaryOf(sessions, id);
-                note("menu item clicked: sessionId=" + id);
-                void togglePin(id, (summary && summary.title) || (targetRow && targetRow.textContent) || "").catch((error) => {
-                    reportActionError("置顶失败：" + messageOf(error));
-                });
-            }, true);
-            templates[templates.length - 1].insertAdjacentElement("afterend", clone);
-            note("menu item injected: " + (pinned ? "unpin" : "pin") + " row=" + (row === null ? "geometry" : "matched"));
-        }
-
-        /** Watch for the row popup appearing (it is portaled to <body> on every open). */
-        function watchSessionMenus(ctx, sessions) {
-            const seen = new WeakSet();
-            const consider = (node) => {
-                if (!(node instanceof Element)) return;
-                const menus = [];
-                if (node.matches('[role="menu"]')) menus.push(node);
-                if (node.querySelectorAll) menus.push(...node.querySelectorAll('[role="menu"]'));
-                for (const menu of menus) {
-                    if (seen.has(menu)) continue;
-                    seen.add(menu);
+        /** Short id chip; clicking copies the full id so an external agent can be pointed at it. */
+        function SessionIdChip({ sessionId, onCopy }) {
+            const [copied, setCopied] = react.useState(false);
+            return h("span", {
+                className: "dsw-pins-id",
+                "data-copied": copied ? "true" : null,
+                title: "会话 ID：" + sessionId + "（点击复制）",
+                onClick: (event) => {
+                    event.stopPropagation();
+                    let ok = false;
                     try {
-                        injectIntoMenu(ctx, sessions, menu);
-                    } catch (error) {
-                        note("menu inject failed: " + messageOf(error));
+                        void navigator.clipboard.writeText(sessionId);
+                        ok = true;
+                    } catch {
+                        ok = false;
                     }
+                    if (ok && typeof onCopy === "function") onCopy(sessionId);
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1200);
                 }
-            };
-            const observer = new MutationObserver((records) => {
-                for (const record of records) {
-                    for (const node of record.addedNodes) consider(node);
-                }
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
-            const onPointerDown = (event) => {
-                const target = event.target;
-                const row = target && target.closest ? target.closest('[role="treeitem"]') : null;
-                if (row) lastPointerRow = row;
-            };
-            document.addEventListener("pointerdown", onPointerDown, true);
-            return () => {
-                observer.disconnect();
-                document.removeEventListener("pointerdown", onPointerDown, true);
-            };
+            }, copied ? "已复制" : shortId(sessionId));
         }
 
-        /** Pin toggle for the conversation header (a declared, session-scoped slot). */
-        function PinHeaderAction({ sessionId, useSessions }) {
-            const [state, refresh] = usePins();
-            const snapshot = typeof useSessions === "function" ? useSessions((value) => value) : null;
-            const summary = snapshot && snapshot.byId ? snapshot.byId[sessionId] : null;
-            const title = (summary && summary.title) || "";
-            const pinned = state.pins.some((pin) => pin.sessionId === sessionId);
+        /**
+        * Pin toggle for the conversation header (a declared, session-scoped slot). Built by a
+        * factory so the slot component closes over the live services instead of guessing at
+        * props the slot never passes.
+        * @param workspace - the `uiWorkspace` service that owns pin state.
+        * @returns the slot component.
+        */
+        function makeHeaderAction(workspace) {
+        return function PinHeaderAction({ sessionId }) {
+            const pinnedIds = usePinnedIds(workspace);
+            const pinned = pinnedIds.includes(sessionId);
             const [busy, setBusy] = react.useState(false);
             const [error, setError] = react.useState(null);
             const onClick = async () => {
                 setBusy(true);
                 try {
-                    const body = await mutate(pinned ? "unpin" : "pin", { sessionId, title });
-                    acceptPins(body && body.pins);
-                    await refresh();
-                    notifyPinReaders();
+                    if (pinned) await workspace.unpinSession(sessionId);
+                    else await workspace.pinSession(sessionId);
                     setError(null);
                 } catch (failure) {
                     setError(messageOf(failure));
@@ -398,68 +234,12 @@ window.__ModuleLoader__.load({
                 disabled: busy,
                 onClick
             }, h(PinIcon, { size: 16 }));
-        }
-
-        /** Host half document (pins) with its own refresh, so a mutation is visible immediately. */
-        function usePins() {
-            const [state, setState] = react.useState({ pins: [], error: null, loaded: false });
-            const refresh = react.useCallback(async () => {
-                try {
-                    const response = await fetch(ROUTE, { headers: { accept: "application/json" } });
-                    if (!response.ok) throw new Error("HTTP " + response.status);
-                    const body = await response.json();
-                    acceptPins(body && body.pins);
-                    setState({
-                        pins: pinsCache,
-                        error: (body && body.error) || null,
-                        loaded: true
-                    });
-                } catch (error) {
-                    setState((previous) => ({ ...previous, error: messageOf(error), loaded: true }));
-                }
-            }, []);
-            react.useEffect(() => {
-                let alive = true;
-                const run = () => { if (alive) void refresh(); };
-                const onShared = () => {
-                    if (!alive) return;
-                    // Another entry point (menu item, header button) changed the document.
-                    run();
-                    setState((previous) => ({ ...previous, sharedError: externalError }));
-                };
-                pinListeners.add(onShared);
-                run();
-                const timer = window.setInterval(run, POLL_MS);
-                return () => {
-                    alive = false;
-                    pinListeners.delete(onShared);
-                    window.clearInterval(timer);
-                };
-            }, [refresh]);
-            return [state, refresh];
-        }
-
-        /** Live session catalog from the client session service (same store the sidebar reads). */
-        function useSessions(sessions) {
-            const store = sessions && sessions.list;
-            const subscribe = react.useCallback((listener) => {
-                if (store && typeof store.subscribe === "function") return store.subscribe(listener);
-                return () => {};
-            }, [store]);
-            const getSnapshot = react.useCallback(() => {
-                try {
-                    const snapshot = store && typeof store.getSnapshot === "function" ? store.getSnapshot() : null;
-                    return snapshot || EMPTY_SNAPSHOT;
-                } catch {
-                    return EMPTY_SNAPSHOT;
-                }
-            }, [store]);
-            return react.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+        };
         }
 
         function PinnedArea({ sessions, workspace, collapsed }) {
-            const [state, refresh] = usePins();
             const snapshot = useSessions(sessions);
+            const pinnedIds = usePinnedIds(workspace);
             const [pickerOpen, setPickerOpen] = react.useState(false);
             const [query, setQuery] = react.useState("");
             const [busy, setBusy] = react.useState(false);
@@ -488,7 +268,7 @@ window.__ModuleLoader__.load({
 
             const candidates = react.useMemo(() => {
                 const ids = Array.isArray(snapshot && snapshot.ids) ? snapshot.ids : Object.keys(byId);
-                const pinned = new Set(state.pins.map((pin) => pin.sessionId));
+                const pinned = new Set(pinnedIds);
                 const needle = query.trim().toLowerCase();
                 return ids
                     .map((id) => ({ id, summary: byId[id] || {} }))
@@ -497,35 +277,27 @@ window.__ModuleLoader__.load({
                     .filter((entry) => needle.length === 0 || String(entry.summary.title || "").toLowerCase().includes(needle))
                     .sort((a, b) => (Number(b.summary.updatedAt) || 0) - (Number(a.summary.updatedAt) || 0))
                     .slice(0, MAX_CANDIDATES);
-            }, [snapshot, state.pins, query, byId]);
+            }, [snapshot, pinnedIds, query, byId]);
 
             if (collapsed) return null;
 
             const open = (sessionId) => {
                 try {
-                    // The client session catalog (`sessions`) exposes list/search/manager but
-                    // NO open; selection is owned by the workspace service. Asking `sessions`
-                    // for one is what produced "会话服务不可用". `uiWorkspace.openSession` is the
-                    // same entry point the stock sidebar uses.
-                    if (workspace && typeof workspace.openSession === "function") {
-                        workspace.openSession(sessionId);
-                    } else if (sessions && typeof sessions.open === "function") {
-                        // Older builds where the catalog still carried selection.
-                        sessions.open(sessionId);
-                    } else {
-                        throw new Error("会话服务不可用");
-                    }
+                    // Selection is owned by the workspace service; the session catalog has no `open`.
+                    if (!workspace || typeof workspace.openSession !== "function") throw new Error("会话服务不可用");
+                    workspace.openSession(sessionId);
                     setActionError(null);
                 } catch (error) {
                     setActionError("打开会话失败：" + messageOf(error));
                 }
             };
 
-            const run = async (action, payload) => {
+            const run = async (action, sessionId) => {
                 setBusy(true);
                 try {
-                    await mutate(action, payload);
-                    await refresh();
+                    if (!workspace) throw new Error("置顶服务不可用");
+                    if (action === "pin") await workspace.pinSession(sessionId);
+                    else await workspace.unpinSession(sessionId);
                     setActionError(null);
                     return true;
                 } catch (error) {
@@ -536,13 +308,13 @@ window.__ModuleLoader__.load({
                 }
             };
 
-            const rows = state.pins.map((pin) => {
-                const summary = byId[pin.sessionId];
+            const rows = pinnedIds.map((sessionId) => {
+                const summary = byId[sessionId];
                 return {
-                    sessionId: pin.sessionId,
-                    title: (summary && summary.title) || pin.title || "（未命名会话）",
+                    sessionId,
+                    title: (summary && (summary.displayTitle || summary.title)) || "（未命名会话）",
                     missing: !summary,
-                    updatedAt: (summary && summary.updatedAt) || Date.parse(pin.pinnedAt) || 0
+                    updatedAt: (summary && summary.updatedAt) || 0
                 };
             });
 
@@ -569,6 +341,7 @@ window.__ModuleLoader__.load({
                     },
                         h("span", { style: { flex: "none", display: "inline-flex", color: "var(--dsw-alias-label-tertiary)" } }, h(PinIcon, { size: 12 })),
                         h("span", { className: "dsw-pins-title" }, row.title),
+                        h(SessionIdChip, { sessionId: row.sessionId }),
                         h("span", { className: "dsw-pins-time" }, whenText(row.updatedAt)),
                         h("button", {
                             type: "button",
@@ -578,13 +351,11 @@ window.__ModuleLoader__.load({
                             disabled: busy,
                             onClick: (event) => {
                                 event.stopPropagation();
-                                void run("unpin", { sessionId: row.sessionId });
+                                void run("unpin", row.sessionId);
                             }
                         }, "×")
                     )),
                 actionError !== null ? h("div", { className: "dsw-pins-error" }, actionError) : null,
-                state.error !== null ? h("div", { className: "dsw-pins-error" }, "置顶服务：" + state.error) : null,
-                state.sharedError ? h("div", { className: "dsw-pins-error" }, state.sharedError) : null,
                 pickerOpen ? h("div", { className: "dsw-pins-picker" },
                     h("input", {
                         className: "dsw-pins-input",
@@ -596,21 +367,18 @@ window.__ModuleLoader__.load({
                     }),
                     h("div", { className: "dsw-pins-list" },
                         candidates.length === 0
-                            ? h("div", { className: "dsw-pins-note" }, state.loaded ? "没有可置顶的会话" : "正在读取会话…")
+                            ? h("div", { className: "dsw-pins-note" }, "没有可置顶的会话")
                             : candidates.map((entry) => h("div", {
                                 key: entry.id,
                                 className: "dsw-pins-item",
                                 title: entry.summary.title || entry.id,
                                 onClick: async () => {
-                                    const ok = await run("pin", {
-                                        sessionId: entry.id,
-                                        title: String(entry.summary.title || ""),
-                                        workspaceId: entry.summary.workspaceId || null
-                                    });
+                                    const ok = await run("pin", entry.id);
                                     if (ok) setPickerOpen(false);
                                 }
                             },
-                                h("span", { className: "dsw-pins-title" }, entry.summary.title || "（未命名会话）"),
+                                h("span", { className: "dsw-pins-title" }, entry.summary.displayTitle || entry.summary.title || "（未命名会话）"),
+                                h("span", { className: "dsw-pins-id", title: entry.id }, shortId(entry.id)),
                                 h("span", { className: "dsw-pins-time" }, whenText(entry.summary.updatedAt))
                             ))
                     )
@@ -621,7 +389,7 @@ window.__ModuleLoader__.load({
         function apply(ctx) {
             ensureStyles();
             const sessions = ctx.get("sessions");
-            // Selection lives on the workspace service, not the session catalog.
+            // Pinning is a shell capability: the workspace service owns the state and the writes.
             const workspace = ctx.get("uiWorkspace");
 
             let container = null;
@@ -689,37 +457,22 @@ window.__ModuleLoader__.load({
                 attach();
             }, 500);
 
-            // The row-menu item is injected into the popup the primitive portals to <body>;
-            // the header button uses the declared, session-scoped header slot.
-            let stopMenuWatch = null;
-            try {
-                stopMenuWatch = watchSessionMenus(ctx, sessions);
-            } catch (error) {
-                ctx.logger.warn("session-pins: could not watch the row menus: %s", messageOf(error));
-                note("menu watch failed: " + messageOf(error));
-            }
+            // The conversation header keeps its own toggle; the row hover button and the row menu
+            // are the shell's own pin affordances, so this plugin adds no second copy of them.
             ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
                 name: "conversation.session.header.actions",
                 id: "session-pins",
                 order: 40
-            }, PinHeaderAction));
+            }, makeHeaderAction(workspace)));
 
             note("build " + BUILD + " applied: area=" + (container !== null && container.isConnected ? "mounted" : "pending") +
-                " menuWatch=" + (typeof stopMenuWatch === "function" ? "active" : "offline") +
-                " headerSlot=" + (ctx.slots ? "on" : "off"));
+                " source=native headerSlot=" + (ctx.slots ? "on" : "off"));
 
             ctx.effect(() => () => {
                 window.clearInterval(retry);
                 if (frame !== 0) window.cancelAnimationFrame(frame);
                 observer.disconnect();
                 if (resize !== null) resize.disconnect();
-                if (typeof stopMenuWatch === "function") {
-                    try {
-                        stopMenuWatch();
-                    } catch {
-                        // Detaching observers is best effort.
-                    }
-                }
                 const mounted = root;
                 root = null;
                 if (mounted) {

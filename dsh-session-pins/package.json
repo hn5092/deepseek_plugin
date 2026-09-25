@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-pins",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH Web UI surface: a pinned-conversation area above the sidebar session list",
   "type": "module",
   "main": "lib/index.js",
