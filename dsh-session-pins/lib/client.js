@@ -46,8 +46,14 @@ window.__ModuleLoader__.load({
             `.dsw-pins-row:hover .dsw-pins-remove{display:inline-flex}`,
             `.dsw-pins-empty{padding:2px 8px 6px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:17px}`,
             `.dsw-pins-wrap{position:relative}`,
+            // The picker must be OPAQUE. --dsw-specific-menu resolves to var(--dsw-menu-surface-fill)
+            // on this theme, which is a 58%-alpha fill meant to sit over a blur; blur alone does not
+            // stop the sidebar showing through, so the panel is painted in two layers instead:
+            // an opaque layer-3 base, then the themed menu fill on top for its tint.
             `.dsw-pins-picker{position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:60;max-height:min(50vh,360px);overflow:auto;padding:8px;border-radius:12px;`,
-            `border:1px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));background:var(--dsw-specific-menu, var(--dsw-alias-bg-layer-3, #353638));`,
+            `border:1px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));`,
+            `background-color:var(--dsw-alias-bg-layer-3, #353638);`,
+            `background-image:linear-gradient(var(--dsw-specific-menu, transparent), var(--dsw-specific-menu, transparent));`,
             `box-shadow:0 12px 32px var(--dsw-alias-bg-mask-2, rgba(0,0,0,.28));color:var(--dsw-alias-label-primary)}`,
             `.dsw-pins-input{box-sizing:border-box;width:100%;height:28px;padding:0 8px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l4, rgba(127,127,127,.45));`,
             `background:var(--dsw-alias-button-elevated-fill, transparent);color:inherit;font-size:13px;outline:none}`,
@@ -451,7 +457,7 @@ window.__ModuleLoader__.load({
             return react.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
         }
 
-        function PinnedArea({ sessions, collapsed }) {
+        function PinnedArea({ sessions, workspace, collapsed }) {
             const [state, refresh] = usePins();
             const snapshot = useSessions(sessions);
             const [pickerOpen, setPickerOpen] = react.useState(false);
@@ -497,8 +503,18 @@ window.__ModuleLoader__.load({
 
             const open = (sessionId) => {
                 try {
-                    if (!sessions || typeof sessions.open !== "function") throw new Error("会话服务不可用");
-                    sessions.open(sessionId);
+                    // The client session catalog (`sessions`) exposes list/search/manager but
+                    // NO open; selection is owned by the workspace service. Asking `sessions`
+                    // for one is what produced "会话服务不可用". `uiWorkspace.openSession` is the
+                    // same entry point the stock sidebar uses.
+                    if (workspace && typeof workspace.openSession === "function") {
+                        workspace.openSession(sessionId);
+                    } else if (sessions && typeof sessions.open === "function") {
+                        // Older builds where the catalog still carried selection.
+                        sessions.open(sessionId);
+                    } else {
+                        throw new Error("会话服务不可用");
+                    }
                     setActionError(null);
                 } catch (error) {
                     setActionError("打开会话失败：" + messageOf(error));
@@ -605,6 +621,8 @@ window.__ModuleLoader__.load({
         function apply(ctx) {
             ensureStyles();
             const sessions = ctx.get("sessions");
+            // Selection lives on the workspace service, not the session catalog.
+            const workspace = ctx.get("uiWorkspace");
 
             let container = null;
             let root = null;
@@ -613,7 +631,7 @@ window.__ModuleLoader__.load({
             let resize = null;
 
             const render = () => {
-                if (root) root.render(h(PinnedArea, { sessions, collapsed }));
+                if (root) root.render(h(PinnedArea, { sessions, workspace, collapsed }));
             };
 
             const attach = () => {
@@ -717,7 +735,7 @@ window.__ModuleLoader__.load({
         }
 
         /** Client services required before the area can mount. */
-        const inject = ["sessions", "slots"];
+        const inject = ["sessions", "slots", "uiWorkspace"];
 
         exports.apply = apply;
         exports.inject = inject;
