@@ -1,0 +1,25 @@
+{
+  "name": "dsh-codex-bridge",
+  "version": "0.1.0",
+  "description": "Local HTTP bridge that lets an external agent (Codex) post a message into any DSH session, delivered exactly like the composer does",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hn5092/deepseek_plugin.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "codex",
+    "bridge",
+    "automation"
+  ],
+  "license": "MIT"
+}
