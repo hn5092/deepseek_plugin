@@ -42,7 +42,13 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-panel{position:absolute;bottom:calc(100% + 6px);right:0;z-index:60;width:max-content;max-height:min(60vh, 420px);overflow:auto;",
             "max-width:min(620px, calc(100vw - 32px));padding:12px 14px;border-radius:12px;",
             "border:1px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));",
-            "background:var(--dsw-specific-menu, var(--dsw-alias-bg-layer-3, #353638));pointer-events:auto;-webkit-app-region:no-drag;",
+            // Opaque surface. --dsw-specific-menu resolves to var(--dsw-menu-surface-fill) on this
+            // theme, a 58%-alpha fill meant to sit over a backdrop blur; using it alone let the
+            // conversation show through the table. Paint an opaque layer-3 base and let the themed
+            // menu fill tint it, so the panel stays readable on every theme.
+            "background-color:var(--dsw-alias-bg-layer-3, #353638);",
+            "background-image:linear-gradient(var(--dsw-specific-menu, transparent), var(--dsw-specific-menu, transparent));",
+            "pointer-events:auto;-webkit-app-region:no-drag;",
             "box-shadow:0 12px 32px var(--dsw-alias-bg-mask-2, rgba(0,0,0,.28));",
             "color:var(--dsw-alias-label-primary, inherit);font-size:12px;line-height:18px}",
             ".dsw-ogu-title{font-weight:600;color:var(--dsw-alias-label-primary, inherit);margin-bottom:8px}",
