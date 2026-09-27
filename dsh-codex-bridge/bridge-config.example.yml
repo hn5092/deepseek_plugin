@@ -1,0 +1,51 @@
+# codex-bridge controller configuration fragment.
+#
+# This is the `config:` body of the plugin's managed patch row, so every line here is inserted verbatim
+# under `config:`. Install it with scripts/Install-CodexBridge.ps1:
+#
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 `
+#     -Commit <exact-git-commit> -ControllerConfig <path-to-this-file> [-HealthUrl <launch-url-file>]
+#
+# It contains NO secrets. `tokenRef` is the NAME of a credential reference; the value lives in the harness
+# credential store (`<DshHome>/.credentials.yaml`) or the process environment and is resolved at call time.
+# Never put a credential value in this file, and never pass one on a command line.
+
+path: /codex-bridge
+collabPath: /codex-collab
+answerTimeoutMs: 600000
+
+# Retention bounds for this plugin's OWN record store. `maxAgeMs` must be a non-negative integer and
+# `maxEvents` at least 1; any other value makes the plugin refuse to activate rather than silently
+# adopting a policy it cannot honour. A record is reclaimable only when its notification is confirmed AND
+# its work is finished AND it is past both bounds; an unanswered or unconfirmed event is never removed
+# for capacity.
+inboxMaxAgeMs: 604800000
+inboxMaxEvents: 500
+
+# Local run paths for this plugin's own records and notification files. Not secrets, not committed.
+# `storeRoot` defaults to `inboxRoot` when omitted.
+inboxRoot: C:/Users/Administrator/.dsh/codex-bridge/inbox
+storeRoot: C:/Users/Administrator/.dsh/codex-bridge/store
+
+# One entry per DS session this controller owns.
+#
+#   bindingId   stable identity of the binding. Answers are matched through it, so two sessions may share
+#               a local question id without crossing, and a handover marks the predecessor `current: false`
+#               so its late answers are refused.
+#   sessionId   the DS Session id.
+#   cwd         that session's REAL working directory, with forward slashes. One controller may own
+#               bindings in DIFFERENT directories; sessions are never merged by directory name.
+#   controller  the control party. A controller receives and answers only its own bindings.
+#   tokenRef    the credential REFERENCE authenticating this controller; the same controller uses the
+#               same reference on all of its bindings.
+#   current     optional; `false` marks a superseded binding during a handover.
+#
+# Two bindings claiming the SAME session as a live owner are refused: a session has exactly one answer
+# owner. The plugin also refuses to activate when a session's real directory does not match the `cwd`
+# recorded here, which is what stops a binding from answering for the wrong project.
+bindings:
+  - bindingId: codex::example
+    sessionId: session-example
+    cwd: D:/workspace/chaossa_fix1_mysql_metadata
+    controller: codex
+    tokenRef: CODEX_BRIDGE_TOKEN_EXAMPLE

@@ -1,6 +1,6 @@
 # dsh-codex-bridge：DS↔Codex 双向协作桥
 
-状态：**隔离实例全部验收 GREEN（14 套 291/291，全部 EXIT=0）；未安装主实例、未重启、未推送。**
+状态：**隔离实例全部验收 GREEN（16 套 327/327，全部 EXIT=0）；未安装主实例、未重启、未推送。**
 作者源码：`D:\workspace\_tools\deepseek_plugin\dsh-codex-bridge\`（唯一）。
 
 ## 零之一、重试合同（所有入口同一语义）
@@ -153,7 +153,52 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 - **重启**：确认不重现、未确认可补收、**旧 cursor 不漏新事件**、**不重放**；未恢复的工具等待**不复活**，
   答复照常落盘并回 `delivered:false` 说明本进程无活等待。
 
-## 四、验收（全部实测，`EXIT=0`，合计 291/291）
+## 三之二、部署与消费入口（运维面，**不新增消息仓**）
+
+### 热加载结论（**隔离实例实测**，非推测）
+
+- Harness 的 profile 补丁层 `<home>/profiles/<profile>/cordis.patch.yml` 是**被 watch 的**：
+  启动代码对该文件（及 `<home>/cordis.patch.yml`）注册观察者，变化时调用 `reconcileProfilePatches`
+  → Loader 激活，注释原文即「**hot-reloaded on long-lived surfaces**」。
+- **实测（`collab-hotload` 11/11）**：实例启动时**不含**本插件（路由 404）→ 只有该文件被改写 →
+  **同一 PID**（无宿主重启）内路由转为 200、**既有 session 与其历史仍在**、绑定可读、
+  notify/signals/wait 全可用。
+- **准确限制**：`--patch <file>` 这类**启动参数**补丁**只在启动时读一次**，改写它**不会**热加载 ——
+  必须写 **profile 自己的** `cordis.patch.yml`。这是本插件安装入口的做法。
+
+### `scripts/Install-CodexBridge.ps1`（**可逆**安装，root 外部执行）
+
+```powershell
+# 安装：精确提交 + 配置片段（可选 -HealthUrl 做健康门，失败自动回滚本插件）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 `
+  -Commit <exact-commit> -ControllerConfig <path-to-config.yml> -HealthUrl <launch-url-file>
+# 回滚：恢复最近备份 + 放回原 artifact
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Rollback
+```
+
+- 用 `git archive <commit>:<pkg>` **从精确提交**取干净产物（**不含** `*.test.mjs`、日志、scratch）。
+- 只改**本插件自己的 delim 块**：其它插件行与注释**逐字节保留**（实测）。
+- 写前**备份**、写后**用 harness 自带 js-yaml 复核 YAML**；不顺 ⇒ **立即还原备份**并报错。
+- 旧 artifact **移入** `.dsh-codex-bridge-artifacts/` 而非删除；**不删未知目录**。
+- `-HealthUrl` 失败 ⇒ **精确回滚本插件**（还原备份 + 放回旧 artifact）。
+- 实测：回滚后 patch 文件与安装前 **SHA256 完全一致**，产物已移除。
+
+### `scripts/bridge-cli.mjs`（薄消费入口，**只调用本桥 HTTP**）
+
+| 命令 | 语义 |
+| --- | --- |
+| `health` | 存活 / 绑定数 / 路由（**无需凭据**，先探活） |
+| `bindings` | 该控制方自己的绑定 |
+| `wait-any` | **跨会话**等待：**总截止 20 分钟**上限 + **底层有界长轮询**；**无事件则返回码 3 且无输出**（不调用模型） |
+| `answer` | 文本**从文件读**，`source` **固定 `codex`** |
+| `confirm` | **单事件**确认 |
+| `notify` | **显式**通知；新通知**不写** `--request-id`（服务端分配）；重试必须给 `--issued-at` |
+
+- 启动 URL **从本机文件读**（不接命令行）；凭据只给**引用名** `--token-ref`，值从
+  `<home>/.credentials.yaml` 或环境解析，**不进命令行、不打印**（实测断言）。
+- 配置示例见 `bridge-config.example.yml`（**只含引用**，无任何密钥值）。
+
+## 四、验收（全部实测，`EXIT=0`，合计 327/327）
 
 `node scripts/<suite>.test.mjs`：
 
@@ -173,7 +218,8 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 | **`collab-retention`** | **13/13** | **保留参数非法则插件拒绝激活**；**真 ask → 只确认不答复 → 小窗口回收 → 问题仍可答、原工具调用恰好继续一次** |
 | **`collab-callers`** | **35/35** | **回收后用同 `requestId` 重试：缺 `issuedAt` 拒绝、给原 `issuedAt` 判过期、均不重建**；**批量 confirm 后仅 answer/timeout（不再 confirm）仍在终态边界收尾**；**保留中的重复=幂等 200 且不重新 outstanding，真正超窗已回收的重复=过期拒绝**；**配置窗口在全新实例与重启后的首写即生效**；**读不到的 store 拒绝生产并保留原始错误**；未确认记录在多次回收后仍在 |
 | **`collab-meta-loss`** | **23/23** | **运行期 meta 丢失**：producer（模型工具/原生事件）**未经任何 collaboration HTTP reload** 即被拒，**已有记录与游标不变、不重建 seq 1**；共享分配边界独立反例；fresh store 仍正常；失效 ask **返回具体存储错误且不挂起** |
-
+| **`collab-hotload`** | **11/11** | **热加载实测**：启动时无插件（404）→ 只改 profile patch → **同一 PID**（无重启）内路由 200、**既有 session 与历史仍在**、绑定/notify/signals/wait 全可用；`--patch` 启动参数文件**不会**热加载（准确限制） |
+| **`collab-ops`** | **25/25** | **消费与运维**：CLI health/bindings/真实 ask→wait-any→answer→**同 tool 继续**/confirm/notify；**不误吞另一会话**；**空截止到达且无输出、无模型调用**；**凭据不出现在任何输出**；安装精确提交（其它插件行保留、不含 tests）→ 健康 → 回滚**逐字节还原** |
 另需 `scripts/isolated-instance.mjs`（可丢弃或 caller-owned home + `--patch` overlay，**真 SIGTERM → 等退出 →
 有界 SIGKILL → 复核**的 stop，**回收本次自有孙进程**，失败日志复制到 caller 指定的证据目录，并导出
 `stopIsClean()` 供各套件共用同一收据判定）与 `scripts/scripted-model/`
