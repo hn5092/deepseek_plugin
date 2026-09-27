@@ -175,7 +175,9 @@ try {
     const anonymous = await fetch(new URL("/codex-collab/signals?controller=codex", url));
     record("an unauthenticated caller is refused", anonymous.status === 401, `status=${anonymous.status}`);
 } finally {
-    inst.stop();
+    // The stop receipt is asserted, not discarded: a suite must not pass while leaving a process behind.
+    const outcome = await inst.stop();
+    record("the instance stopped cleanly", outcome.stopped === true && outcome.residue.length === 0, `stopped=${outcome.stopped} residue=${outcome.residue.length}`);
     fs.rmSync(workDir, { recursive: true, force: true });
 }
 

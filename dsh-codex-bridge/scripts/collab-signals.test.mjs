@@ -321,7 +321,8 @@ test("pruning keeps recent events and never hides an unconfirmed backlog silentl
     assert.equal(readSignals(dir).signals.length, 2);
 });
 
-fs.rmSync(inboxRoot, { recursive: true, force: true });
+// The inbox root is removed AFTER the cases have run, in the runner below: removing it here would only
+// delete the directory before the cases create anything in it, leaving the real contents behind.
 
 // ---- runner ------------------------------------------------------------------------------
 let failed = 0;
@@ -336,5 +337,22 @@ for (const { title, body } of cases) {
         console.log(`      ${error && error.message}`);
     }
 }
-console.log(`\ncase_count=${cases.length} passed=${passed} failed=${failed}`);
+// Cleanup AFTER the cases, and asserted: a suite that silently leaves its scratch directory behind is
+// leaking exactly what it is testing the plugin to avoid.
+let inboxCleanupOk = false;
+try {
+    fs.rmSync(inboxRoot, { recursive: true, force: true });
+    inboxCleanupOk = !fs.existsSync(inboxRoot);
+} catch {
+    inboxCleanupOk = false;
+}
+if (!inboxCleanupOk) {
+    failed += 1;
+    console.log("FAIL  the test inbox was removed and verified gone");
+} else {
+    passed += 1;
+    console.log("PASS  the test inbox was removed and verified gone");
+}
+
+console.log(`\ncase_count=${passed + failed} passed=${passed} failed=${failed}`);
 process.exitCode = failed === 0 ? 0 : 1;

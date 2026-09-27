@@ -292,32 +292,54 @@ export function apply(ctx, config) {
      * @param {object} raw - candidate signal.
      * @returns {{ok: true, signal: object, duplicate: boolean} | {ok: false, reason: string}} the result.
      */
+    /**
+     * Record one signal and notify waiters — the ONE owner of signal persistence and projection.
+     *
+     * Every producer goes through here: a question raised by the `ask_codex` tool, a notification from
+     * `notify_controller` or `/notify`, and the native Goal/error listener. Concentrating it here is what
+     * keeps those paths from diverging: an earlier version had the HTTP route record the durable signal
+     * while the question tool only recorded the question, so a real pending question survived a restart
+     * in the store but was invisible to `wait-any` and unknown to `confirm`.
+     *
+     * The order is deliberate and is the contract:
+     *   1. the durable record — so a restart can reconstruct this exact event, and so nothing is offered
+     *      that a restart could not also find;
+     *   2. the file projection — how a controller that cannot hold a request open gets told;
+     *   3. the in-memory view and the waiting callers.
+     *
+     * A failure at step 1 is fatal to the raise (the event is not presented at all). A failure at step 2
+     * is reported but does not invalidate the durable record, because the fact is safe and only its
+     * delivery mechanism failed.
+     *
+     * @param {object} raw - candidate signal.
+     * @returns {{ok: true, signal: object, duplicate: boolean, fileError?: string} | {ok: false, reason: string}} the result.
+     */
     const raiseSignal = (raw) => {
         const normalized = normalizeSignal(raw);
         if (!normalized.ok) return normalized;
         const candidate = { ...normalized.signal, seq: sequence + 1 };
         const verdict = signalVerdict(signals.get(candidate.id) ?? null, candidate);
         if (verdict.action === "conflict") return { ok: false, reason: verdict.reason };
-        // A repeat of the SAME identity adds no second event. Its durable record and its file may still
-        // need rewriting if an earlier write failed, but that must never create another business event.
+        // A repeat of the SAME identity adds no second event. Its durable record and its file are still
+        // rewritten if an earlier write failed, but that must never create another business event.
         if (verdict.action === "same") {
             const known = signals.get(candidate.id);
             const persisted = store.putSignal(known);
             const republish = republishSignal(known);
-            return {
-                ok: true,
-                signal: known,
-                duplicate: true,
-                ...(persisted.ok ? {} : { fileError: `signal-not-recorded:${persisted.reason}` }),
-                ...(persisted.ok && !republish.ok ? { fileError: republish.reason } : {})
-            };
+            if (!persisted.ok) return { ok: false, reason: `signal-not-recorded:${persisted.reason}` };
+            return { ok: true, signal: known, duplicate: true, ...(republish.ok ? {} : { fileError: republish.reason }) };
+        }
+        // 1) Durable first: an event that cannot be recorded must not become visible.
+        const persisted = store.putSignal(candidate);
+        if (!persisted.ok) {
+            ctx.logger.error("codex-bridge: signal %s could not be recorded durably: %s", candidate.id, persisted.reason);
+            return { ok: false, reason: `signal-not-recorded:${persisted.reason}` };
         }
         sequence += 1;
         signals.set(candidate.id, candidate);
-        // The in-memory record is authoritative for this process and always succeeds; the FILE is a
-        // notification projection and CAN fail (a read-only root, a full disk). Its failure is reported
-        // rather than swallowed, because the caller must not believe a controller was reliably notified.
+        // 2) Then the file projection, whose failure is reported but does not undo the durable fact.
         const file = republishSignal(candidate);
+        // 3) Then wake everyone waiting on any of this controller's bindings.
         for (const wake of [...signalWaiters]) wake();
         return { ok: true, signal: candidate, duplicate: false, ...(file.ok ? {} : { fileError: file.reason }) };
     };
@@ -412,6 +434,9 @@ export function apply(ctx, config) {
                 seq: meta.seq,
                 askedAt: meta.askedAt,
                 question: meta.question,
+                // The binding that OWNS this question is part of the answer: a controller must be able to
+                // see whether a question belongs to its live binding or to a superseded one it inherited.
+                bindingId: meta.bindingId,
                 state: stateOfQuestion(meta.sessionId, id)
             });
         }
@@ -496,7 +521,9 @@ export function apply(ctx, config) {
             }
             // Raise the signal AFTER the durable record, so a controller woken by it can always read the
             // event it refers to. The signal carries identity and a reference, never the question body.
-            raiseSignal({
+            // `raiseSignal` persists the signal through the SAME owner every other producer uses, so a
+            // question's signal cannot be missing from the store the way it once was.
+            const raised = raiseSignal({
                 id: `sig-question-${questionId}`,
                 controller: bound.binding.controller,
                 bindingId: bound.binding.bindingId,
@@ -506,6 +533,19 @@ export function apply(ctx, config) {
                 reference: `collab-question:${questionId}`,
                 at: meta.askedAt
             });
+            if (!raised.ok) {
+                // The question is recorded, but no controller can be woken for it. Asking anyway would
+                // leave the tool waiting on a question nobody will ever see, so the question is withdrawn
+                // and the caller is told the truth instead of hanging until the deadline.
+                registry.delete(questionId);
+                try {
+                    const current = store.getQuestion(bound.binding.bindingId, questionId);
+                    if (current.ok && current.value && typeof current.value === "object") {
+                        store.putQuestion(bound.binding.bindingId, { ...current.value, cancel: { id: questionId, reason: "signal-not-raised", at: new Date().toISOString() } });
+                    }
+                } catch { /* the store may be gone; the cancellation is best effort */ }
+                return { status: "rejected", questionId: "", reason: `question-signal-not-raised:${raised.reason}` };
+            }
 
             const timeoutMs = Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
                 ? Math.min(args.timeoutMs, config.answerTimeoutMs)
@@ -602,15 +642,9 @@ export function apply(ctx, config) {
             reference: `collab-notify:${binding.bindingId}:${eventId}`,
             at
         };
-        // Record durably BEFORE the event becomes visible, so an event that could not be stored is never
-        // offered as if it existed. Re-recording the same identity replaces the record in place, which is
-        // what makes a retry idempotent rather than duplicative.
-        const stored = store.putSignal({ ...record, text });
-        if (!stored.ok) {
-            ctx.logger.error("codex-bridge: notification %s could not be recorded durably: %s", signalId, stored.reason);
-            return { eventId, signalId, raised: { ok: false, reason: `signal-not-recorded:${stored.reason}` }, fileError: `signal-not-recorded:${stored.reason}` };
-        }
-        // Only now raise it: a signal that is visible must be one a restart can also find.
+        // `raiseSignal` is the ONE owner of signal persistence, so the durable record is written there
+        // and not again here: two writes of the same event could disagree, and the ordering rule (record
+        // before visible) lives in that single place.
         const raised = raiseSignal(record);
         if (!raised.ok) {
             ctx.logger.error("codex-bridge: notification %s could not raise a signal: %s", signalId, raised.reason);
@@ -691,6 +725,15 @@ export function apply(ctx, config) {
                 ...(typeof args.requestId === "string" && args.requestId.length > 0 ? { requestId: args.requestId } : {}),
                 at
             });
+            // The tool's contract is to tell the MODEL the truth. Reporting success when the durable
+            // record or the signal failed would let the session believe its controller was notified, so
+            // each failure is propagated with its own reason instead of being collapsed into ok:true.
+            if (!produced.raised.ok) {
+                return { ok: false, reason: `notification-signal-not-raised:${produced.raised.reason}`, signalId: produced.signalId };
+            }
+            if (produced.fileError !== undefined) {
+                return { ok: false, reason: `notification-file-not-delivered:${produced.fileError}`, signalId: produced.signalId };
+            }
             return { ok: true, signalId: produced.signalId };
         }
     }));

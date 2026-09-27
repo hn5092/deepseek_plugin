@@ -226,6 +226,58 @@ test("a handover is expressed by marking the predecessor non-current", () => {
     ]).ok, true);
 });
 
+// ---- supersession must be enforced by SELECTION, not only by the ownership assertion ---------
+// A previous round only proved that assertSingleOwner tolerates `current: false`. That is not enough:
+// every caller resolves its binding through matchBinding, so if that function ignores `current`, a
+// superseded binding still wins whenever it is listed first.
+
+test("a superseded binding is never selected, even when it is listed first", () => {
+    const bindings = [
+        { bindingId: "old", sessionId: "s1", cwd: "D:/proj", controller: "codex", current: false },
+        { bindingId: "new", sessionId: "s1", cwd: "D:/proj", controller: "codex" }
+    ];
+    const selected = matchBinding({ sessionId: "s1", cwd: "D:/proj", controller: "codex" }, bindings, WIN);
+    assert.equal(selected.allowed, true);
+    assert.equal(selected.binding.bindingId, "new", "the live owner must win over the superseded one");
+});
+
+test("naming a superseded binding explicitly is refused as superseded", () => {
+    const bindings = [
+        { bindingId: "old", sessionId: "s1", cwd: "D:/proj", controller: "codex", current: false },
+        { bindingId: "new", sessionId: "s1", cwd: "D:/proj", controller: "codex" }
+    ];
+    const late = matchBinding({ sessionId: "s1", cwd: "D:/proj", controller: "codex", bindingId: "old" }, bindings, WIN);
+    assert.equal(late.allowed, false);
+    assert.equal(late.reason, "binding-superseded", "the old owner's late answer must not be accepted");
+    const live = matchBinding({ sessionId: "s1", cwd: "D:/proj", controller: "codex", bindingId: "new" }, bindings, WIN);
+    assert.equal(live.allowed, true);
+});
+
+test("a session whose only binding is superseded has no owner at all", () => {
+    const bindings = [{ bindingId: "old", sessionId: "s1", cwd: "D:/proj", controller: "codex", current: false }];
+    const verdict = matchBinding({ sessionId: "s1", cwd: "D:/proj", controller: "codex" }, bindings, WIN);
+    assert.equal(verdict.allowed, false, "nothing may act through a superseded binding");
+    assert.equal(verdict.reason, "no-current-binding");
+});
+
+test("naming a binding that was never declared is refused as undeclared", () => {
+    const bindings = [{ bindingId: "new", sessionId: "s1", cwd: "D:/proj", controller: "codex" }];
+    const verdict = matchBinding({ sessionId: "s1", cwd: "D:/proj", controller: "codex", bindingId: "ghost" }, bindings, WIN);
+    assert.equal(verdict.allowed, false);
+    assert.equal(verdict.reason, "binding-not-declared");
+});
+
+test("supersession does not disturb a controller's other, current bindings", () => {
+    const bindings = [
+        { bindingId: "old", sessionId: "s1", cwd: "D:/a", controller: "codex", current: false },
+        { bindingId: "new", sessionId: "s1", cwd: "D:/a", controller: "codex" },
+        { bindingId: "other", sessionId: "s2", cwd: "D:/b", controller: "codex" }
+    ];
+    const second = matchBinding({ sessionId: "s2", cwd: "D:/b", controller: "codex" }, bindings, WIN);
+    assert.equal(second.allowed, true);
+    assert.equal(second.binding.bindingId, "other");
+});
+
 test("dropping an ambiguous session leaves it with no owner, never with two", () => {
     // The startup rule: an ambiguous session's bindings are all removed, so the session goes from two
     // possible owners to ZERO — the fail-closed direction. It must not silently keep one of them.

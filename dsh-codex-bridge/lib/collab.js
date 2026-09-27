@@ -155,18 +155,25 @@ export function sameDirectory(left, right, platform = process.platform) {
 }
 
 /**
- * Whether a controller may answer one question.
+ * Whether a controller may act on one session, and through WHICH binding.
  *
  * Rejects a session that is not the question's own, a directory that is not that session's, and a
  * controller that is not the binding's. A question whose session is unknown is refused rather than
  * accepted, so a missing binding can never widen access.
  *
- * Being the same CONTROLLER is not sufficient on its own: when a controller owns several bindings, a
- * question is answered only through the binding that owns it, because two bindings may share a local
- * question id and an answer must not cross between them.
+ * A SUPERSEDED binding (`current: false`) is never selected, not even when it appears first in the
+ * declared list: a handover must not leave the previous owner able to act, and an event must be routed
+ * through the live owner or refused. This is enforced here, at the one place every caller resolves a
+ * binding through — the question tool, the notification tool, the native-event listener, the HTTP
+ * routes and the answer path all go through this function, so the rule cannot be bypassed by forgetting
+ * it in a new caller.
  *
- * @param {{sessionId?: unknown, cwd?: unknown, controller?: unknown, bindingId?: unknown}} binding - the answering side's identity.
- * @param {ReadonlyArray<{bindingId: string, sessionId: string, cwd: string, controller: string}>} bindings - declared bindings.
+ * Being the same CONTROLLER is not sufficient on its own: when a controller owns several bindings, an
+ * action applies only through the binding that owns it, because two bindings may share a local question
+ * id and an answer must not cross between them.
+ *
+ * @param {{sessionId?: unknown, cwd?: unknown, controller?: unknown, bindingId?: unknown}} binding - the acting side's identity.
+ * @param {ReadonlyArray<{bindingId: string, sessionId: string, cwd: string, controller: string, current?: boolean}>} bindings - declared bindings.
  * @param {string} platform - Host platform for path comparison.
  * @returns {{allowed: true, binding: object} | {allowed: false, reason: string}} the verdict.
  */
@@ -178,21 +185,33 @@ export function matchBinding(binding, bindings, platform = process.platform) {
     const controller = binding && typeof binding.controller === "string" ? binding.controller : "";
     const cwd = binding && typeof binding.cwd === "string" ? binding.cwd : "";
     const bindingId = binding && typeof binding.bindingId === "string" ? binding.bindingId : "";
-    for (const entry of declared) {
-        // The offered binding id, when present, must name the binding that owns this session: a
-        // handover makes the old binding's late answer invalid rather than ambiguous.
-        if (bindingId.length > 0 && entry.bindingId !== bindingId) continue;
+
+    // An explicitly named binding is resolved against ALL declared bindings, so naming a superseded one
+    // is refused as superseded rather than mistaken for an unknown binding.
+    if (bindingId.length > 0) {
+        const named = declared.find((entry) => entry.bindingId === bindingId);
+        if (named === undefined) return { allowed: false, reason: "binding-not-declared" };
+        // A superseded binding is refused BEFORE any other check: it must not act regardless of how
+        // correct the rest of its identity looks.
+        if (named.current === false) return { allowed: false, reason: "binding-superseded" };
+        if (controller.length > 0 && named.controller !== controller) return { allowed: false, reason: "controller-not-bound" };
+        if (cwd.length > 0 && !sameDirectory(named.cwd, cwd, platform)) return { allowed: false, reason: "cwd-not-bound" };
+        return { allowed: true, binding: named };
+    }
+
+    // Without a named binding, only CURRENT bindings are candidates. Filtering here is what stops a
+    // superseded binding listed first from shadowing the live one.
+    const current = declared.filter((entry) => entry.current !== false);
+    for (const entry of current) {
         // Controller and directory must BOTH match one declared binding; a correct session with the
         // wrong controller (or a controller pointing at another directory) is not this binding.
         if (controller.length > 0 && entry.controller !== controller) continue;
         if (cwd.length > 0 && !sameDirectory(entry.cwd, cwd, platform)) continue;
         return { allowed: true, binding: entry };
     }
-    if (controller.length > 0 && !declared.some((entry) => entry.controller === controller)) {
+    if (current.length === 0) return { allowed: false, reason: "no-current-binding" };
+    if (controller.length > 0 && !current.some((entry) => entry.controller === controller)) {
         return { allowed: false, reason: "controller-not-bound" };
-    }
-    if (bindingId.length > 0 && !declared.some((entry) => entry.bindingId === bindingId)) {
-        return { allowed: false, reason: "binding-not-current" };
     }
     return { allowed: false, reason: "cwd-not-bound" };
 }

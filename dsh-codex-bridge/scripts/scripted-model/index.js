@@ -29,7 +29,9 @@ export const Config = z.object({
     /** Tool name the first model call should invoke. */
     toolName: z.string().default("ask_codex"),
     /** The question text to pass to that tool. */
-    toolQuestion: z.string().default("Should the retry use exponential backoff?")
+    toolQuestion: z.string().default("Should the retry use exponential backoff?"),
+    /** Pre-built tool arguments, as JSON, when the tool under test is not the question tool. */
+    toolArguments: z.string().default("")
 });
 
 export function apply(ctx, config) {
@@ -84,7 +86,11 @@ export function apply(ctx, config) {
             if (state.calls === 1) {
                 // Ask the question through the REAL tool, which then pauses for the controller.
                 const id = "call-scripted-1";
-                const args = JSON.stringify({ question: config.toolQuestion });
+                // A pre-built argument object lets the same scripted provider drive a tool other than the
+                // question tool (for example `notify_controller`), so each real tool path can be exercised.
+                const args = config.toolArguments.length > 0
+                    ? config.toolArguments
+                    : JSON.stringify({ question: config.toolQuestion });
                 yield { type: "block-start", index: 0, blockType: "tool-call" };
                 yield { type: "tool-call-delta", index: 0, id, name: config.toolName, argumentsDelta: args };
                 yield { type: "block-end", index: 0, block: { type: "tool-call", id, name: config.toolName, arguments: args } };

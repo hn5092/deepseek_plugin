@@ -190,7 +190,9 @@ try {
     const unbound = await call("/bindings?controller=stranger");
     record("an unknown controller cannot list bindings", unbound.status === 403, `status=${unbound.status}`);
 } finally {
-    inst.stop();
+    // The stop receipt is asserted, not discarded: a suite must not pass while leaving a process behind.
+    const outcome = await inst.stop();
+    record("the instance stopped cleanly", outcome.stopped === true && outcome.residue.length === 0, `stopped=${outcome.stopped} residue=${outcome.residue.length}`);
     fs.rmSync(workDir, { recursive: true, force: true });
 }
 

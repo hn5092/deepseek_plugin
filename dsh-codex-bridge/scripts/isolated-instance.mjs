@@ -19,11 +19,19 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const NODE = "C:\\Program Files\\nodejs\\node.exe";
+/** The shell used to inspect and end this run's own leftover processes on Windows. */
+const POWERSHELL = "powershell.exe";
 const DSH_ENTRY = path.join(process.env.APPDATA ?? "", "npm", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+/** How long a polite stop is given before the process is forced. Bounds, not waits for their own sake. */
+const STOP_GRACE_MS = 6000;
+/** How long a forced kill is given to be observed. */
+const STOP_FORCE_MS = 4000;
+/** How long a launch may take before the instance is declared unstartable. */
+const START_TIMEOUT_MS = 90_000;
 /** This file's own directory, so the scripted provider is found without a caller-supplied path. */
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -52,9 +60,10 @@ async function freePort() {
  * @param {ReadonlyArray<{controller: string, tokenRef: string, token: string}>} [options.controllerTokens] - test controller credentials.
  * @param {string} [options.home] - reuse an existing DSH home so a restart shares durable state.
  * @param {string|null} [options.storeRoot] - durable store root; defaults to the inbox root.
+ * @param {string} [options.evidenceDir] - caller-owned directory to preserve a raw failure log into.
  * @returns {Promise<object>} the instance handle.
  */
-export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = 90_000, scripted = null, inboxRoot = null, controllerTokens = [], home: reuseHome = undefined, storeRoot = null }) {
+export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = START_TIMEOUT_MS, scripted = null, inboxRoot = null, controllerTokens = [], home: reuseHome = undefined, storeRoot = null, evidenceDir = null }) {
     const port = await freePort();
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "collab-instance-"));
     // A restart keeps the CALLER-provided home so durable sessions live across both processes, while the
@@ -90,9 +99,9 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
         "      config:",
         "        provider: scripted",
         "        model: deepseek-v4.1-flash",
-        "        toolName: ask_codex",
+        ...(scripted.toolName === undefined ? ["        toolName: ask_codex"] : [`        toolName: ${JSON.stringify(scripted.toolName)}`]),
         ...(scripted.question === undefined ? [] : [`        toolQuestion: ${JSON.stringify(scripted.question)}`]),
-        "",
+        ...(scripted.toolArguments === undefined ? [] : [`        toolArguments: ${JSON.stringify(scripted.toolArguments)}`]),        "",
         // Without this a disposable home falls back to a real provider that has no credentials, so the
         // turn would fail before any tool call. Pointing the default at the scripted route is what lets
         // a REAL model call reach the tool under test.
@@ -145,52 +154,120 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
     }
 
     // A child that exits immediately means the instance never started; report THAT, with its log, rather
-    // than blaming the launch URL or waiting out the full deadline.
+    // than blaming the launch URL or waiting out the full deadline. The fd, the log and this run's own
+    // scratch directory are cleaned up here too, because leaving them behind is exactly the residue the
+    // rest of this fixture works to avoid.
     if (child.exitCode !== null) {
-        const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-2500) : "(no log)";
+        const raw = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "(no log)";
+        const preserved = typeof evidenceDir === "string" && evidenceDir.length > 0
+            ? preserveEvidence(evidenceDir, "isolated-instance-exit.log", raw)
+            : null;
         try { fs.closeSync(out); } catch { /* already closed */ }
-        throw new Error(`instance exited immediately (code ${child.exitCode}) on port ${port}. Log:\n${text}`);
+        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* nothing else to do */ }
+        throw new Error(
+            `instance exited immediately (code ${child.exitCode}) on port ${port}`
+            + `${preserved === null ? "" : `; raw log preserved at ${preserved}`}\nLog:\n${raw.slice(-2500)}`
+        );
     }
 
     /**
-     * Stop the instance and leave nothing behind.
+     * Stop THIS instance's child and leave nothing behind.
      *
-     * Bounded and verified rather than best-effort: the child is asked to terminate, its exit is awaited
-     * up to a deadline, the process is force-killed only if it did not go, and then this run's own
-     * temporary directory is removed and its absence confirmed. Failing to clean up is reported, so a
-     * leaked process or directory cannot be mistaken for a tidy run. Only paths inside this run's own
-     * temp directory are ever touched.
+     * The previous version waited 8 seconds WITHOUT asking the child to stop, then force-killed it and
+     * discarded whether it had exited, and finally reported `stopped: true` unconditionally. That is a
+     * false receipt: it could report a clean stop for a process still running.
+     *
+     * This version asks the child to terminate, waits for the real exit, force-kills only if it did not
+     * go within the bound, RE-CHECKS that it is gone, and reports what actually happened. Directory
+     * removal is verified rather than assumed, and only directories this run created are touched.
      *
      * @param {object} [options] - stop options.
-     * @param {boolean} [options.keepLog] - keep the temp directory (for diagnosing a failure).
-     * @returns {Promise<{stopped: boolean, dirRemoved: boolean, residue: ReadonlyArray<string>}>} what actually happened.
+     * @param {boolean} [options.keepLog] - keep this run's scratch directory (for diagnosing a failure).
+     * @returns {Promise<{stopped: boolean, exitCode: number|null, forced: boolean, dirRemoved: boolean, residue: ReadonlyArray<string>, preservedHome: string|null, leaked: ReadonlyArray<number>}>} the real outcome.
      */
     async function stop({ keepLog = false } = {}) {
-        const exited = await waitForExit(child, 8000);
-        if (!exited) {
-            try { child.kill("SIGKILL"); } catch { /* already gone */ }
-            await waitForExit(child, 4000);
+        // 1) Ask this child to stop. `alreadyGone` covers a child that exited on its own.
+        let gone = child.exitCode !== null || child.signalCode !== null;
+        let forced = false;
+        if (!gone) {
+            try { child.kill("SIGTERM"); } catch { /* it may have exited between the check and the kill */ }
+            gone = await waitForExit(child, STOP_GRACE_MS);
         }
+        // 2) Force only if it really did not go, still bounded.
+        if (!gone) {
+            forced = true;
+            try { child.kill("SIGKILL"); } catch { /* ditto */ }
+            gone = await waitForExit(child, STOP_FORCE_MS);
+        }
+        // 2b) The harness starts its OWN child processes (for example a subprocess-local worker). Ending
+        //     the process this fixture spawned does not necessarily end those grandchildren, and leaving
+        //     one running is a real leak that a passing suite would otherwise hide. Processes whose
+        //     command line names THIS run's scratch directory or home are reaped, and only those, so no
+        //     unrelated process can be affected.
+        const leaked = await reapOwnProcesses([workDir, home], 6000);
         try { fs.closeSync(out); } catch { /* already closed */ }
-        if (keepLog) return { stopped: true, dirRemoved: false, residue: [] };
-        // Guard: only ever delete a directory this run created, identified by the mkdtemp prefix.
+
+        // 3) A process that did not exit must NOT be reported as stopped.
+        if (!gone) {
+            return { stopped: false, exitCode: child.exitCode, forced, dirRemoved: false, residue: [workDir], preservedHome: null, leaked };
+        }
+        if (keepLog) return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: false, residue: [], preservedHome: null, leaked };
+
+        // 4) Remove this run's scratch directory. A caller-owned home lives OUTSIDE it, so preserving the
+        // home and cleaning the scratch are independent and neither is reported as the other's residue.
         const residue = [];
-        if (path.dirname(workDir) !== os.tmpdir() || !path.basename(workDir).startsWith("collab-instance-")) {
+        const ownsHome = typeof reuseHome !== "string" || reuseHome.length === 0;
+        const safeToRemove = path.dirname(workDir) === os.tmpdir() && path.basename(workDir).startsWith("collab-instance-");
+        if (!safeToRemove) {
             residue.push(workDir);
-            return { stopped: true, dirRemoved: false, residue };
+            return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: false, residue, preservedHome: null, leaked };
         }
         try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* verified below */ }
         if (fs.existsSync(workDir)) residue.push(workDir);
-        return { stopped: true, dirRemoved: !fs.existsSync(workDir), residue };
+        // The caller's home is reported as PRESERVED, not as residue: the caller owns it and decides when
+        // it is finished with. Conflating the two would make a clean run look leaky and hide a real leak.
+        const preservedHome = ownsHome ? null : home;
+        return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: !fs.existsSync(workDir), residue, preservedHome, leaked };
     }
 
     if (url === null) {
-        const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-2500) : "(no log)";
-        await stop({ keepLog: true });
-        throw new Error(`instance did not publish a launch URL on port ${port}. Log tail:\n${text}`);
+        // Preserve the raw log into the caller's evidence location BEFORE the scratch home is removed, so
+        // a failed launch is diagnosable without leaving a temporary home (which may hold credentials)
+        // lying around.
+        const tail = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-4000) : "(no log)";
+        const preserved = typeof evidenceDir === "string" && evidenceDir.length > 0
+            ? preserveEvidence(evidenceDir, "isolated-instance-launch-failure.log", fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "(no log)")
+            : null;
+        const outcome = await stop();
+        throw new Error(
+            `instance did not publish a launch URL on port ${port} (stopped=${outcome.stopped}, residue=${outcome.residue.length})`
+            + `${preserved === null ? "" : `; raw log preserved at ${preserved}`}\nLog tail:\n${tail}`
+        );
     }
 
     return { port, url, home, workDir, logFile, patchFile, stop, pluginLoaded: true, child };
+}
+
+/**
+ * Copy a log file to a caller-owned evidence location.
+ *
+ * Used so a failure leaves its original output behind in a place the caller names, instead of only in a
+ * temporary home that is about to be deleted.
+ *
+ * @param {string} dir - the evidence directory (created if needed).
+ * @param {string} name - the file name to write.
+ * @param {string} content - the raw content.
+ * @returns {string|null} the written path, or null when it could not be written.
+ */
+function preserveEvidence(dir, name, content) {
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+        const target = path.join(dir, name);
+        fs.writeFileSync(target, content, "utf8");
+        return target;
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -208,4 +285,54 @@ async function waitForExit(child, timeoutMs) {
         const timer = setTimeout(() => finish(false), timeoutMs);
         child.once("exit", onExit);
     });
+}
+
+/**
+ * End any process still running that belongs to THIS isolated run.
+ *
+ * The harness spawns its own helper processes, so ending the process this fixture started is not by
+ * itself enough to guarantee nothing survives. Rather than trust that, the running process table is
+ * consulted and every process whose command line names one of this run's own paths is ended — the
+ * match is on paths this run created, so unrelated processes are never candidates.
+ *
+ * @param {ReadonlyArray<string>} ownedPaths - absolute paths that identify this run.
+ * @param {number} timeoutMs - how long to wait for them to disappear.
+ * @returns {Promise<ReadonlyArray<number>>} the PIDs that were still running after the wait.
+ */
+async function reapOwnProcesses(ownedPaths, timeoutMs) {
+    if (process.platform !== "win32") return [];
+    const markers = ownedPaths.filter((p) => typeof p === "string" && p.length > 0).map((p) => p.toLowerCase());
+    if (markers.length === 0) return [];
+    /** Snapshot the PIDs whose command line names one of this run's paths. */
+    const findOwned = () => {
+        const script = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+            + "Where-Object { $_.CommandLine -ne $null } | "
+            + "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
+        const result = spawnSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 20_000 });
+        if (result.status !== 0 || typeof result.stdout !== "string" || result.stdout.trim().length === 0) return [];
+        let rows;
+        try { rows = JSON.parse(result.stdout); } catch { return []; }
+        const list = Array.isArray(rows) ? rows : [rows];
+        return list
+            .filter((row) => row && typeof row.CommandLine === "string")
+            .filter((row) => markers.some((marker) => row.CommandLine.toLowerCase().includes(marker)))
+            .map((row) => Number(row.ProcessId))
+            .filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+    };
+    const kill = (pids) => {
+        if (pids.length === 0) return;
+        const script = pids.map((pid) => `Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`).join("; ");
+        spawnSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 20_000 });
+    };
+
+    let remaining = findOwned();
+    if (remaining.length === 0) return [];
+    kill(remaining);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250));
+        remaining = findOwned();
+        if (remaining.length === 0) return [];
+    }
+    return remaining;
 }

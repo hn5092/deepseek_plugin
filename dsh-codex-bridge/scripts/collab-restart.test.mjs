@@ -44,11 +44,20 @@ const REF = "TEST_CONTROLLER_TOKEN_CODEX";
 const bindings = [{ bindingId: "codex::restart", sessionId, cwd: projDir, controller: "codex", tokenRef: REF }];
 const controllerTokens = [{ controller: "codex", tokenRef: REF, token: TOKEN }];
 
-/** Start one instance against the shared disposable home, so a restart shares state. */
+/**
+ * Start one instance against a CALLER-owned home that outlives both runs.
+ *
+ * The home is created here and sits outside each run's scratch directory, so "the scratch is clean" and
+ * "the home was preserved" stay separate and verifiable facts.
+ */
+const sharedHome = path.join(workDir, "home");
+fs.mkdirSync(sharedHome, { recursive: true });
 const first = await startIsolatedInstance({
-    pluginRoot, bindings, controllerTokens, inboxRoot, answerTimeoutMs: 6000
+    pluginRoot, bindings, controllerTokens, inboxRoot,
+    storeRoot: path.join(workDir, "store"),
+    home: sharedHome,
+    answerTimeoutMs: 6000
 });
-const sharedHome = first.home;
 /** A control call as the controller. */
 const callOn = (inst, route, init = {}) => fetch(new URL(`/codex-collab${route}`, new URL(inst.url)), {
     ...init,
@@ -77,13 +86,20 @@ try {
         fs.writeFileSync(path.join(workDir, "cursor.txt"), String(cursorBefore), "utf8");
         fs.writeFileSync(path.join(workDir, "confirmedId.txt"), toConfirm.id, "utf8");
 
-        const stopResult = await first.stop({ keepLog: true });
-        record("the first host really stopped with no leftover directory of its own", stopResult.stopped === true, `stopped=${stopResult.stopped}`);
+        // Preserve the raw log BEFORE stopping, because stopping removes this run's scratch directory.
+        fs.copyFileSync(first.logFile, path.join(workDir, "first-host.log"));
+        // The stop receipt is asserted rather than logged: a suite must not pass while leaving a host
+        // running. `keepLog` is NOT used — a retained scratch directory is a silent leak.
+        const stopResult = await first.stop();
+        record("the first host really stopped and its scratch was removed", stopResult.stopped === true && stopResult.residue.length === 0, `stopped=${stopResult.stopped} residue=${stopResult.residue.length}`);
     }
 
     // ---- restart on the SAME home ---------------------------------------------------------
     const second = await startIsolatedInstance({
-        pluginRoot, bindings, controllerTokens, inboxRoot, answerTimeoutMs: 6000, home: sharedHome
+        pluginRoot, bindings, controllerTokens, inboxRoot,
+        storeRoot: path.join(workDir, "store"),
+        answerTimeoutMs: 6000,
+        home: sharedHome
     });
     try {
         const client2 = new DshClient(new URL(second.url), 55_000);
@@ -124,8 +140,11 @@ try {
             record("confirming after the restart is accepted", false, "no surviving event to confirm");
         }
     } finally {
-        const stopResult = await second.stop({ keepLog: true });
-        record("the second host stopped cleanly", stopResult.stopped === true, `stopped=${stopResult.stopped}`);
+        // Preserve the raw log before stopping removes the scratch directory, then assert the receipt so a
+        // retained directory or a surviving host cannot pass unnoticed.
+        fs.copyFileSync(second.logFile, path.join(workDir, "second-host.log"));
+        const stopResult = await second.stop();
+        record("the second host stopped cleanly and its scratch was removed", stopResult.stopped === true && stopResult.residue.length === 0, `stopped=${stopResult.stopped} residue=${stopResult.residue.length}`);
         // Now that the run is over, remove the shared home and verify it is gone.
         fs.rmSync(sharedHome, { recursive: true, force: true });
         record("the shared home is removed and verified gone", fs.existsSync(sharedHome) === false, "no residue");

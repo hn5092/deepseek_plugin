@@ -57,7 +57,14 @@ try {
 
     const broken = await startIsolatedInstance({
         pluginRoot, bindings, controllerTokens, answerTimeoutMs: 6000,
-        inboxRoot: path.join(workDir, "inbox-broken"), storeRoot: unwritableStore
+        inboxRoot: path.join(workDir, "inbox-broken"), storeRoot: unwritableStore,
+        // The scripted model is what lets a REAL tool call reach `notify_controller` here, so the store
+        // failure is proven on the model-facing path and not only on the HTTP one.
+        scripted: {
+            toolName: "notify_controller",
+            toolArguments: JSON.stringify({ kind: "delivery", text: "broken store" })
+        },
+        evidenceDir: path.join(workDir, "evidence")
     });
     try {
         const client = new DshClient(new URL(broken.url), 55_000);
@@ -75,6 +82,28 @@ try {
         // Nothing may be offered as if it had been recorded.
         const offered = await callOn(broken, "/signals?controller=codex");
         record("nothing is offered after a refused notification", (offered.body.signals ?? []).length === 0, `count=${(offered.body.signals ?? []).length}`);
+
+        // The MODEL-FACING tool must report the truth too. The HTTP route answering 5xx does not prove the
+        // tool path does: `notify_controller` used to return `ok: true` regardless, which would tell a
+        // session its controller had been notified when nothing was recorded. This drives the real tool
+        // and reads its tool/result from the session log.
+        const toolTurn = await client.rpc("session/prompt", {
+            request: {
+                sessionId,
+                requestId: crypto.randomUUID(),
+                mode: "queue",
+                content: [{ type: "text", text: 'Call the tool "notify_controller" with kind "delivery" and text "broken store".' }],
+                clientTimeZone: "Asia/Shanghai"
+            }
+        }).then(() => true).catch(() => false);
+        record("a prompt can be dispatched to reach the tool", toolTurn === true, `accepted=${toolTurn}`);
+        await new Promise((r) => setTimeout(r, 6000));
+        const snapshot = await client.snapshot(sessionId, 200);
+        const toolResults = snapshot.records.map((r) => r.event).filter((e) => e && e.type === "tool/result");
+        const notifyResults = JSON.stringify(toolResults.map((e) => e.data));
+        record("the real notify_controller tool ran", /notify_controller/.test(JSON.stringify(snapshot.records.map((r) => r.event).filter((e) => e && e.type === "tool/call").map((e) => e.data))), `toolResults=${toolResults.length}`);
+        // The tool must NOT report success: either it reports ok:false with a reason, or it failed loudly.
+        record("the tool does not claim success when the store is unwritable", !/"ok"\s*:\s*true/.test(notifyResults), notifyResults.slice(0, 200));
     } finally {
         await broken.stop();
     }
