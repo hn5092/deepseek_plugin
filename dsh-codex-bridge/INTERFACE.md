@@ -40,37 +40,46 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 
 ## 三、合同要点
 
-- **绑定身份**：`{bindingId, sessionId, cwd, controller}` 显式声明；**不由标题/最近窗口推断**；
-  一个控制方可有**多个绑定、多个目录**，`(controller,sessionId)` 是身份，**不按目录名合并会话**。
-- **状态归属**：提问/答复以原生持久事件（`collab/question`、`collab/answer`、`collab/cancel`、
-  `collab/notify`）+ `collabQuestions` 投影持有；**不另维护第二份可写真源**。
-- **人类权限不拦截**：`ask_user_question` 与 approval 语义原样；AI 答复必须带 `source:"codex"`，
-  **不可伪装用户同意**。
+- **控制方身份由凭据决定，不由自报决定**：`connection.admit` 只证明请求来自 operator（**恒为同一 peer**，
+  不区分控制方），因此每个绑定声明 `tokenRef`（凭据**引用**，值经 `ctx.credentials` 解析，**不入 Git/日志/会话**）。
+  请求须带 `x-controller-token`；服务端用解析出的控制方身份，**自报的 `controller` 必须与之一致**（否则 403）。
+  ⇒ 持有 B 合法凭据者**无法**借自报 A 读取/答复/确认 A 的事件。
+- **AI 来源由服务端写死 `codex`**；调用方传 `source:"user"` 会被覆盖，**机器不能伪造人类同意**；人类仍走原生
+  `ask_user_question`/approval 入口，本插件不拦截。
+- **绑定身份**：`{bindingId, sessionId, cwd, controller, tokenRef}`；一个控制方可**多绑定、多目录**，
+  `(controller,sessionId)` 是身份，**不按目录名合并会话**。同一 session **两个答复 owner 直接拒绝**
+  （该 session 的绑定全部剔除 = 零 owner，fail-closed）；交接用 `current:false`。
+- **权威状态在插件自有持久存储**（`lib/store.js`）：`signals/`、`confirmations/`、`questions/`，
+  每记录一文件、**先临时写再同目录原子 rename**、按稳定 id 覆盖 ⇒ 重试幂等。
+  **不写入会话日志**：本 harness 拒绝读取含未知事件类型且未标 `ignorable` 的日志，而 `Session.append`
+  **无法设置该标记**，写自定义事件会让会话**永久不可读**（已实测复现）。
 - **幂等/冲突**：同 `questionId` 同内容=幂等；同 id 异内容=冲突（409）；取消后晚答=拒绝。
-- **确认与投递分离**：`wait` 返回**不代表**验收通过；只有调用方显式确认才退休事件。
-- **完成语义**：`kind:"delivery"` 只有调用方**声明完成**时才唤醒等待（`deliveryComplete=true`）；
-  **普通 `turn/end` 不产生交付信号**。
-- **文件信号**：每事件一个唯一文件，**先临时写再同目录原子 rename**；按控制方分目录；
-  读取**每次重读目录实际状态**，通知只作提示；扫描→订阅→**再扫描**封住竞态。
-  文件是**通知投影**，不是业务真源——不因出现文件就批准部署、接受测试或执行命令。
-- **有界**：等待有总截止；超时回 `empty:true, reason:"no-new-events"`（不是答复/批准/失败）；
-  保留有界（`inboxMaxAgeMs`/`inboxMaxEvents`），**不静默清掉未确认事件**。
-- **重启**：重启**不保留假活 Promise**；未答问题仍可读，工具返回 `interrupted` 由控制方按原身份恢复；
-  **不重放已执行工具**。
+- **确认与投递分离**：`wait` 返回**不代表**验收通过；确认写权威记录（**重启后仍生效**），重复确认幂等。
+- **完成语义（正式 producer）**：
+  - **原生 `goal/change` 且 `phase==="complete"`** → `delivery`（带 Goal 身份）；
+  - **原生 `turn/end` 且 reason 为终态 `error`** → `error`；
+  - **普通 `turn/end` 不产生任何信号**；
+  - DS 侧 `notify_controller` 工具为显式补充；交付/异常均可由正式 caller 产生。
+- **有界**：等待有总截止；超时回 `empty:true, reason:"no-new-events"`（不是答复/批准/失败）。
+- **重启**：确认不重现、未确认可补收、**旧 cursor 不漏新事件**、**不重放**；未恢复的工具等待**不复活**，
+  答复照常落盘并回 `delivered:false` 说明本进程无活等待。
 
-## 四、验收（全部实测，`EXIT=0`）
+## 四、验收（全部实测，`EXIT=0`，合计 152/152）
 
 `node scripts/<suite>.test.mjs`：
 
 | 套件 | 结果 | 说明 |
 | --- | --- | --- |
-| `collab-rules` | 19/19 | 纯函数规则层 |
-| `collab-signals` | 27/27 | 信号规则 + 文件收件箱（含扫描/订阅竞态） |
-| `collab-multi` | 24/24 | 真机：**5 会话跨 5 目录 + 第二控制方** |
-| `collab-loop` | 27/27 | 真机：**真实 `ask_codex` → wait → answer → 同一调用继续** |
+| `collab-rules` | 25/25 | 纯函数规则层（含 peer 身份反例） |
+| `collab-signals` | 35/35 | 信号规则 + 文件收件箱（扫描/订阅竞态） |
+| `collab-multi` | 30/30 | 真机：5 会话跨 5 目录 + 第二控制方；**匿/错/冒名一律拒绝** |
+| `collab-loop` | 28/28 | 真机：**真实 `ask_codex` → wait → 答 → 同一调用继续** |
+| `collab-restart` | 14/14 | **真停自有 host → 同 home 重启**：确认不重现、补收、cursor、无重放、零残留 |
+| `collab-durability` | 11/11 | **store 不可写则拒绝**、重试幂等、**并发答复单一终态**、取消后晚答拒 |
+| `collab-native` | 9/9 | **原生 Goal 完成 → delivery（带 Goal 身份）**；普通 turn 结束无信号 |
 
-另需 `scripts/isolated-instance.mjs`（可丢弃 home + `--patch` overlay）与
-`scripts/scripted-model/`（**测试专用**可控 provider，不可用于生产）。
+另需 `scripts/isolated-instance.mjs`（可丢弃 home + `--patch` overlay，**有界 stop + 零残留复核**）与
+`scripts/scripted-model/`（**测试专用**可控 provider）。
 
 ## 五、限制（如实）
 

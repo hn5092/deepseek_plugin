@@ -769,48 +769,80 @@ export function apply(ctx, config) {
         return { signals: recoveredCount, questions, cursor: sequence };
     };
 
-    // ---- real terminal failures become error signals -----------------------------------------
+    // ---- native completion and terminal failure become signals -------------------------------
 
     /**
-     * Report an ABNORMAL END of a turn as an `error` signal.
+     * Report NATIVE completion and ABNORMAL END as signals.
      *
-     * A normal `turn/end` is explicitly NOT a delivery: the turn ending says nothing about whether the
-     * business result is complete, which is why only the session's own `notify_controller` declares a
-     * delivery. A turn that ends with a real terminal error, however, is a genuine abnormal stop, and
-     * the controller must hear about it even if the model never got to call the tool. This is the
-     * automatic half; the tool is the explicit half.
+     * Two native facts are authoritative here, and neither is "the turn ended":
+     *
+     *  - `goal/change` with a `complete` phase is the harness's own statement that a Goal finished. That
+     *    is a real completed result, so it becomes a `delivery` — with the Goal identity attached, so the
+     *    controller can tie the result back to the work it asked for.
+     *  - `turn/end` with a terminal `error` is a genuine abnormal stop and becomes an `error`, so the
+     *    controller hears about it even if the model never got to call the tool.
+     *
+     * A normal `turn/end` produces NOTHING: the turn ending says nothing about whether the business
+     * result is complete, which is exactly why the session's own `notify_controller` exists for the
+     * cases the harness does not know about.
      */
     ctx.on("session/event", (session, event) => {
         try {
-            if (event === null || event === undefined || event.type !== "turn/end") return;
-            const reason = event.data && event.data.reason;
-            if (reason === null || reason === undefined || reason.kind !== "error") return;
+            if (event === null || event === undefined) return;
             const sessionId = session && typeof session.id === "string" ? session.id : "";
             if (sessionId.length === 0) return;
             const headerCwd = session.header && typeof session.header.cwd === "string" ? session.header.cwd : "";
             const bound = matchBinding({ sessionId, cwd: headerCwd }, bindings);
             if (!bound.allowed) return;
-            const message = reason.error && typeof reason.error.message === "string" ? reason.error.message : "";
-            const requestId = typeof event.data.requestId === "string" ? event.data.requestId : undefined;
-            // Identity is derived from the failure itself, so a re-delivered turn/end for the SAME failed
-            // turn raises the SAME signal instead of a second business event.
-            //
+
+            /** @type {{kind: "delivery"|"error", text: string, goalId?: string, requestId?: string}|null} */
+            let report = null;
+            if (event.type === "goal/change") {
+                const goal = event.data && event.data.goal;
+                // Only a completed Goal is a delivery; paused, blocked and cleared are not "done".
+                if (goal && goal.phase === "complete") {
+                    const goalId = typeof goal.id === "string" ? goal.id : undefined;
+                    report = {
+                        kind: "delivery",
+                        text: typeof goal.objective === "string" ? goal.objective : "Goal complete",
+                        ...(goalId === undefined ? {} : { goalId }),
+                        // Identity comes from the Goal and its completion, so a re-read of the same
+                        // completion is the same event rather than a second delivery.
+                        requestId: `goal-complete-${goalId ?? "unknown"}-${typeof goal.revision === "number" ? goal.revision : 0}`
+                    };
+                }
+            } else if (event.type === "turn/end") {
+                const reason = event.data && event.data.reason;
+                if (reason && reason.kind === "error") {
+                    const message = reason.error && typeof reason.error.message === "string" ? reason.error.message : "";
+                    const requestId = typeof event.data.requestId === "string" ? event.data.requestId : undefined;
+                    report = {
+                        kind: "error",
+                        text: message,
+                        ...(requestId === undefined ? {} : { requestId: `turn-error-${requestId}` })
+                    };
+                }
+            }
+            if (report === null) return;
+
             // DEFERRED deliberately: `session/event` is emitted from inside the session's own append, and
             // appending from within an observer re-enters the publisher ("session append cannot reenter
             // while another append is being published") and takes the whole host down. Recording the
             // notification on a later tick leaves the append that triggered us to finish first.
+            const pending = report;
             setImmediate(() => {
                 produceNotification({
                     agent: session,
                     binding: bound.binding,
-                    kind: "error",
-                    text: message,
-                    ...(requestId === undefined ? {} : { requestId: `turn-error-${requestId}` }),
+                    kind: pending.kind,
+                    text: pending.text,
+                    ...(pending.goalId === undefined ? {} : { goalId: pending.goalId }),
+                    ...(pending.requestId === undefined ? {} : { requestId: pending.requestId }),
                     at: new Date().toISOString()
-                }).catch((error) => ctx.logger.warn("codex-bridge: could not report a terminal turn failure: %s", messageOf(error)));
+                }).catch((error) => ctx.logger.warn("codex-bridge: could not report a native event: %s", messageOf(error)));
             });
         } catch (error) {
-            ctx.logger.warn("codex-bridge: could not report a terminal turn failure: %s", messageOf(error));
+            ctx.logger.warn("codex-bridge: could not report a native event: %s", messageOf(error));
         }
     });
 
