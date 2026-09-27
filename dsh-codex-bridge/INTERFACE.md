@@ -1,6 +1,6 @@
 # dsh-codex-bridge：DS↔Codex 双向协作桥
 
-状态：**隔离实例全部验收 GREEN（16 套 327/327，全部 EXIT=0）；未安装主实例、未重启、未推送。**
+状态：**隔离实例全部验收 GREEN（17 套 360/360，全部 EXIT=0）；未安装主实例、未重启、未推送。**
 作者源码：`D:\workspace\_tools\deepseek_plugin\dsh-codex-bridge\`（唯一）。
 
 ## 零之一、重试合同（所有入口同一语义）
@@ -160,9 +160,15 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 - Harness 的 profile 补丁层 `<home>/profiles/<profile>/cordis.patch.yml` 是**被 watch 的**：
   启动代码对该文件（及 `<home>/cordis.patch.yml`）注册观察者，变化时调用 `reconcileProfilePatches`
   → Loader 激活，注释原文即「**hot-reloaded on long-lived surfaces**」。
-- **实测（`collab-hotload` 11/11）**：实例启动时**不含**本插件（路由 404）→ 只有该文件被改写 →
+- **首装实测（`collab-hotload` 11/11）**：实例启动时**不含**本插件（路由 404）→ 只有该文件被改写 →
   **同一 PID**（无宿主重启）内路由转为 200、**既有 session 与其历史仍在**、绑定可读、
   notify/signals/wait 全可用。
+- **升级实测（`collab-upgrade` 33/33）—— 关键限制**：宿主**已经 import 过**该模块后，
+  Loader 重载按名字重新 import，而 **Node ESM 缓存返回已加载的旧模块** ⇒ 运行中的宿主
+  **继续提供旧 artifact**。实测序列：装**旧单向桥** → 启动宿主 → 换新 artifact + 触发重载 ⇒
+  **collab 路由仍不存在**，而 **patch 层确实重载**（移除该行 health 即 404）、**session 与进程身份保留**。
+  ⇒ **首装可热加载；升级已加载过的插件必须重启一次 Harness。**
+  安装脚本对此返回 **`restart-required`（退出码 3）**，**不谎称热升级成功**，也**不回滚**正确的磁盘安装。
 - **准确限制**：`--patch <file>` 这类**启动参数**补丁**只在启动时读一次**，改写它**不会**热加载 ——
   必须写 **profile 自己的** `cordis.patch.yml`。这是本插件安装入口的做法。
 
@@ -180,7 +186,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
 - 只改**本插件自己的 delim 块**：其它插件行与注释**逐字节保留**（实测）。
 - 写前**备份**、写后**用 harness 自带 js-yaml 复核 YAML**；不顺 ⇒ **立即还原备份**并报错。
 - 旧 artifact **移入** `.dsh-codex-bridge-artifacts/` 而非删除；**不删未知目录**。
-- `-HealthUrl` 失败 ⇒ **精确回滚本插件**（还原备份 + 放回旧 artifact）。
+- **健康门**用 CLI **先登录换 cookie**，要求响应含 `codex-collab` 路由与 `bindings`（**旧单向桥的匿名 200 不算通过**）；**首装**失败⇒精确回滚，**升级**失败⇒报 `restart-required`（退出码 3）而不回滚正确磁盘安装。
 - 实测：回滚后 patch 文件与安装前 **SHA256 完全一致**，产物已移除。
 
 ### `scripts/bridge-cli.mjs`（薄消费入口，**只调用本桥 HTTP**）
@@ -198,7 +204,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
   `<home>/.credentials.yaml` 或环境解析，**不进命令行、不打印**（实测断言）。
 - 配置示例见 `bridge-config.example.yml`（**只含引用**，无任何密钥值）。
 
-## 四、验收（全部实测，`EXIT=0`，合计 327/327）
+## 四、验收（全部实测，`EXIT=0`，合计 360/360）
 
 `node scripts/<suite>.test.mjs`：
 
@@ -220,6 +226,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
 | **`collab-meta-loss`** | **23/23** | **运行期 meta 丢失**：producer（模型工具/原生事件）**未经任何 collaboration HTTP reload** 即被拒，**已有记录与游标不变、不重建 seq 1**；共享分配边界独立反例；fresh store 仍正常；失效 ask **返回具体存储错误且不挂起** |
 | **`collab-hotload`** | **11/11** | **热加载实测**：启动时无插件（404）→ 只改 profile patch → **同一 PID**（无重启）内路由 200、**既有 session 与历史仍在**、绑定/notify/signals/wait 全可用；`--patch` 启动参数文件**不会**热加载（准确限制） |
 | **`collab-ops`** | **25/25** | **消费与运维**：CLI health/bindings/真实 ask→wait-any→answer→**同 tool 继续**/confirm/notify；**不误吞另一会话**；**空截止到达且无输出、无模型调用**；**凭据不出现在任何输出**；安装精确提交（其它插件行保留、不含 tests）→ 健康 → 回滚**逐字节还原** |
+| **`collab-upgrade`** | **33/33** | **升级真实反例**：先装**旧单向桥**→启动宿主→换新 artifact 触发重载 ⇒ **已 import 的模块不换**（collab 仍 404），而 **patch 层确实重载**（移行即 404）、session 与进程身份保留；**健康门**拒匿名旧 200、要求 collab 路由+bindings；**回滚绑定本插件收据**（只移本块、恢复收据记录的旧 artifact、**并发改同块即拒绝**、无收据拒绝猜测）|
 另需 `scripts/isolated-instance.mjs`（可丢弃或 caller-owned home + `--patch` overlay，**真 SIGTERM → 等退出 →
 有界 SIGKILL → 复核**的 stop，**回收本次自有孙进程**，失败日志复制到 caller 指定的证据目录，并导出
 `stopIsClean()` 供各套件共用同一收据判定）与 `scripts/scripted-model/`

@@ -4,9 +4,14 @@
 
 ## 前置事实（已在隔离实例实测）
 
-- **装插件不需要重启主服务。** Harness 会 watch profile 的 `cordis.patch.yml`，文件一变就重新协调
-  Loader。实测：同一进程内从「插件不存在（404）」变为「路由 200、既有 session 与历史仍在、
-  双向接口可用」，PID 不变。
+- **首次安装不需要重启主服务。** Harness 会 watch profile 的 `cordis.patch.yml`，文件一变就重新协调
+  Loader。实测：同一进程内从「插件不存在（404）」变为「路由 200」。
+- **升级「已加载过」的插件必须重启 Harness。** 实测结论（`collab-upgrade` 33/33）：宿主已经 import
+  过该模块后，Loader 重载时按名字重新 import，而 **Node 的 ESM 缓存直接返回已加载的旧模块**，
+  于是运行中的宿主**继续提供旧 artifact**。此时 patch 层确实重载了（移除该行路由即 404），
+  session 也仍在，**只有模块本身不会换**。安装脚本因此返回 `restart-required`（退出码 3），
+  **不会**谎称热升级成功，也**不会**把正确的磁盘安装回滚掉。
+  ⇒ **主实例当前装的是旧单向桥，升级必须重启一次 Harness。**
 - **准确限制**：`--patch <file>` 这类**启动参数**补丁只在启动时读一次，改写它**不会**热加载。
   所以要写 **profile 自己的** `cordis.patch.yml` —— 安装脚本就是这么做的。
 - 本机主实例：`127.0.0.1:43132`，PID 应保持 `43136`（本轮未安装、未重启）。
@@ -41,12 +46,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
 ```
 
 - `-Commit` 由 root 填入**本轮冻结的精确提交**（安装脚本会用 `git rev-parse` 校验它就是该提交）。
-
 - `<launch-url-file>`：含主实例启动 URL 的日志文件（`-HealthUrl` 会从中读取 `http://127.0.0.1:43132/?token=...`）。
 - 脚本行为：从**精确提交**取干净产物（不含测试/日志）；只改本插件自己的块，**其它插件与注释不动**；
-  写前备份、写后用 Harness 自带 js-yaml 复核；**健康失败自动精确回滚本插件**。
+  写前备份、写后用 Harness 自带 js-yaml 复核。
+- **健康门**：`-HealthUrl` 会**先登录换 cookie**，再要求响应**同时**列出 `codex-collab` 路由与
+  `bindings`。**旧单向桥的匿名 200 不算通过**；主实例的 401 也不会被误判成失败。
+- **退出码**：`0` 成功；**`3` = 磁盘写入正确、但运行中的宿主仍提供旧 artifact，需要重启 Harness**
+  （见上方「前置事实」）；其它非 0 = **首次安装**失败且**已回滚**（patch 与本插件 artifact 都还原）。
+- **升级不会回滚**磁盘上正确的安装 —— 回滚会毁掉已经正确的产物，所以只报告需要重启。
+- **回滚绑定本插件收据**：`-Rollback` 只移除本插件自己的标记块，并恢复收据记录的那个旧 artifact。
+  若该块在安装后被改动过（并发编辑），回滚**明确拒绝**，**不覆盖**别人的修改；没有收据也**拒绝猜测**。
 - **`-HealthUrl` 用不上时**：安装后手动确认
-  `Invoke-WebRequest http://127.0.0.1:43132/codex-bridge/health`（未登录返回 401 属正常鉴权，不是失败）。
+  `node dsh-codex-bridge\scripts\bridge-cli.mjs health --url-file <launch-url-file>`
+  （CLI 会自动登录；`bindings` 为 0 或没有 `codex-collab` 路由即表示仍是旧桥）。
 
 ## 三、验证
 
@@ -72,10 +84,14 @@ node dsh-codex-bridge\scripts\bridge-cli.mjs wait-any --url-file <launch-url-fil
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Rollback
 ```
 
-- 恢复**最近一次备份**的 patch 文件（实测与安装前 SHA256 一致），并把**上一个 artifact 放回**；
-  若此前没有 artifact，则移除本次安装的副本。
-- 旧 artifact 一直保留在 `<DshHome>\profiles\node_modules\.dsh-codex-bridge-artifacts\`，
-  需要时可手工换回。脚本**不删除未知目录**。
+- 回滚**只移除本插件自己的标记块**（实测：安装后追加的其它行、其它插件行与注释**逐字节保留**），
+  并放回**收据记录的那个**旧 artifact；没有旧 artifact 则移除本次安装的副本。
+- 回滚**绑定本插件收据**（`<DshHome>\profiles\node_modules\.dsh-codex-bridge-artifacts\migration.json`），
+  **不是**"目录里最新的 .bak" —— 那个可能属于别人后续的改动。
+- 若本插件块在安装后被编辑过（并发改同一块）⇒ **明确拒绝回滚**并说明，**不覆盖别人的修改**；
+  没有收据同样**拒绝猜测**。此时按提示手工处理该块。
+- 旧 artifact 一直保留在上述归档目录，需要时可手工换回。脚本**不删除未知目录**，
+  且移动/递归删除前会校验路径位于 profile 的 `node_modules` 或本次 stage 内。
 
 ## 五、两个控制方（Codex）怎么用
 
