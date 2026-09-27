@@ -53,7 +53,7 @@
   Restore the newest backup of the patch file and put the previous artifact back.
 
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Commit d0d839b -ControllerConfig .\bridge-config.yml
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Commit <exact-commit> -ControllerConfig .\bridge-config.yml
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Rollback
 #>

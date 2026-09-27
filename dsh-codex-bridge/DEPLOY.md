@@ -35,10 +35,12 @@
 ```powershell
 cd D:\workspace\_tools\deepseek_plugin
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 `
-  -Commit d0d839b `
+  -Commit <本轮冻结的精确提交> `
   -ControllerConfig <你的本地配置.yml> `
   -HealthUrl <launch-url-file>
 ```
+
+- `-Commit` 由 root 填入**本轮冻结的精确提交**（安装脚本会用 `git rev-parse` 校验它就是该提交）。
 
 - `<launch-url-file>`：含主实例启动 URL 的日志文件（`-HealthUrl` 会从中读取 `http://127.0.0.1:43132/?token=...`）。
 - 脚本行为：从**精确提交**取干净产物（不含测试/日志）；只改本插件自己的块，**其它插件与注释不动**；
