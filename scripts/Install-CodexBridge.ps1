@@ -42,8 +42,8 @@
   a command line and this script invents no configuration of its own.
 
 .PARAMETER PackageRoot
-  Where the package name is read from. Defaults to the plugin directory named in the config fragment's
-  sibling `dsh-codex-bridge` folder.
+  The plugin package directory whose package.json names the package to install. Defaults to
+  `dsh-codex-bridge` under -Repo.
 
 .PARAMETER HealthUrl
   Optional. When given, the launch URL is read from this file and the bridge's health route is probed
@@ -53,7 +53,7 @@
   Restore the newest backup of the patch file and put the previous artifact back.
 
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Commit 4fdacdc -ControllerConfig .\bridge-config.yml
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Commit d0d839b -ControllerConfig .\bridge-config.yml
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.ps1 -Rollback
 #>
