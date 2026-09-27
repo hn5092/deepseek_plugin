@@ -14,9 +14,9 @@ import {
     pendingQuestions,
     questionStateOf
 } from "./collab.js";
-import { deliverableSignals, normalizeSignal, recoverSignals, signalVerdict, waitOutcome } from "./signals.js";
-import { confirmSignal, inboxDirFor, publishSignal, readSignals } from "./inbox.js";
-import { CollabStore } from "./store.js";
+import { deliverableSignals, waitOutcome } from "./signals.js";
+import { inboxDirFor, readSignals } from "./inbox.js";
+import { BridgeState, QUESTION_STATE, signalView } from "./state.js";
 
 /** Cordis plugin name; the profile patch row id stays independent of it. */
 export const name = "codex-bridge";
@@ -114,6 +114,27 @@ export const Config = z.object({
     inboxMaxEvents: z.number().default(500)
 });
 
+/**
+ * Validate the retention bounds.
+ *
+ * These are the numbers that decide when a finished record may be reclaimed, so a nonsensical value is
+ * refused at startup rather than silently producing a store that either grows forever or starts
+ * discarding work: an age must be a finite non-negative integer, and the retained window must be at
+ * least one record. `maxEvents: 0` would make every finished record reclaimable the moment it was
+ * confirmed, which is not a retention policy.
+ *
+ * @param {{inboxMaxAgeMs: unknown, inboxMaxEvents: unknown}} config - the plugin configuration.
+ * @returns {{ok: true} | {ok: false, reason: string}} the verdict.
+ */
+export function validateRetention({ inboxMaxAgeMs, inboxMaxEvents }) {
+    if (!Number.isSafeInteger(inboxMaxAgeMs) || inboxMaxAgeMs < 0) {
+        return { ok: false, reason: `inboxMaxAgeMs must be a non-negative integer, got ${String(inboxMaxAgeMs)}` };
+    }
+    if (!Number.isSafeInteger(inboxMaxEvents) || inboxMaxEvents < 1) {
+        return { ok: false, reason: `inboxMaxEvents must be an integer of at least 1, got ${String(inboxMaxEvents)}` };
+    }
+    return { ok: true };
+}
 function messageOf(error) {
     return error instanceof Error ? error.message : String(error);
 }
@@ -168,6 +189,14 @@ export function apply(ctx, config) {
     const base = config.path.replace(/\/+$/, "");
     const collabBase = config.collabPath.replace(/\/+$/, "");
 
+    // A nonsensical retention bound is refused outright: it decides when finished records may be
+    // reclaimed, and silently accepting a negative age or an empty retained window would produce a store
+    // that either never bounds itself or discards work.
+    const retentionCheck = validateRetention(config);
+    if (!retentionCheck.ok) {
+        throw new Error(`codex-bridge: refusing to start: ${retentionCheck.reason}`);
+    }
+
     /** Declared bindings, validated once at startup so a typo cannot silently widen access. */
     const bindings = [];
     for (const raw of config.bindings || []) {
@@ -188,51 +217,69 @@ export function apply(ctx, config) {
         }
     }
 
-    /** Live waiters only: `questionId` -> resolver. Not a record; the log is the record. */
-    const waiters = new Map();
-    /** Question metadata needed to serve a controller: id -> {sessionId, cwd, question, seq, askedAt}. */
-    const registry = new Map();
-    /** Monotonic sequence so a controller's cursor is meaningful. */
-    let sequence = 0;
-
     /**
-     * Signals raised by this process, keyed by signal id.
+     * The collaboration state owner.
      *
-     * The signal is a NOTIFICATION projection of an event that already exists in the session log or in
-     * this plugin's own question registry; it is never a second writable source of truth. Identity is
-     * the id, so a repeat of the same event is the same signal and cannot be delivered twice.
+     * Every fact this bridge keeps is ONE record with two independent axes — whether the controller has
+     * confirmed being told, and whether the work itself is finished — and that owner is responsible for
+     * the record, its transitions, its identity and its file projection. This host half only routes
+     * requests into it and renders what it reports; it keeps no state of its own that could disagree.
+     *
+     * See `lib/state.js` for why one record replaced three files, and why the session log is not used.
      */
-    const signals = new Map();
+    const state = new BridgeState({
+        storeRoot: config.storeRoot.length > 0 ? config.storeRoot : config.inboxRoot,
+        inboxRoot: config.inboxRoot,
+        logger: ctx.logger
+    });
+    /** The configured inbox root, or null when file signalling is not configured. */
+    const inboxRoot = config.inboxRoot.length > 0 ? config.inboxRoot : null;
     /** Resolvers waiting on ANY bound session, so one new signal can wake several waits. */
     const signalWaiters = new Set();
+    state.onChange = () => { for (const wake of [...signalWaiters]) wake(); };
 
-    /** The configured inbox root, or null when file signalling is not configured. */
-    const inboxRoot = typeof config.inboxRoot === "string" && config.inboxRoot.length > 0 ? config.inboxRoot : null;
+    if (state.store.available) {
+        const probe = state.store.probeWritable();
+        if (!probe.ok) ctx.logger.error("codex-bridge: the durable store is not writable (%s); transfers will be refused rather than lost", probe.reason);
+    }
+    /** @type {ReturnType<typeof import("./state.js").BridgeState.prototype.load>} */
+    let loaded = { loaded: 0, problems: [] };
 
     /**
-     * Confirmed event ids, read from the durable store.
+     * The question state a controller reads, derived from the ONE record.
      *
-     * Confirmation is a durable, per-event fact rather than a client-supplied list, so every view (the
-     * memory view, the file inbox, and a process restarted against the same store) agrees on what has
-     * been dealt with, and a controller never has to remember what it already confirmed.
+     * The fold in `collab.js` works on typed events; a record is converted to that same shape so the
+     * identical rules apply to a live question and to one read back after a restart.
      *
-     * @param {string} [controller] - when given, only that controller's confirmations.
-     * @returns {Set<string>} the confirmed event ids.
+     * @param {string} questionId - the question.
+     * @returns {{status: string, answer?: object, reason?: string}} the state.
      */
-    const durableConfirmed = (controller) => {
-        try {
-            if (typeof controller === "string" && controller.length > 0) {
-                return store.confirmationsFor(controller).confirmed;
-            }
-            const confirmed = new Set();
-            for (const controller of new Set(bindings.map((entry) => entry.controller))) {
-                for (const id of store.confirmationsFor(controller).confirmed) confirmed.add(id);
-            }
-            return confirmed;
-        } catch {
-            // A store that cannot be read means "nothing known confirmed", never "everything confirmed".
-            return new Set();
-        }
+    const stateOfQuestion = (questionId) => {
+        const record = state.get(questionId);
+        if (record === null || record.kind !== "question") return { status: "unknown", reason: "question-not-recorded" };
+        if (record.business === "answered") return { status: "answered", answer: record.answer ?? { text: "", source: "codex" } };
+        if (record.business === "cancelled") return { status: "cancelled", reason: record.cancelReason ?? "cancelled" };
+        if (record.business === "expired") return { status: "cancelled", reason: "expired" };
+        return { status: "pending" };
+    };
+
+    // ---- controller-facing view -------------------------------------------------------------
+
+    /** Every question this process knows about, with its folded state, for one binding. */
+    const listForBinding = (binding) => {
+        return state.all()
+            .filter((record) => record.sessionId === binding.sessionId && record.kind === "question")
+            .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+            .map((record) => ({
+                id: record.id,
+                sessionId: record.sessionId,
+                cwd: record.cwd,
+                seq: record.seq,
+                askedAt: record.createdAt,
+                question: record.question ?? record.text ?? "",
+                bindingId: record.bindingId,
+                state: stateOfQuestion(record.id)
+            }));
     };
 
     /**
@@ -281,211 +328,6 @@ export function apply(ctx, config) {
     const secretsLoaded = loadControllerSecrets().then(() => { secretsReady = true; });
     /** @returns {boolean} whether the credential cache has been populated. */
     const controllerAuthReady = () => secretsReady;
-
-    /**
-     * Record one signal and notify waiters.
-     *
-     * The optional file projection is published first, so a controller that is watching files sees the
-     * event even if this process dies immediately afterwards; the in-memory copy then wakes live waits.
-     * A duplicate id whose content differs is refused rather than silently retargeting a task.
-     *
-     * @param {object} raw - candidate signal.
-     * @returns {{ok: true, signal: object, duplicate: boolean} | {ok: false, reason: string}} the result.
-     */
-    /**
-     * Record one signal and notify waiters — the ONE owner of signal persistence and projection.
-     *
-     * Every producer goes through here: a question raised by the `ask_codex` tool, a notification from
-     * `notify_controller` or `/notify`, and the native Goal/error listener. Concentrating it here is what
-     * keeps those paths from diverging: an earlier version had the HTTP route record the durable signal
-     * while the question tool only recorded the question, so a real pending question survived a restart
-     * in the store but was invisible to `wait-any` and unknown to `confirm`.
-     *
-     * The order is deliberate and is the contract:
-     *   1. the durable record — so a restart can reconstruct this exact event, and so nothing is offered
-     *      that a restart could not also find;
-     *   2. the file projection — how a controller that cannot hold a request open gets told;
-     *   3. the in-memory view and the waiting callers.
-     *
-     * A failure at step 1 is fatal to the raise (the event is not presented at all). A failure at step 2
-     * is reported but does not invalidate the durable record, because the fact is safe and only its
-     * delivery mechanism failed.
-     *
-     * @param {object} raw - candidate signal.
-     * @returns {{ok: true, signal: object, duplicate: boolean, fileError?: string} | {ok: false, reason: string}} the result.
-     */
-    const raiseSignal = (raw) => {
-        const normalized = normalizeSignal(raw);
-        if (!normalized.ok) return normalized;
-        const candidate = { ...normalized.signal, seq: sequence + 1 };
-        const verdict = signalVerdict(signals.get(candidate.id) ?? null, candidate);
-        if (verdict.action === "conflict") return { ok: false, reason: verdict.reason };
-        // A repeat of the SAME identity adds no second event. Its durable record and its file are still
-        // rewritten if an earlier write failed, but that must never create another business event.
-        if (verdict.action === "same") {
-            const known = signals.get(candidate.id);
-            const persisted = store.putSignal(known);
-            const republish = republishSignal(known);
-            if (!persisted.ok) return { ok: false, reason: `signal-not-recorded:${persisted.reason}` };
-            return { ok: true, signal: known, duplicate: true, ...(republish.ok ? {} : { fileError: republish.reason }) };
-        }
-        // 1) Durable first: an event that cannot be recorded must not become visible.
-        const persisted = store.putSignal(candidate);
-        if (!persisted.ok) {
-            ctx.logger.error("codex-bridge: signal %s could not be recorded durably: %s", candidate.id, persisted.reason);
-            return { ok: false, reason: `signal-not-recorded:${persisted.reason}` };
-        }
-        sequence += 1;
-        signals.set(candidate.id, candidate);
-        // 2) Then the file projection, whose failure is reported but does not undo the durable fact.
-        const file = republishSignal(candidate);
-        // 3) Then wake everyone waiting on any of this controller's bindings.
-        for (const wake of [...signalWaiters]) wake();
-        return { ok: true, signal: candidate, duplicate: false, ...(file.ok ? {} : { fileError: file.reason }) };
-    };
-
-    /**
-     * Write one signal's file into its controller's inbox.
-     *
-     * Publishing is idempotent by event id: retrying after a failure overwrites the same final name and
-     * never produces a second business event. A controller whose directory cannot be resolved (an
-     * unsafe id, or no configured root) is reported as a failure rather than silently skipped.
-     *
-     * @param {object} signal - a normalized signal.
-     * @returns {{ok: true, file: string} | {ok: false, reason: string}} the outcome.
-     */
-    const republishSignal = (signal) => {
-        if (inboxRoot === null) return { ok: false, reason: "file-inbox-not-configured" };
-        const dir = inboxDirFor(inboxRoot, signal.controller);
-        if (!dir.ok) return { ok: false, reason: dir.reason };
-        const published = publishSignal(dir.dir, signal);
-        if (!published.ok) {
-            // Visible in the plugin log as well, so an operator can see a broken inbox without reading
-            // the response of whichever call happened to notice first.
-            ctx.logger.warn("codex-bridge: signal %s could not be written to the inbox: %s", signal.id, published.reason);
-        }
-        return published;
-    };
-
-    /**
-     * THE owner of the notification-file projection.
-     *
-     * The inbox is a projection of the durable signals, so it must never become a second truth that can
-     * disagree with them. This one function keeps it reconciled, and every surface reads the projection
-     * through it:
-     *
-     *  - REPAIR: a signal recorded durably but missing its file (a crash between the two writes, a
-     *    previously unwritable inbox, a file deleted by hand) has the file written again. Without this a
-     *    restart would show a signal in the API while its file was silently absent.
-     *  - FILTER: a signal the authoritative store records as CONFIRMED is excluded even if its file still
-     *    exists. A file that could not be deleted must not turn a confirmed event back into outstanding
-     *    work — the file's presence is not the fact; the confirmation is.
-     *  - DROP: a file with no corresponding durable signal is not delivered, because nothing recorded it.
-     *
-     * @param {string} controller - the controller whose view is being built.
-     * @returns {{signals: ReadonlyArray<object>, repaired: number, unrecorded: number, confirmed: ReadonlySet<string>}} the reconciled view.
-     */
-    const projectSignals = (controller) => {
-        const confirmed = durableConfirmed(controller);
-        const durable = [...signals.values()].filter((signal) => signal.controller === controller);
-        const durableById = new Map(durable.map((signal) => [signal.id, signal]));
-        // 1) Repair: every durable, unconfirmed signal must have its file.
-        let repaired = 0;
-        for (const signal of durable) {
-            if (confirmed.has(signal.id)) continue;
-            const republished = republishSignal(signal);
-            if (republished.ok) repaired += 1;
-        }
-        // 2) Deliver only what the store records and has not confirmed.
-        const deliverable = durable.filter((signal) => !confirmed.has(signal.id));
-        const recorded = new Set(deliverable.map((signal) => signal.id));
-        // 3) Report files that no durable signal backs, so a stray file is visible rather than delivered.
-        let unrecorded = 0;
-        if (inboxRoot !== null) {
-            const dir = inboxDirFor(inboxRoot, controller);
-            if (dir.ok) {
-                const onDisk = readSignals(dir.dir).signals;
-                unrecorded = onDisk.filter((signal) => !durableById.has(signal.id)).length;
-            }
-        }
-        return { signals: deliverable, repaired, unrecorded, confirmed, recorded };
-    };
-
-    // ---- durable store ------------------------------------------------------------------------
-
-    /**
-     * The plugin's own durable store.
-     *
-     * This is the single authoritative place a signal, a question and a confirmation live. It is NOT the
-     * Session log, and that is deliberate: this harness refuses to read a session log containing an event
-     * type outside its generated known set unless the envelope carries `ignorable: true`, while
-     * `Session.append` only accepts `sourceEventSeqs` and `surfaceOp`. Writing a custom event therefore
-     * makes the session permanently unreadable, reproduced on a real stop/restart. Records go here.
-     */
-    const store = new CollabStore(config.storeRoot.length > 0 ? config.storeRoot : inboxRoot ?? "");
-    if (store.available) {
-        const probe = store.probeWritable();
-        if (!probe.ok) ctx.logger.error("codex-bridge: the durable store is not writable (%s); notifications will be refused rather than lost", probe.reason);
-    }
-
-    /**
-     * The recorded states of one question, read from this plugin's own durable store.
-     *
-     * The fold in `collab.js` expects a sequence of typed events; the store keeps one record holding the
-     * question's current facts, which is converted to that same shape so identical rules apply to a live
-     * question and to one read back after a restart.
-     *
-     * @param {string} sessionId - the owning session.
-     * @param {string} questionId - the question.
-     * @returns {ReadonlyArray<object> | null} the events, or null when the store cannot be read.
-     */
-    const eventsFor = (sessionId, questionId) => {
-        const meta = registry.get(questionId);
-        const bindingId = meta !== undefined && typeof meta.bindingId === "string" ? meta.bindingId : null;
-        if (bindingId === null) return null;
-        const read = store.getQuestion(bindingId, questionId);
-        if (!read.ok) return null;
-        const record = read.value;
-        if (record === null || typeof record !== "object") return null;
-        const events = [{ type: EVENT_QUESTION, data: record }];
-        if (record.answer !== undefined && record.answer !== null) events.push({ type: EVENT_ANSWER, data: record.answer });
-        if (record.cancel !== undefined && record.cancel !== null) events.push({ type: EVENT_CANCEL, data: record.cancel });
-        return events;
-    };
-
-    /** @param {string} sessionId - session. @param {string} questionId - question. @returns {object} the folded state. */
-    const stateOfQuestion = (sessionId, questionId) => {
-        const events = eventsFor(sessionId, questionId);
-        if (events === null) {
-            // The question cannot be read from the durable store, which is not the same as "pending".
-            // Reporting it as unknown keeps a missing record from looking like a live question.
-            return { status: "unknown", reason: "question-not-recorded" };
-        }
-        return questionStateOf(events);
-    };
-
-    // ---- controller-facing view -------------------------------------------------------------
-
-    /** Every question this process knows about, with its folded state, for one binding. */
-    const listForBinding = (binding) => {
-        const out = [];
-        for (const [id, meta] of registry) {
-            if (meta.sessionId !== binding.sessionId) continue;
-            out.push({
-                id,
-                sessionId: meta.sessionId,
-                cwd: meta.cwd,
-                seq: meta.seq,
-                askedAt: meta.askedAt,
-                question: meta.question,
-                // The binding that OWNS this question is part of the answer: a controller must be able to
-                // see whether a question belongs to its live binding or to a superseded one it inherited.
-                bindingId: meta.bindingId,
-                state: stateOfQuestion(meta.sessionId, id)
-            });
-        }
-        return out;
-    };
 
     // ---- the model-facing tool --------------------------------------------------------------
 
@@ -537,106 +379,71 @@ export function apply(ctx, config) {
             if (!bound.allowed) {
                 return { status: "rejected", questionId: "", reason: `not-a-controlled-session:${bound.reason}` };
             }
-            const questionId = `collab-${randomUUID()}`;
-            sequence += 1;
-            // The binding id travels with the question so an answer can be matched to the exact binding,
-            // not merely to a session: two bindings may legitimately raise the same local question id.
-            const meta = { sessionId, cwd, seq: sequence, askedAt: new Date().toISOString(), question, bindingId: bound.binding.bindingId, controller: bound.binding.controller };
-            registry.set(questionId, meta);
-            // Durable FIRST, in this plugin's own store: the question is recorded before anyone can answer
-            // it, so the fact survives even if this process dies while the tool is still waiting. It is
-            // deliberately not written to the session log — see the store module for why an out-of-repo
-            // event name would make that log permanently unreadable.
-            const stored = store.putQuestion(bound.binding.bindingId, {
-                id: questionId,
-                seq: sequence,
-                question,
-                bindingId: bound.binding.bindingId,
-                controller: bound.binding.controller,
-                sessionId,
-                cwd,
-                askedAt: meta.askedAt,
-                ...(typeof args.detail === "string" ? { detail: args.detail } : {})
-            });
-            if (!stored.ok) {
-                // A question that cannot be recorded durably must not be asked: the tool would wait for an
-                // answer to a question no restart could find.
-                registry.delete(questionId);
-                return { status: "rejected", questionId: "", reason: `question-not-recorded:${stored.reason}` };
-            }
-            // Raise the signal AFTER the durable record, so a controller woken by it can always read the
-            // event it refers to. The signal carries identity and a reference, never the question body.
-            // `raiseSignal` persists the signal through the SAME owner every other producer uses, so a
-            // question's signal cannot be missing from the store the way it once was.
-            const raised = raiseSignal({
-                id: `sig-question-${questionId}`,
-                controller: bound.binding.controller,
-                bindingId: bound.binding.bindingId,
-                sessionId,
-                cwd,
+            // ONE call records the question as a single atomic record carrying both axes: the business
+            // state starts `pending` and the notification starts `outstanding`. The owner persists before
+            // it publishes, so a question that could not be recorded is never asked at all.
+            const published = state.publish({
                 kind: "question",
-                reference: `collab-question:${questionId}`,
-                at: meta.askedAt
+                bindingId: bound.binding.bindingId,
+                controller: bound.binding.controller,
+                sessionId,
+                cwd,
+                text: question,
+                reference: `collab-question`,
+                sourceIdentity: typeof args.detail === "string" ? { detail: args.detail } : {}
             });
-            if (!raised.ok) {
-                // The question is recorded, but no controller can be woken for it. Asking anyway would
-                // leave the tool waiting on a question nobody will ever see, so the question is withdrawn
-                // and the caller is told the truth instead of hanging until the deadline.
-                registry.delete(questionId);
-                try {
-                    const current = store.getQuestion(bound.binding.bindingId, questionId);
-                    if (current.ok && current.value && typeof current.value === "object") {
-                        store.putQuestion(bound.binding.bindingId, { ...current.value, cancel: { id: questionId, reason: "signal-not-raised", at: new Date().toISOString() } });
-                    }
-                } catch { /* the store may be gone; the cancellation is best effort */ }
-                return { status: "rejected", questionId: "", reason: `question-signal-not-raised:${raised.reason}` };
+            if (!published.ok) {
+                return { status: "rejected", questionId: "", reason: `question-not-recorded:${published.reason}` };
             }
-            // The signal is durably recorded and raised, but its FILE could not be written. This is the
-            // case the store being writable does not cover: the inbox can be unwritable on its own. The
-            // controller may still be reached through the API, so the question is NOT withdrawn — but the
-            // tool reports the degraded delivery instead of pretending the notification was reliable.
-            const fileWarning = raised.fileError === undefined
+            const questionId = published.record.id;
+            // The record's question text is what a controller reads; keep it on the record itself.
+            state.store.putRecord({ ...published.record, question });
+            const record = state.get(questionId) ?? published.record;
+            // The record is durable. If its FILE could not be written, the controller can still be reached
+            // through the API, so the question is NOT withdrawn — but the tool reports the degraded
+            // delivery instead of pretending the notification was reliable.
+            const fileWarning = published.fileError === undefined
                 ? null
-                : `question-signal-file-not-delivered:${raised.fileError}`;
+                : `question-signal-file-not-delivered:${published.fileError}`;
             if (fileWarning !== null) {
-                ctx.logger.warn("codex-bridge: question %s raised but its notification file failed: %s", questionId, raised.fileError);
+                ctx.logger.warn("codex-bridge: question %s recorded but its notification file failed: %s", questionId, published.fileError);
             }
 
             const timeoutMs = Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
                 ? Math.min(args.timeoutMs, config.answerTimeoutMs)
                 : config.answerTimeoutMs;
 
+            /** Settles this call exactly once, whatever ends it. */
+            let disposeWaiter = () => {};
             const answer = await new Promise((resolve) => {
                 let settled = false;
                 /** @param {object} value - the outcome to settle with. */
                 const settle = (value) => {
                     if (settled) return;
                     settled = true;
-                    waiters.delete(questionId);
+                    disposeWaiter();
                     clearTimeout(timer);
                     exec.signal?.removeEventListener?.("abort", onAbort);
                     resolve(value);
                 };
                 const timer = setTimeout(() => {
-                    // Bounded wait: an unanswered question is left readable and reported, never pinned
-                    // forever and never silently dropped.
+                    // A bounded wait. Timing out is a real business outcome, not merely a dropped promise:
+                    // the record is marked `expired` so a later answer is recognizably too late and a
+                    // restart can see that this question was never answered.
+                    state.settleBusiness(questionId, { business: "expired" });
                     settle({ status: "interrupted", reason: "answer-timeout" });
                 }, timeoutMs);
                 const onAbort = () => {
-                    try {
-                        // Record the cancellation durably, so a late answer is recognizably too late rather
-                        // than looking like the first answer to a live question.
-                        const current = store.getQuestion(bound.binding.bindingId, questionId);
-                        const record = current.ok && current.value && typeof current.value === "object" ? current.value : { id: questionId };
-                        store.putQuestion(bound.binding.bindingId, { ...record, cancel: { id: questionId, reason: "caller-cancelled", at: new Date().toISOString() } });
-                    } catch { /* the store may be gone; the wait still ends */ }
+                    // Cancellation is likewise a durable business outcome, so a late answer is refused
+                    // rather than looking like the first answer to a live question.
+                    state.settleBusiness(questionId, { business: "cancelled" });
                     settle({ status: "interrupted", reason: "cancelled" });
                 };
                 if (exec.signal) {
                     if (exec.signal.aborted) { onAbort(); return; }
                     exec.signal.addEventListener?.("abort", onAbort, { once: true });
                 }
-                waiters.set(questionId, { settle, sessionId });
+                disposeWaiter = state.registerWaiter(questionId, settle);
             });
 
             return {
@@ -670,47 +477,47 @@ export function apply(ctx, config) {
      * @returns {{eventId: string, signalId: string, raised: object}} the produced identities.
      */
     const produceNotification = async ({ agent, binding, kind, text, goalId, requestId, at }) => {
-        // A stable event id: retrying the same notification (same binding, kind, goal and request at the
-        // same instant is not the identity — the identity is derived from what the notification IS) must
-        // not create a second business event. Callers that retry pass the same requestId, so that is the
-        // natural identity when present; otherwise a fresh id is right because it is a new notification.
-        const eventId = typeof requestId === "string" && requestId.length > 0
+        // A caller that retries names the SAME event, and an event id is issued by this store, so a retry
+        // inside the retention window matches the existing record exactly. Beyond that window the record
+        // has been reclaimed and a bare arbitrary string is no longer accepted as proof of identity: the
+        // caller must present the original issue time and is told the event expired rather than being
+        // allowed to re-create it. Unlimited retention and unlimited deduplication cannot both hold, and
+        // pretending otherwise with tombstones would be an unbounded store claiming to be bounded.
+        const knownId = typeof requestId === "string" && requestId.length > 0
             ? `notify-${binding.bindingId}-${requestId}-${kind}`
-            : `notify-${randomUUID()}`;
-        const signalId = `sig-${eventId}`;
-        sequence += 1;
-        const record = {
-            // `id` is the signal identity every rule keys on; `signalId` is the same value under the name
-            // the durable event and the HTTP surface use, so both spellings agree rather than drifting.
-            id: signalId,
-            signalId,
-            eventId,
+            : undefined;
+        const published = state.publish({
+            kind: kind === "error" ? "error" : "delivery",
             bindingId: binding.bindingId,
             controller: binding.controller,
             sessionId: binding.sessionId,
             cwd: binding.cwd,
-            kind,
-            seq: sequence,
-            ...(goalId === undefined ? {} : { goalId }),
-            ...(requestId === undefined ? {} : { requestId }),
-            // The reference is IDENTITY, so it is derived from what the event IS and never from when it
-            // was sent: a timestamp here would give the same logical notification a different identity on
-            // every retry, turning a legitimate retry into a conflict. The time lives in `at`, which is
-            // deliberately not part of the identity.
-            reference: `collab-notify:${binding.bindingId}:${eventId}`,
-            at
-        };
-        // `raiseSignal` is the ONE owner of signal persistence, so the durable record is written there
-        // and not again here: two writes of the same event could disagree, and the ordering rule (record
-        // before visible) lives in that single place.
-        const raised = raiseSignal(record);
-        if (!raised.ok) {
-            ctx.logger.error("codex-bridge: notification %s could not raise a signal: %s", signalId, raised.reason);
+            text,
+            ...(knownId === undefined ? {} : { id: knownId }),
+            ...(at === undefined ? {} : { at }),
+            sourceIdentity: {
+                ...(goalId === undefined ? {} : { goalId }),
+                ...(requestId === undefined ? {} : { requestId })
+            }
+        });
+        if (!published.ok) {
+            ctx.logger.error("codex-bridge: notification for %s could not be published: %s", binding.sessionId, published.reason);
+            return {
+                eventId: knownId ?? "",
+                signalId: "",
+                raised: { ok: false, reason: published.reason },
+                fileError: `${published.expired === true ? "event-expired" : "record-not-persisted"}:${published.reason}`
+            };
         }
         // The DURABLE record is what makes the event recoverable, and the FILE is only how a controller
         // may be notified. They are reported separately on purpose: a successful durable write is not
         // invalidated by a failed notification file, and a caller must be able to tell which failed.
-        return { eventId, signalId, raised, fileError: raised.ok ? raised.fileError : `signal-not-raised:${raised.reason}` };
+        return {
+            eventId: knownId ?? published.record.id,
+            signalId: published.record.id,
+            raised: { ok: true, signal: signalView(published.record), duplicate: published.duplicate },
+            fileError: published.fileError
+        };
     };
 
     /** The DS-side producer for completion and failure.
@@ -821,65 +628,38 @@ export function apply(ctx, config) {
      * @returns {{signals: number, questions: number, cursor: number}} what was recovered.
      */
     const recoverFromEvents = () => {
-        let recoveredCount = 0;
-        let questions = 0;
         try {
-            if (!store.available) return { signals: 0, questions: 0, cursor: sequence };
-            // Questions first: a question's binding is how the durable record is located later.
-            const storedQuestions = store.allQuestions();
-            for (const record of storedQuestions.questions) {
-                if (record === null || typeof record !== "object" || typeof record.id !== "string") continue;
-                if (registry.has(record.id)) continue;
-                const owned = bindings.find((entry) => entry.bindingId === record.bindingId);
-                if (owned === undefined) continue;
-                registry.set(record.id, {
-                    sessionId: typeof record.sessionId === "string" ? record.sessionId : owned.sessionId,
-                    cwd: typeof record.cwd === "string" ? record.cwd : owned.cwd,
-                    seq: typeof record.seq === "number" ? record.seq : 0,
-                    askedAt: typeof record.askedAt === "string" ? record.askedAt : new Date(0).toISOString(),
-                    question: typeof record.question === "string" ? record.question : "",
-                    bindingId: record.bindingId,
-                    controller: typeof record.controller === "string" ? record.controller : owned.controller
-                });
-                questions += 1;
+            if (!state.store.available) return { records: 0, questions: 0, cursor: 0 };
+            // Rebuild the cache from the durable records. Nothing is derived a second time: the records ARE
+            // the state, so a restart cannot resurrect a record that reclamation has removed, and a record
+            // that exists is visible with both of its axes intact.
+            const loaded = state.load();
+            const questions = state.all().filter((record) => record.kind === "question").length;
+            if (loaded.problems.length > 0) {
+                ctx.logger.warn("codex-bridge: %d unreadable record(s) in the durable store", loaded.problems.length);
             }
-            // Signals, minus what the store records as already confirmed.
-            const stored = store.allSignals();
-            const recovered = recoverSignals(stored.signals, [
-                ...durableConfirmed()
-            ]);
-            for (const signal of recovered.signals) {
-                if (!signals.has(signal.id)) recoveredCount += 1;
-                signals.set(signal.id, signal);
-            }
-            // Resume above everything already recorded, so an old cursor cannot re-deliver the backlog
-            // and a new event is never assigned a sequence that collides with a recovered one.
-            const highestQuestionSeq = [...registry.values()].reduce((max, entry) => Math.max(max, entry.seq ?? 0), 0);
-            sequence = Math.max(sequence, recovered.highestSeq, highestQuestionSeq);
-            if (stored.problems.length > 0) {
-                // A corrupt record is reported, never silently treated as "no event".
-                ctx.logger.warn("codex-bridge: %d unreadable record(s) in the durable store", stored.problems.length);
-            }
-            // Repair the notification projection as part of recovering: a signal that is recorded durably
-            // but lost its file (a crash between the two writes, a previously unwritable inbox, or a file
-            // removed by hand) must have that file written again, or the API would show an event whose
-            // notification silently does not exist.
+            // Repair the notification projection as a normal part of recovering: a record that is durable
+            // but lost its file (a crash between the two writes, a previously unwritable inbox, a file
+            // removed by hand) gets that file written again.
             let repaired = 0;
-            for (const controller of new Set([...signals.values()].map((signal) => signal.controller))) {
-                const projection = projectSignals(controller);
-                repaired += projection.repaired > 0 ? 1 : 0;
-                if (projection.unrecorded > 0) {
-                    ctx.logger.warn("codex-bridge: %d inbox file(s) for %s have no durable record and are not delivered", projection.unrecorded, controller);
+            for (const controller of new Set(state.all().map((record) => record.controller))) {
+                const projection = state.project(controller);
+                repaired += projection.repaired;
+                if (projection.ghosts.length > 0) {
+                    ctx.logger.warn("codex-bridge: %d inbox file(s) for %s have no record and are not delivered", projection.ghosts.length, controller);
                 }
             }
-            ctx.logger.info("codex-bridge: recovered %d signal(s) and %d question(s) from the durable store (cursor=%d, projection-repaired=%s)",
-                recoveredCount, questions, sequence, repaired > 0 ? "yes" : "no");
+            const meta = state.store.readMeta();
+            const cursor = meta.ok ? meta.meta.nextSeq - 1 : 0;
+            ctx.logger.info("codex-bridge: recovered %d record(s), %d question(s) from the durable store (cursor=%d, projection-repaired=%d)",
+                loaded.loaded, questions, cursor, repaired);
+            return { records: loaded.loaded, questions, cursor };
         } catch (error) {
             // Recovery failing must not take the host down; the bridge starts with what it has, and an
             // unreadable question then reports `unknown` rather than a wrong answer.
             ctx.logger.warn("codex-bridge: recovery from the durable store failed: %s", messageOf(error));
+            return { records: 0, questions: 0, cursor: 0 };
         }
-        return { signals: recoveredCount, questions, cursor: sequence };
     };
 
     // ---- native completion and terminal failure become signals -------------------------------
@@ -1098,14 +878,15 @@ export function apply(ctx, config) {
                     return;
                 }
                 // Every read of what this controller is owed goes through the projection owner, so the view
-                // is reconciled with the durable records (missing files repaired, confirmed events
-                // excluded) instead of each route re-deriving it and drifting.
-                const projection = projectSignals(controller);
-                const deliverable = deliverableSignals(projection.signals, controller, acknowledged);
+                // is reconciled with the durable records (a missing file is repaired, a confirmed or
+                // reclaimed record is not delivered, a file with no record is reported) instead of each
+                // route re-deriving it and drifting.
+                const projection = state.project(controller);
+                const deliverable = deliverableSignals(projection.outstanding, controller, acknowledged);
                 send(response, 200, {
                     signals: deliverable,
                     cursor: deliverable.length > 0 ? deliverable[deliverable.length - 1].seq : null,
-                    ...(projection.unrecorded > 0 ? { unrecordedFiles: projection.unrecorded } : {})
+                    ...(projection.ghosts.length > 0 ? { unrecordedFiles: projection.ghosts.length } : {})
                 });
                 return;
             }
@@ -1132,17 +913,21 @@ export function apply(ctx, config) {
                     return;
                 }
                 const snapshot = readSignals(dir.dir);
-                // The files view reports what is ACTUALLY owed, not merely what is on disk. A file whose
-                // event the authoritative store records as confirmed is filtered out even if it could not
-                // be deleted: otherwise a permissions problem would resurrect a handled event as
-                // outstanding work, which is precisely the confusion confirmation exists to prevent.
-                const confirmed = durableConfirmed(controller);
-                const outstanding = snapshot.signals.filter((signal) => typeof signal.id !== "string" || !confirmed.has(signal.id));
+                // The files view reports what is ACTUALLY owed, not what happens to be on disk: a record
+                // that is confirmed or reclaimed is not delivered even if its file lingers, and a file with
+                // no record at all is a ghost that is reported but never delivered. All three read
+                // surfaces share this one reconciliation, so they cannot disagree with each other.
+                const projection = state.project(controller);
+                const problems = [...snapshot.problems];
                 send(response, 200, {
                     configured: true,
-                    signals: outstanding,
-                    problems: snapshot.problems,
-                    ...(outstanding.length !== snapshot.signals.length ? { filteredConfirmed: snapshot.signals.length - outstanding.length } : {})
+                    signals: projection.outstanding,
+                    problems: [
+                        ...problems,
+                        ...projection.ghosts.map((ghost) => ({ file: ghost.id, reason: "no durable record for this inbox file; not delivered" }))
+                    ],
+                    ...(projection.confirmedFromFiles > 0 ? { filteredConfirmed: projection.confirmedFromFiles } : {}),
+                    ...(projection.ghosts.length > 0 ? { ghosts: projection.ghosts.length } : {})
                 });
                 return;
             }
@@ -1168,9 +953,12 @@ export function apply(ctx, config) {
                     send(response, 403, { error: "not your binding: controller-not-bound" });
                     return;
                 }
-                const known = signals.get(signalId);
-                if (known === undefined) {
-                    send(response, 404, { error: `unknown signal "${signalId}"` });
+                const known = state.get(signalId);
+                if (known === null) {
+                    // A record that was issued and then reclaimed is reported as retired rather than as
+                    // simply unknown, so a caller can tell "never existed" from "was already finished and
+                    // has been reclaimed", and does not treat the latter as fresh work.
+                    send(response, 410, { error: `signal "${signalId}" is unknown or has been retired`, signalId });
                     return;
                 }
                 // Only the binding that owns the event may confirm it: one controller cannot retire
@@ -1179,42 +967,34 @@ export function apply(ctx, config) {
                     send(response, 403, { error: "not your event" });
                     return;
                 }
-                // Confirmation is DURABLE in the plugin's own store, so every view (memory, the file
-                // inbox, and a process restarted against the same store) agrees on what has been dealt
-                // with and a controller never has to re-send the list it already confirmed. It is keyed by
-                // event id, so a repeat is the same outcome rather than a second fact.
-                const already = durableConfirmed(controller).has(signalId);
-                if (!already) {
-                    const recorded = store.putConfirmation(controller, signalId, { at: new Date().toISOString(), bindingId: known.bindingId, sessionId: known.sessionId });
-                    if (!recorded.ok) {
-                        // Without a durable record the event would reappear after any restart, so the
-                        // confirmation is refused rather than reported as successful.
-                        send(response, 503, { error: `the confirmation could not be recorded: ${recorded.reason}`, signalId });
-                        return;
-                    }
-                    // Confirmation is the moment a record becomes reclaimable, so retention runs here —
-                    // the one boundary where an event provably stops being owed. It only ever removes
-                    // records that are confirmed AND terminal AND past both bounds, so unconfirmed work is
-                    // never touched, and its result is reported rather than assumed.
-                    const reclaimed = store.reclaim({ maxAgeMs: config.inboxMaxAgeMs, maxEvents: config.inboxMaxEvents });
-                    if (reclaimed.failed.length > 0) {
-                        ctx.logger.warn("codex-bridge: %d confirmed record(s) could not be reclaimed and remain on disk", reclaimed.failed.length);
-                    }
+                // Confirmation is a compare-and-set on the NOTIFICATION axis alone, recorded durably, so
+                // every view (memory, the file inbox, and a process restarted against the same store)
+                // agrees on what has been dealt with. It deliberately does NOT touch the business state: a
+                // question that has not been answered stays answerable after its notification is
+                // confirmed. A repeat is the same outcome rather than a second fact.
+                const confirmed = state.confirm(signalId);
+                if (!confirmed.ok) {
+                    // Without a durable record the event would reappear after any restart, so the
+                    // confirmation is refused rather than reported as successful.
+                    send(response, 503, { error: `the confirmation could not be recorded: ${confirmed.reason}`, signalId });
+                    return;
                 }
-                // The file is a projection of the same fact, so removing it is part of the same act. A
-                // failure to remove it is REPORTED instead of discarded: the authoritative record still
-                // stands, but the caller must know the projection is out of step, and the files view will
-                // keep filtering that event out so it cannot return as outstanding work.
-                let fileNote = null;
-                if (inboxRoot !== null) {
-                    const dir = inboxDirFor(inboxRoot, controller);
-                    if (!dir.ok) fileNote = dir.reason;
-                    else {
-                        const removal = confirmSignal(dir.dir, signalId);
-                        if (removal.removed !== true) fileNote = "the inbox file could not be removed";
-                    }
+                // Confirmation is the moment a record becomes reclaimable, so retention runs here — the one
+                // boundary where the notification has provably been dealt with. It removes only records
+                // that are confirmed AND terminal AND past both bounds, so a pending question is never
+                // touched, and its outcome is reported rather than assumed.
+                const reclaimed = state.reclaim({ maxAgeMs: config.inboxMaxAgeMs, maxEvents: config.inboxMaxEvents });
+                if (reclaimed.failed.length > 0) {
+                    ctx.logger.warn("codex-bridge: %d record(s) could not be reclaimed and remain on disk", reclaimed.failed.length);
                 }
-                send(response, 200, { ok: true, confirmed: true, idempotent: already, signalId, ...(fileNote === null ? {} : { fileNote }) });
+                send(response, 200, {
+                    ok: true,
+                    confirmed: true,
+                    idempotent: !confirmed.changed,
+                    signalId,
+                    business: confirmed.record.business,
+                    ...(confirmed.fileNote === undefined ? {} : { fileNote: confirmed.fileNote })
+                });
                 return;
             }
 
@@ -1245,9 +1025,9 @@ export function apply(ctx, config) {
                     //
                     // The projection owner supplies the signals so an event that is confirmed (or has no
                     // durable record) is never handed out as new work, no matter what is on disk.
-                    signals: projectSignals(controller).signals,
+                    signals: state.project(controller).outstanding,
                     controller,
-                    acknowledged: [...durableConfirmed(controller), ...acknowledged],
+                    acknowledged: [...acknowledged],
                     since,
                     maxBatch
                 });
@@ -1352,8 +1132,8 @@ export function apply(ctx, config) {
                     send(response, 403, { error: "stated controller does not match the presented credential" });
                     return;
                 }
-                const meta = registry.get(questionId);
-                if (meta === undefined) {
+                const meta = state.get(questionId);
+                if (meta === null || meta.kind !== "question") {
                     send(response, 404, { error: `unknown question "${questionId}"` });
                     return;
                 }
@@ -1371,38 +1151,42 @@ export function apply(ctx, config) {
                 // The source is written by the SERVER. A caller cannot label machine output as the human,
                 // so any supplied value is ignored rather than trusted.
                 const source = ANSWER_SOURCES[0];
-                const state = stateOfQuestion(meta.sessionId, questionId);
-                const verdict = answerVerdict(state, { text, source });
+                const currentState = stateOfQuestion(questionId);
+                const verdict = answerVerdict(currentState, { text, source });
                 if (verdict.action === "reject" || verdict.action === "conflict") {
                     send(response, 409, { error: verdict.reason, action: verdict.action, questionId });
                     return;
                 }
                 if (verdict.action === "idempotent") {
                     // The identical answer again is the same outcome, not a second delivery.
-                    send(response, 200, { ok: true, idempotent: true, questionId, answer: state.answer });
+                    send(response, 200, { ok: true, idempotent: true, questionId, answer: currentState.answer });
                     return;
                 }
-                // Record the answer durably FIRST: the answer is the terminal fact for this question, so it
-                // must not be observable only through a live in-memory waiter. If it cannot be recorded,
-                // the answer is refused rather than acknowledged.
-                const current = store.getQuestion(matched.binding.bindingId, questionId);
-                const record = current.ok && current.value && typeof current.value === "object" ? current.value : { id: questionId, seq: meta.seq, sessionId: meta.sessionId, cwd: meta.cwd, bindingId: meta.bindingId, controller: matched.binding.controller, question: meta.question, askedAt: meta.askedAt };
-                const answerRecord = { id: questionId, text, source, controller: matched.binding.controller, at: new Date().toISOString() };
-                const written = store.putQuestion(matched.binding.bindingId, { ...record, answer: answerRecord });
-                if (!written.ok) {
-                    send(response, 503, { error: `the answer could not be recorded: ${written.reason}`, questionId });
+                // The answer is the question's terminal BUSINESS fact, applied as a compare-and-set so the
+                // first answer wins: a second, different answer is refused rather than overwriting it. It is
+                // recorded durably before any waiter is resumed, so it is never observable only through a
+                // live in-memory promise.
+                const applied = state.settleBusiness(questionId, {
+                    business: QUESTION_STATE.ANSWERED,
+                    answer: { id: questionId, text, source, at: new Date().toISOString() }
+                });
+                if (!applied.ok) {
+                    send(response, 503, { error: `the answer could not be recorded: ${applied.reason}`, questionId });
                     return;
                 }
-                const waiter = waiters.get(questionId);
-                if (waiter !== undefined) {
-                    // Resume the SAME tool call. Nothing already executed is replayed: the loop simply
-                    // receives the tool result it was waiting for.
-                    waiter.settle({ status: "answered", answer: text, source });
+                if (applied.changed === false) {
+                    // It became terminal between the fold above and the compare-and-set: report the outcome
+                    // that actually won instead of applying this one.
+                    send(response, 409, { error: "question-already-decided", action: "conflict", questionId, answer: applied.record.answer });
+                    return;
                 }
+                // Resume the SAME tool call, if this process still has one. Nothing already executed is
+                // replayed: the loop simply receives the tool result it was waiting for.
+                const delivered = state.settleWaiter(questionId, { status: "answered", answer: text, source });
                 // A tool cannot be resumed across a restart, so an answer to a question whose waiter died
-                // with the previous process is still recorded and reported as NOT delivered, which tells
-                // the controller the truth instead of implying a continuation that did not happen.
-                send(response, 200, { ok: true, questionId, delivered: waiter !== undefined, answer: { text, source }, ...(waiter === undefined ? { note: "recorded; no live waiting tool call in this process" } : {}) });
+                // with the previous process is still recorded and reported as NOT delivered — the truth,
+                // rather than an implication that a continuation happened.
+                send(response, 200, { ok: true, questionId, delivered, answer: { text, source }, ...(delivered ? {} : { note: "recorded; no live waiting tool call in this process" }) });
                 return;
             }
 
@@ -1546,13 +1330,15 @@ export function apply(ctx, config) {
     ctx.effect(() => ctx.webServer.register({ kind: "prefix", path: collabBase, handler: collabHandler }), `codex-bridge: ${collabBase}`);
     ctx.effect(() => () => {
         // End our own waits on disposal so no promise outlives the plugin, and release every signal
-        // waiter so a blocked caller returns instead of hanging on a disposed bridge.
-        for (const [id, waiter] of waiters) waiter.settle({ status: "interrupted", reason: "bridge-disposed" });
-        waiters.clear();
+        // waiter so a blocked caller returns instead of hanging on a disposed bridge. Waiter functions are
+        // pure in-memory and are never recovered, so a disposed process reports `interrupted` rather than
+        // pretending a tool call survived it.
+        for (const [id, settle] of [...state.waiters]) {
+            state.waiters.delete(id);
+            settle({ status: "interrupted", reason: "bridge-disposed" });
+        }
         for (const wake of [...signalWaiters]) wake();
         signalWaiters.clear();
-        registry.clear();
-        signals.clear();
     }, "codex-bridge: drain waiters");
     ctx.logger.info("codex-bridge listening on %s and %s (%d bindings)", base, collabBase, bindings.length);
 }

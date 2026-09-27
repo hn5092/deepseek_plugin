@@ -14,16 +14,15 @@ import path from "node:path";
 import {
     deliverableSignals,
     normalizeSignal,
-    recoverSignals,
-    signalIsWakeworthy,
     signalVerdict,
     waitOutcome
 } from "../lib/signals.js";
-import { confirmSignal, inboxDirFor, publishSignal, readSignals, watchInbox } from "../lib/inbox.js";
+import { confirmSignal, inboxDirFor, publishSignal, readSignals } from "../lib/inbox.js";
 // Imported under a local name purely to ASSERT its absence: a directory-level prune with file-age-only
 // semantics would delete events a controller had not confirmed, so the module must not offer one.
 import * as inboxModule from "../lib/inbox.js";
 const pruneInbox = inboxModule.pruneInbox;
+const watchInbox = inboxModule.watchInbox;
 
 let passed = 0;
 const cases = [];
@@ -163,16 +162,10 @@ test("an unseen id is new", () => {
     assert.equal(signalVerdict(null, normalizeSignal(baseSignal).signal).action, "new");
 });
 
-// ---- wake policy: a finished turn is not a completed delivery -----------------------------
-test("a question or an abnormal stop always interrupts a wait", () => {
-    assert.equal(signalIsWakeworthy({ kind: "question" }, false), true);
-    assert.equal(signalIsWakeworthy({ kind: "error" }, false), true);
-});
-
-test("a delivery only interrupts when the business result is actually complete", () => {
-    assert.equal(signalIsWakeworthy({ kind: "delivery" }, false), false, "a finished turn is not a delivery");
-    assert.equal(signalIsWakeworthy({ kind: "delivery" }, true), true);
-});
+// The wake policy is no longer a helper here: a record's OUTSTANDING notification is what makes it
+// deliverable, and whether a delivery exists at all is decided by the producer (a plain finished turn
+// produces no record). That rule is proven at the real callers in `collab-native`, where a normal
+// `turn/end` is shown to create nothing and a native Goal completion is shown to create a delivery.
 
 // ---- selection: per controller, unacknowledged, oldest first -------------------------------
 test("signals are selected per controller so bindings cannot cross", () => {
@@ -198,35 +191,22 @@ test("a wait with backlog returns immediately and reports nothing new when there
     assert.equal(waitOutcome({ signals: [], controller: "codex" }).status, "empty");
 });
 
-// ---- restart recovery: the authoritative log is enough to rebuild the view ----------------
-test("a restart recovers unconfirmed events and their cursor from the log alone", () => {
-    const records = [
-        normalizeSignal({ ...baseSignal, id: "e1" }).signal,
-        normalizeSignal({ ...baseSignal, id: "e2" }).signal,
-        normalizeSignal({ ...baseSignal, id: "e3" }).signal
-    ].map((s, i) => ({ ...s, seq: i + 1 }));
-    const recovered = recoverSignals(records, ["e1"]);
-    assert.deepEqual(recovered.signals.map((s) => s.id), ["e2", "e3"], "confirmed events do not come back");
-    assert.equal(recovered.cursor, 3, "the cursor reflects the log, not a counter that restarted at zero");
-});
-
-test("a cursor from before a restart still finds newer events", () => {
-    // Before the restart the controller had seen up to seq 1. After recovery, seq 2 exists and must
-    // still be delivered — a restart must not make an old cursor filter out new work.
-    const records = [
-        { ...normalizeSignal({ ...baseSignal, id: "old" }).signal, seq: 1 },
-        { ...normalizeSignal({ ...baseSignal, id: "new" }).signal, seq: 2 }
+// Restart recovery no longer folds a signal log here: the record store IS the recovered state, and the
+// proof lives at the real caller in `collab-pending-restart` (a real pending question and its signal
+// rebuilt across a real restart) and `collab-projection` (reclamation does not lower the cursor). What
+// remains testable at this boundary is that a cursor still selects only genuinely newer events.
+test("a cursor selects only events newer than it", () => {
+    const signals = [
+        { id: "old", controller: "codex", seq: 1 },
+        { id: "new", controller: "codex", seq: 2 }
     ];
-    const recovered = recoverSignals(records, ["old"]);
-    const outcome = waitOutcome({ signals: recovered.signals, controller: "codex", since: 1 });
+    const outcome = waitOutcome({ signals, controller: "codex", since: 1 });
     assert.equal(outcome.status, "signals");
     assert.deepEqual(outcome.signals.map((s) => s.id), ["new"]);
 });
 
-test("recovery never invents an event the log does not contain", () => {
-    const recovered = recoverSignals([], ["anything"]);
-    assert.equal(recovered.signals.length, 0);
-    assert.equal(recovered.cursor, 0);
+test("a wait never invents an event that does not exist", () => {
+    assert.equal(waitOutcome({ signals: [], controller: "codex" }).status, "empty");
 });
 
 // ---- the file inbox ------------------------------------------------------------------------
@@ -289,27 +269,24 @@ test("confirmation removes exactly one event and is idempotent", () => {
     assert.deepEqual(readSignals(dir).signals.map((s) => s.id), ["keep"]);
 });
 
-test("watching delivers the backlog first, and re-reading the directory is the record", () => {
+test("re-reading the directory is the record, so a missed notification cannot lose an event", () => {
+    // The inbox is a PROJECTION and every read re-reads the actual directory, which is what makes a
+    // missed watcher notification harmless. There is deliberately no watcher to depend on: the previous
+    // revision exposed one, but nothing consumed it, and a watcher is only ever a prompt to re-read.
     const dir = inboxDirFor(inboxRoot, "watch").dir;
-    publishSignal(dir, normalizeSignal({ ...baseSignal, id: "before-watch" }).signal);
-    const seen = [];
-    const dispose = watchInbox(dir, (snapshot) => seen.push(snapshot.signals.map((s) => s.id)));
-    dispose();
-    assert.ok(seen.length >= 1, "the initial scan must run");
-    assert.deepEqual(seen[0], ["before-watch"], "an event predating the wait is returned immediately");
+    publishSignal(dir, normalizeSignal({ ...baseSignal, id: "before-read" }).signal);
+    const first = readSignals(dir).signals.map((s) => s.id);
+    assert.deepEqual(first, ["before-read"], "an event written before the read is returned by the read");
 });
 
-test("an event published between the scan and the watcher is caught by the re-scan", async () => {
+test("an event written after a read is seen by the NEXT read, so nothing is lost in between", () => {
     const dir = inboxDirFor(inboxRoot, "race").dir;
     fs.mkdirSync(dir, { recursive: true });
-    const seen = [];
-    const dispose = watchInbox(dir, (snapshot) => seen.push(snapshot.signals.map((s) => s.id)));
-    // Publish AFTER the watcher was established: only the post-observe re-scan can see it.
-    publishSignal(dir, normalizeSignal({ ...baseSignal, id: "raced" }).signal);
-    await new Promise((r) => setTimeout(r, 300));
-    dispose();
-    const flat = seen.flat();
-    assert.ok(flat.includes("raced"), `the raced event must be observed; saw ${JSON.stringify(seen)}`);
+    const before = readSignals(dir).signals.map((s) => s.id);
+    assert.deepEqual(before, [], "the directory starts empty");
+    publishSignal(dir, normalizeSignal({ ...baseSignal, id: "after-read" }).signal);
+    const after = readSignals(dir).signals.map((s) => s.id);
+    assert.ok(after.includes("after-read"), `the next read sees it; saw ${JSON.stringify(after)}`);
 });
 
 // Retention is owned by the store, not by the inbox directory (see `CollabStore.reclaim`), and it is
@@ -319,6 +296,12 @@ test("an event published between the scan and the watcher is caught by the re-sc
 // so this guards against it being reintroduced with file-age-only semantics.
 test("the inbox module exposes no directory-level prune that could drop unconfirmed events", () => {
     assert.equal(typeof pruneInbox, "undefined", "retention must be decided by the store that knows what is confirmed");
+});
+
+test("the inbox module exposes no watcher, because a read is the record", () => {
+    // A watcher would be a second, asynchronous way to learn about files, and nothing consumed it; every
+    // read re-reads the directory instead, so a missed notification cannot lose an event.
+    assert.equal(typeof watchInbox, "undefined", "reads reconcile the directory; a watcher would be a second truth");
 });
 
 // The inbox root is removed AFTER the cases have run, in the runner below: removing it here would only

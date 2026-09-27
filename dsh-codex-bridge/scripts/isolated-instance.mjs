@@ -61,9 +61,10 @@ async function freePort() {
  * @param {string} [options.home] - reuse an existing DSH home so a restart shares durable state.
  * @param {string|null} [options.storeRoot] - durable store root; defaults to the inbox root.
  * @param {string} [options.evidenceDir] - caller-owned directory to preserve a raw failure log into.
+ * @param {object} [options.extraConfig] - extra bridge config lines, so a suite can exercise invalid values.
  * @returns {Promise<object>} the instance handle.
  */
-export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = START_TIMEOUT_MS, scripted = null, inboxRoot = null, controllerTokens = [], home: reuseHome = undefined, storeRoot = null, evidenceDir = null }) {
+export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = START_TIMEOUT_MS, scripted = null, inboxRoot = null, controllerTokens = [], home: reuseHome = undefined, storeRoot = null, evidenceDir = null, extraConfig = null }) {
     const port = await freePort();
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "collab-instance-"));
     // A restart keeps the CALLER-provided home so durable sessions live across both processes, while the
@@ -122,6 +123,8 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
         `        answerTimeoutMs: ${answerTimeoutMs}`,
         ...(inboxRoot === null ? [] : [`        inboxRoot: ${JSON.stringify(inboxRoot.replace(/\\/g, "/"))}`]),
         ...(storeRoot === null ? [] : [`        storeRoot: ${JSON.stringify(String(storeRoot).replace(/\\/g, "/"))}`]),
+        // Extra config is emitted verbatim, so a suite can pass a value the bridge must refuse.
+        ...(extraConfig === null ? [] : Object.entries(extraConfig).map(([key, value]) => `        ${key}: ${JSON.stringify(value)}`)),
         "        bindings:",
         ...(bindingLines.length > 0 ? bindingLines : ["          []"]),
         ...scriptedLines,

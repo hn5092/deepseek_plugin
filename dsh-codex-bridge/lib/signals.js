@@ -107,23 +107,6 @@ export function signalVerdict(known, candidate) {
 }
 
 /**
- * Whether a signal is worth waking a controller for.
- *
- * A question and an abnormal stop always are. A delivery is only worth waking for when the caller has
- * said the business result is complete — a plain finished turn is NOT a completed delivery, and
- * treating it as one is exactly how "the turn ended" gets mistaken for "the work is done".
- *
- * @param {object} signal - a normalized signal.
- * @param {boolean} deliveryComplete - whether the caller declared the delivery complete.
- * @returns {boolean} whether the signal should interrupt a wait.
- */
-export function signalIsWakeworthy(signal, deliveryComplete) {
-    if (signal.kind === "question" || signal.kind === "error") return true;
-    if (signal.kind === "delivery") return deliveryComplete === true;
-    return false;
-}
-
-/**
  * Select the signals a controller should receive now.
  *
  * Unacknowledged signals for that controller are returned oldest-first. Selection is by CONTROLLER, so
@@ -168,31 +151,4 @@ export function waitOutcome(input) {
     // single global sequence number can never be advanced past events that were never delivered.
     const batch = unseen.slice(0, Number.isFinite(input.maxBatch) ? input.maxBatch : 50);
     return { status: "signals", signals: batch, cursor: batch[batch.length - 1].seq ?? null, more: unseen.length > batch.length };
-}
-
-/**
- * Recover the events a restart must not lose.
- *
- * A restart must not silently forget what a controller was owed. Confirmation is durable, so the
- * recovered set is "what the authoritative log says happened, minus what the log says was confirmed",
- * and its cursor is derived from the events themselves — never from a counter that starts at zero
- * again. A caller holding a cursor from before the restart therefore still receives anything newer,
- * and an event it had not confirmed arrives again rather than being assumed handled.
- *
- * @param {ReadonlyArray<object>} records - every recorded event, in log order.
- * @param {ReadonlyArray<string>} confirmed - ids the authoritative log records as confirmed.
- * @returns {{signals: ReadonlyArray<object>, cursor: number, highestSeq: number}} the recovered view.
- */
-export function recoverSignals(records, confirmed) {
-    const done = new Set(confirmed ?? []);
-    const signals = [];
-    let highestSeq = 0;
-    for (const record of records ?? []) {
-        if (record === null || typeof record !== "object") continue;
-        if (typeof record.seq === "number" && record.seq > highestSeq) highestSeq = record.seq;
-        if (done.has(record.id)) continue;
-        signals.push(record);
-    }
-    signals.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    return { signals, cursor: highestSeq, highestSeq };
 }

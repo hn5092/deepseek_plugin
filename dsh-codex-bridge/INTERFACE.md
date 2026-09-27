@@ -1,7 +1,46 @@
 # dsh-codex-bridge：DS↔Codex 双向协作桥
 
-状态：**隔离实例全部验收 GREEN（11 套 219/219，全部 EXIT=0）；未安装主实例、未重启、未推送。**
+状态：**隔离实例全部验收 GREEN（12 套 233/233，全部 EXIT=0）；未安装主实例、未重启、未推送。**
 作者源码：`D:\workspace\_tools\deepseek_plugin\dsh-codex-bridge\`（唯一）。
+
+## 零、状态模型（唯一合同）
+
+每个事件是**一条原子记录**（一个文件、temp+rename），**两条独立轴**：
+
+```
+id, seq, generation, bindingId, controller, sessionId, cwd,
+kind(question|delivery|error), sourceIdentity(goalId?/requestId?/sessionEventSeq?),
+createdAt, notification(outstanding|confirmed),
+business(question: pending|answered|cancelled|expired; notice: terminal),
+answer?, confirmedAt?, terminalAt?
+```
+
+- **`notification` 与 `business` 互不代表**：确认通知**不**结束工作；工作结束**不**等于已确认。
+  ⇒ 确认一个**尚未答复**的问题后，问题**仍可答复**（旧的三文件设计正是在此处删掉了问题本身）。
+- 内存只是该记录的**可重建缓存**；`waiters` 纯内存、**不恢复**（死掉的进程无法续跑工具调用，如实回报）。
+- **`ControllerMeta`**：`nextSeq`/`generation` **只增不减**；**先原子预留 seq 再写事件**（崩溃留空洞可接受）；
+  **回收不降低高水位**，故调用方 cursor 含义不变；**换代**使旧 generation 的身份明确 stale。
+- **不写入会话日志**：本 harness 拒绝读取含未知类型且未标 `ignorable` 的日志，而 `Session.append`
+  **无法设置该标记**，写自定义事件会让会话**永久不可读**（已实测复现）。
+
+四个状态边界**全部归 store**：
+1. **产生**：完整记录**原子持久成功**后再投影/唤醒；持久失败**不发布成功**。
+2. **答/取消/超时**：`pending → 终态` 的 **CAS**（首个终态胜出，晚者拒绝），再 settle 活 waiter；
+   **超时写 `expired`**、取消写 `cancelled`。
+3. **确认**：仅 `notification → confirmed`，重复**幂等**，**pending 问题保留**。
+4. **回收**：仅 `confirmed` **且**终态 **且**过 `maxAgeMs` **且**超出最近 `maxEvents` 窗口；
+   **pending/unconfirmed 永不因容量删除**；单条失败**只多留整条**（一记录=一文件，无部分孤儿）；
+   成功后内存缓存**从权威重建**。
+
+## 零之二、投影与有限保留的边界（如实声明）
+
+- **inbox 只是 outstanding 记录的投影**；`/signals`、`/signals/files`、`/wait-any` **共用同一 `state.project()`**：
+  记录有文件无→**补**；记录 confirmed/已回收→**不交付**；**文件有记录无→只报告 ghost，不交付**。
+- **有限保留与无限期任意 `requestId` 精确去重不可兼得。** 面向可靠问答/信号，不承诺无限历史：
+  服务端生成身份；记录在则**精确幂等**；**已回收 ID 返回 410 expired/retired**。HTTP `notify` 的任意
+  `requestId` **仅在保留窗口内去重**，超窗重试需原 `issuedAt`，否则拒绝为过期；**不用无限 tombstone 伪装有界**。
+- **保留参数为有限整数**：`maxAgeMs >= 0`；`maxEvents >= 1`。非法值使**插件拒绝激活**（宿主记录
+  `refusing to start` / `Validation error`，桥路由不存在），不静默接受。
 
 ## 一、它解决什么
 
@@ -71,7 +110,7 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 | 套件 | 结果 | 说明 |
 | --- | --- | --- |
 | `collab-rules` | 30/30 | 纯函数规则层：peer 身份反例 + **失效绑定在真正选择处被排除** |
-| `collab-signals` | 36/36 | 信号规则 + 文件收件箱（扫描/订阅竞态、清理断言） |
+| `collab-signals` | 34/34 | 规则层；不再导出按文件年龄的 prune 与无人消费的 watcher |
 | `collab-multi` | 31/31 | 真机：5 会话跨 5 目录 + 第二控制方；**匿/错/冒名一律拒绝** |
 | `collab-loop` | 29/29 | 真机：**真实 `ask_codex` → wait → 答 → 同一调用继续** |
 | `collab-restart` | 14/14 | 真停 host → 同 home 重启：确认不重现、补收、cursor、无重放 |
@@ -79,8 +118,9 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 | `collab-durability` | 20/20 | store 不可写则拒绝；**真实工具返回 `ok:false`**；**store 可写但 inbox 不可写**：问题保留、API 仍可取、**工具如实报 `deliveryWarning`** |
 | `collab-native` | 9/9 | 原生 Goal 完成 → delivery（带 Goal 身份）；普通 turn 结束无信号 |
 | `collab-handover` | 12/12 | **失效绑定排在最前仍不命中**：旧 owner 读/答 403 |
-| **`collab-five`** | **8/8** | **5 会话并发真 ask → `wait-any` 批收 → 逐问独立答复 → 各原调用恰好继续一次、只读到自己的答复** |
-| **`collab-projection`** | **14/14** | **投影修复**（文件被删后读回自动补建）、**确认过滤**（残留文件不复活已确认事件）、**有界回收**（已确认且过界才回收；**未确认永不因上限删除**） |
+| `collab-five` | 8/8 | **5 会话并发真 ask → `wait-any` 批收 → 逐问独立答复 → 各原调用恰好继续一次、只读到自己的答复** |
+| `collab-projection` | 17/17 | **投影修复**（文件被删后读回自动补建）、**ghost 不交付只上报**、**有界回收**（两轴：确认且终态且过双界才回收；**未确认/已确认但仍 pending 均永不因上限删除**）、**高水位不降** |
+| **`collab-retention`** | **13/13** | **保留参数非法则插件拒绝激活**；**真 ask → 只确认不答复 → 小窗口回收 → 问题仍可答、原工具调用恰好继续一次** |
 
 另需 `scripts/isolated-instance.mjs`（可丢弃或 caller-owned home + `--patch` overlay，**真 SIGTERM → 等退出 →
 有界 SIGKILL → 复核**的 stop，**回收本次自有孙进程**，失败日志复制到 caller 指定的证据目录，并导出
@@ -92,6 +132,7 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 - **未安装/未启用**：主实例仍跑旧的单向版本，需 root 审核后由外部控制方安装并重启。
 - **Codex 侧未验证**：若 Codex 回合已结束或 App 已关闭，**写文件不会自动唤醒它**；本能力
   **不保证**、也**不造计划任务**。
-- 文件收件箱需要配置 `inboxRoot`（本机运行路径，不入库）。
+- `inboxRoot`/`storeRoot` 需配置（本机运行路径，不入库）。
 - 多控制方**独立**：不形成任何全局总控；解绑/取消只影响指定绑定。
-- 未做：跨进程（多实例）共享同一 inbox 的并发压测；Codex 真实端到端联调（本轮只做隔离实例）。
+- **有限保留**：已回收事件的迟到重试会被判 `expired/retired`（410），**不承诺无限历史**。
+- 未做：跨进程（多实例）共享同一 store 的并发压测；Codex 真实端到端联调（本轮只做隔离实例）。

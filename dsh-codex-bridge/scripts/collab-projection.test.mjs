@@ -20,7 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
-import { CollabStore } from "../lib/store.js";
+import { CollabStore, NOTIFICATION, NOTICE_STATE, QUESTION_STATE, isTerminalBusiness } from "../lib/store.js";
 import { inboxDirFor, publishSignal, readSignals } from "../lib/inbox.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -36,25 +36,56 @@ function record(name, ok, detail) {
     console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  ${detail}` : ""}`);
 }
 
-// ---- 3) retention: the store's own bounds -------------------------------------------------
+// ---- 3) retention: the store's own bounds, on the two axes --------------------------------
 {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "collab-reclaim-"));
-    const store = new CollabStore(root);
+    // The whole block is wrapped so the scratch directory is removed even when an assertion throws:
+    // a failing suite must not be the reason a directory is left behind.
+    try {
+        const store = new CollabStore(root);
     const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    for (let i = 0; i < 3; i += 1) store.putSignal({ id: `unconfirmed-${i}`, controller: "codex", bindingId: "codex::r", reference: `collab-question:q${i}`, kind: "question", at: old });
-    for (let i = 0; i < 3; i += 1) {
-        store.putSignal({ id: `confirmed-${i}`, controller: "codex", bindingId: "codex::r", reference: `collab-notify:x:${i}`, kind: "delivery", at: old });
-        store.putConfirmation("codex", `confirmed-${i}`, {});
-    }
+    const put = (id, kind, business, notification) => {
+        const reservation = store.reserveSeq();
+        store.putRecord({
+            id, seq: reservation.seq, generation: reservation.generation,
+            bindingId: "codex::r", controller: "codex", sessionId: "s", cwd: "D:/p",
+            kind, sourceIdentity: {}, reference: `collab:${id}`,
+            createdAt: old, ...(isTerminalBusiness({ kind, business }) ? { terminalAt: old } : {}),
+            notification, business
+        });
+    };
+    // The four combinations that matter. Only the last is reclaimable.
+    put("pending-unc", "question", QUESTION_STATE.PENDING, NOTIFICATION.OUTSTANDING);
+    // A CONFIRMED notification whose question is still PENDING: the notification has been dealt with,
+    // the question has not been answered, so it must survive.
+    put("pending-conf", "question", QUESTION_STATE.PENDING, NOTIFICATION.CONFIRMED);
+    // A terminal question whose notification was never confirmed: still owed, so it must survive.
+    put("answered-unc", "question", QUESTION_STATE.ANSWERED, NOTIFICATION.OUTSTANDING);
+    for (let i = 0; i < 3; i += 1) put(`terminal-conf-${i}`, "delivery", NOTICE_STATE.TERMINAL, NOTIFICATION.CONFIRMED);
+
+    const before = store.readMeta().meta.nextSeq;
     const reclaimed = store.reclaim({ maxAgeMs: 60_000, maxEvents: 1 });
-    const remaining = store.allSignals().signals.map((s) => s.id);
-    record("an unconfirmed event is NEVER removed to satisfy a capacity bound",
-        [0, 1, 2].every((i) => remaining.includes(`unconfirmed-${i}`)),
+    const remaining = store.allRecords().records.map((r) => r.id);
+    record("an UNCONFIRMED record is never removed to satisfy a capacity bound",
+        remaining.includes("pending-unc") && remaining.includes("answered-unc"),
         `remaining=${JSON.stringify(remaining.sort())}`);
-    record("a confirmed event past both bounds is reclaimed", reclaimed.removed.length > 0, `removed=${JSON.stringify(reclaimed.removed.sort())}`);
-    record("the newest confirmed event is retained regardless of age", remaining.includes("confirmed-0"), `remaining=${JSON.stringify(remaining.sort())}`);
+    record("a CONFIRMED but still-PENDING question is never removed (the two axes are independent)",
+        remaining.includes("pending-conf"),
+        `remaining=${JSON.stringify(remaining.sort())}`);
+    record("a confirmed AND terminal record past both bounds is reclaimed", reclaimed.removed.length > 0, `removed=${JSON.stringify(reclaimed.removed.sort())}`);
+    record("the newest confirmed terminal record is retained regardless of age", remaining.includes("terminal-conf-0"), `remaining=${JSON.stringify(remaining.sort())}`);
     record("reclamation reports what it removed instead of being silent", Array.isArray(reclaimed.removed), `removed=${reclaimed.removed.length} retained=${reclaimed.retained}`);
-    fs.rmSync(root, { recursive: true, force: true });
+    record("reclamation does not lower the sequence high-water mark", store.readMeta().meta.nextSeq >= before, `before=${before} after=${store.readMeta().meta.nextSeq}`);
+    // Reserving a sequence advances the meta BEFORE the record is written, so a crash between the two
+    // leaves a gap instead of letting two records share a number. A fresh reservation must therefore
+    // always move the mark forward by exactly one.
+        const reservation = store.reserveSeq();
+        record("a new reservation advances the high-water mark and never reuses a number",
+            reservation.ok && reservation.seq === before && store.readMeta().meta.nextSeq === before + 1,
+            `reserved=${reservation.seq} nextSeq=${store.readMeta().meta.nextSeq}`);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 }
 
 // ---- 1) and 2) on a live instance ---------------------------------------------------------

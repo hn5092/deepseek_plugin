@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
+import { CollabStore, NOTIFICATION, QUESTION_STATE } from "../lib/store.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -139,14 +140,19 @@ try {
 
         // Answering the same question twice: the second is idempotent, and a DIFFERENT answer conflicts,
         // so one question has exactly one terminal answer no matter how many times it is delivered.
-        const questionId = "collab-race-1";
-        const stored = path.join(healthyStore, "questions", "d-codex_003a_003adur", `${questionId}.json`);
-        fs.mkdirSync(path.dirname(stored), { recursive: true });
-        fs.writeFileSync(stored, JSON.stringify({
-            id: questionId, seq: 1, question: "race me", bindingId: "codex::dur",
-            controller: "codex", sessionId, cwd: projDir, askedAt: new Date().toISOString()
-        }), "utf8");
-        // The question must be visible to the plugin, so it is discovered through recovery.
+        // The question is created through the STORE's own API (the same one the tool uses), not by
+        // hand-writing a file, so this exercises the real record shape rather than a guess at it.
+        const seed = new CollabStore(healthyStore);
+        const raceRecord = {
+            id: "collab-race-1", seq: seed.reserveSeq().seq, generation: 1,
+            bindingId: "codex::dur", controller: "codex", sessionId, cwd: projDir,
+            kind: "question", sourceIdentity: {}, reference: "collab-question",
+            createdAt: new Date().toISOString(),
+            notification: NOTIFICATION.OUTSTANDING, business: QUESTION_STATE.PENDING, question: "race me"
+        };
+        seed.putRecord(raceRecord);
+        const questionId = raceRecord.id;
+        // The question must become visible to the plugin, so it is discovered through recovery.
         await callOn(healthy, "/questions?sessionId=" + sessionId + "&controller=codex");
 
         const [answerA, answerB] = await Promise.all([
@@ -163,14 +169,17 @@ try {
         const recordedAnswer = (after.body.questions ?? []).map((q) => q.state && q.state.answer).filter(Boolean)[0];
         record("the recorded answer matches the accepted outcome", recordedAnswer === undefined || ["first", "second"].includes(recordedAnswer.text), `recorded=${recordedAnswer ? recordedAnswer.text : "none"}`);
 
-        // A late answer to a cancelled question is refused: cancellation is a terminal state.
-        const cancelId = "collab-race-cancel";
-        fs.writeFileSync(path.join(path.dirname(stored), `${cancelId}.json`), JSON.stringify({
-            id: cancelId, seq: 2, question: "cancel me", bindingId: "codex::dur", controller: "codex",
-            sessionId, cwd: projDir, askedAt: new Date().toISOString(),
-            cancel: { id: cancelId, reason: "caller-cancelled", at: new Date().toISOString() }
-        }), "utf8");
-        const late = await callOn(healthy, "/answer", { method: "POST", body: JSON.stringify({ questionId: cancelId, text: "too late", source: "codex", controller: "codex" }) });
+        // A late answer to a cancelled question is refused: cancellation is a terminal business state.
+        const cancelRecord = {
+            id: "collab-race-cancel", seq: seed.reserveSeq().seq, generation: 1,
+            bindingId: "codex::dur", controller: "codex", sessionId, cwd: projDir,
+            kind: "question", sourceIdentity: {}, reference: "collab-question",
+            createdAt: new Date().toISOString(),
+            notification: NOTIFICATION.OUTSTANDING, business: QUESTION_STATE.CANCELLED,
+            terminalAt: new Date().toISOString(), question: "cancel me"
+        };
+        seed.putRecord(cancelRecord);
+        const late = await callOn(healthy, "/answer", { method: "POST", body: JSON.stringify({ questionId: cancelRecord.id, text: "too late", source: "codex", controller: "codex" }) });
         record("an answer to a cancelled question is refused", late.status === 409, `status=${late.status}`);
     } finally {
         const outcome = await healthy.stop();

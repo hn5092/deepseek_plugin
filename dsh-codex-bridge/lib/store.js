@@ -1,29 +1,33 @@
 /**
- * The bridge's own durable store.
+ * The bridge's own durable state: ONE atomic record per event.
  *
- * Why this exists instead of the Session log. This harness refuses to READ a session log containing an
- * event type it does not know unless the event envelope carries `ignorable: true`, and `Session.append`
- * exposes no way to set that marker (it accepts only `sourceEventSeqs` and `surfaceOp`). Out-of-repo
- * plugin event names are outside the generated known-type set by construction, so writing a custom event
- * makes that session log uninterpretable — `session/list` and `session/query` then fail permanently.
- * That was reproduced on a real stop/restart, not theorised. The session log therefore CANNOT hold this
- * plugin's records, and this store is the single authoritative place they live.
+ * Why not the Session log. This harness refuses to READ a session log containing an event type outside
+ * its generated known set unless the envelope carries `ignorable: true`, and `Session.append` accepts
+ * only `sourceEventSeqs` and `surfaceOp` — there is no way for an out-of-repo writer to set that marker.
+ * Writing a custom event therefore made the session permanently uninterpretable, reproduced on a real
+ * stop/restart. This store is where the plugin's own records live instead.
  *
- * Design rules that keep it from becoming a second writable truth:
+ * Why ONE record and not three files. An earlier revision kept signals, questions and confirmations in
+ * three separate directories. That made the same event three independent writable facts, and every
+ * combination of them had to be reasoned about separately:
  *
- *  - ONE store owns each fact. A signal, a question, and a confirmation are each written here once and
- *    read back from here; nothing is mirrored into the session log and nothing is re-derived elsewhere.
- *  - Every record is one file, written to a temporary name and atomically renamed, so a reader never
- *    sees a partial record and two writers cannot interleave inside one name.
- *  - Writes are keyed by stable identity, so re-recording the same fact is idempotent and never creates
- *    a duplicate.
- *  - Secrets never go in: records carry identity and references only.
+ *  - confirming the NOTIFICATION deleted the QUESTION file, so a still-pending question could be
+ *    destroyed by an act that says nothing about whether the question was answered;
+ *  - reclaim removed the three files one after another, so a failure in the middle left a partial,
+ *    permanently orphaned record;
+ *  - memory and disk could disagree, so a deleted record could be written back from a stale cache.
  *
- * Layout, all beneath one configured root:
+ * One record removes the class of problem rather than each instance of it: a single file is written by
+ * `temp + rename`, so it is complete or absent, and there is no partial state to reconcile. The two axes
+ * that were being conflated are now explicit and independent fields:
  *
- *   signals/<controller>/<signalId>.json          one event, unconfirmed
- *   confirmations/<controller>/<signalId>.json    the separate act of confirming that event
- *   questions/<bindingId>/<questionId>.json       one question's state machine
+ *  - `notification`: outstanding | confirmed — whether the CONTROLLER has dealt with being told;
+ *  - `business`: for a question pending | answered | cancelled | expired; for a notice, terminal.
+ *
+ * Confirming a notification leaves a pending question answerable, which is the whole point.
+ *
+ * Records are addressed only by identities this store or the server issued (id/seq/generation), so a
+ * lookup is a pure function of the id and two ids can never share a file.
  *
  * @module dsh-codex-bridge/store
  */
@@ -34,18 +38,30 @@ import { randomUUID } from "node:crypto";
 /** Only these characters may appear in a path segment, so no id can escape the store root. */
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
+/** The notification axis: whether the controller has confirmed being told. */
+export const NOTIFICATION = Object.freeze({ OUTSTANDING: "outstanding", CONFIRMED: "confirmed" });
+
+/** The business axis for a question. */
+export const QUESTION_STATE = Object.freeze({ PENDING: "pending", ANSWERED: "answered", CANCELLED: "cancelled", EXPIRED: "expired" });
+
+/** The business axis for a notice. A notice has no follow-up state. */
+export const NOTICE_STATE = Object.freeze({ TERMINAL: "terminal" });
+
+/** Whether a business state is final for its kind. */
+export function isTerminalBusiness(record) {
+    if (record === null || typeof record !== "object") return false;
+    if (record.kind === "question") return [QUESTION_STATE.ANSWERED, QUESTION_STATE.CANCELLED, QUESTION_STATE.EXPIRED].includes(record.business);
+    return record.business === NOTICE_STATE.TERMINAL;
+}
+
 /**
  * Turn a record id into a filename-safe name.
  *
  * Ids legitimately contain characters that are legal inside a path segment but NOT inside a filename on
  * Windows: a binding id such as `codex::a` contains `:`, which the filesystem reads as an
- * alternate-data-stream separator, so writing `<id>.json` fails with a misleading `ENOENT`. The mapping
- * is deterministic and INJECTIVE — `_` is escaped as `__`, and every other unsafe character as `_` plus
- * its 4-digit hex code point — so two different ids can never share a file, and a lookup stays a pure
- * function of the id. The id inside the record is unchanged.
- *
- * Exported so every surface that names a file after an id (the store, and the notification inbox) uses
- * ONE mapping instead of each inventing its own.
+ * alternate-data-stream separator, so naming a file after it fails with a misleading `ENOENT`. The
+ * mapping is deterministic and INJECTIVE — `_` becomes `__`, and every other unsafe character becomes
+ * `_` plus its 4-digit hex code point — so two different ids can never share a file.
  *
  * @param {string} id - the record id.
  * @returns {string} a name that is legal on every supported platform.
@@ -57,58 +73,15 @@ export function safeFileName(id) {
         else if (char === "_") out += "__";
         else out += `_${char.codePointAt(0).toString(16).padStart(4, "0")}`;
     }
-    // A reserved DOS device name or an empty name would still be unwise as a bare filename.
     return out.length === 0 || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(out) ? `_${out}` : out;
 }
 
-/** The internal alias, kept so call sites read as "the file name for this id". */
-const fileNameOf = safeFileName;
-
-/**
- * Resolve a path beneath the root, refusing anything that could escape it.
- *
- * Ids come from configuration and from generated identities, never from a caller's raw string, but this
- * check is the belt to that pair of braces: a segment that is not plainly safe is refused rather than
- * joined, so a malformed id cannot write outside the store.
- *
- * @param {string} root - the store root.
- * @param {...string} segments - path segments to join.
- * @returns {{ok: true, file: string} | {ok: false, reason: string}} the resolved path.
- */
+/** Resolve a path beneath the root, refusing anything that could escape it. */
 function resolveInside(root, ...segments) {
     if (typeof root !== "string" || root.length === 0) return { ok: false, reason: "no-store-root" };
     for (const segment of segments) {
         if (typeof segment !== "string" || !SAFE_SEGMENT.test(segment)) {
             return { ok: false, reason: `unsafe store segment ${JSON.stringify(segment)}` };
-        }
-    }
-    // The FIRST segment is this module's own fixed domain name ("signals"/"questions"/etc.) and is left
-    // as written; every later segment except the last is an ID used as a DIRECTORY, which has the same
-    // platform limits as a file name (`codex::1` cannot be a directory on Windows either).
-    const encoded = segments.map((segment, index) => (index === 0 || index === segments.length - 1 ? segment : `d-${fileNameOf(segment)}`));
-    const file = path.join(root, ...encoded);
-    const relative = path.relative(root, file);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) return { ok: false, reason: "store path escapes its root" };
-    return { ok: true, file };
-}
-
-/**
- * Join already-readable directory names beneath the root, refusing anything that escapes it.
- *
- * Used when enumerating what is on disk: the names come from `readdir`, so they are already the encoded
- * form and must not be encoded again. The containment check still applies, so a symlink or a crafted
- * entry cannot lead outside the store.
- *
- * @param {string} root - the store root.
- * @param {...string} segments - already-safe directory names.
- * @returns {{ok: true, file: string} | {ok: false, reason: string}} the resolved path.
- */
-function joinRaw(root, ...segments) {
-    if (typeof root !== "string" || root.length === 0) return { ok: false, reason: "no-store-root" };
-    for (const segment of segments) {
-        // A name straight from readdir cannot contain a separator or a parent reference.
-        if (typeof segment !== "string" || segment.length === 0 || segment.includes("/") || segment.includes("\\") || segment === "." || segment === "..") {
-            return { ok: false, reason: `unsafe listed segment ${JSON.stringify(segment)}` };
         }
     }
     const file = path.join(root, ...segments);
@@ -117,18 +90,8 @@ function joinRaw(root, ...segments) {
     return { ok: true, file };
 }
 
-/**
- * Write one JSON record atomically.
- *
- * Written to a temporary name in the SAME directory and then renamed, so a concurrent reader sees either
- * the previous complete record or the new one, never a half-written file. Re-writing the same identity
- * replaces the record in place, which is what makes a retry idempotent instead of duplicative.
- *
- * @param {string} file - destination path.
- * @param {unknown} value - the record.
- * @returns {{ok: true} | {ok: false, reason: string}} the outcome.
- */
-export function writeRecord(file, value) {
+/** Write one JSON file atomically: a temp name in the same directory, then rename. */
+function writeJsonAtomic(file, value) {
     const text = JSON.stringify(value);
     const temp = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`);
     try {
@@ -142,13 +105,8 @@ export function writeRecord(file, value) {
     }
 }
 
-/**
- * Read one JSON record.
- *
- * @param {string} file - the record path.
- * @returns {{ok: true, value: unknown} | {ok: false, reason: string}} the record, or why it is unavailable.
- */
-export function readRecord(file) {
+/** Read one JSON file. */
+function readJson(file) {
     try {
         return { ok: true, value: JSON.parse(fs.readFileSync(file, "utf8")) };
     } catch (error) {
@@ -156,27 +114,14 @@ export function readRecord(file) {
     }
 }
 
-/** Read every record in a directory, reporting unreadable files instead of skipping them silently. */
-export function readRecords(dir) {
-    const records = [];
-    const problems = [];
-    let names;
-    try {
-        names = fs.readdirSync(dir);
-    } catch {
-        return { records, problems };
-    }
-    for (const name of names) {
-        if (!name.endsWith(".json")) continue;
-        const file = path.join(dir, name);
-        const read = readRecord(file);
-        if (read.ok) records.push(read.value);
-        else problems.push({ file, reason: read.reason });
-    }
-    return { records, problems };
-}
-
-/** The bridge's durable store: the single place its records live. */
+/**
+ * The bridge's durable event store: one record per event, plus a monotonic controller meta.
+ *
+ * `ControllerMeta` holds `nextSeq` and `generation`. A sequence is RESERVED before an event is written,
+ * so a crash leaves a gap in the sequence rather than two events sharing one, and reclaiming records
+ * can never lower the high-water mark — which is what keeps a caller's cursor meaningful across
+ * reclamation and restart.
+ */
 export class CollabStore {
     /**
      * @param {string} root - store root, from configuration.
@@ -186,195 +131,251 @@ export class CollabStore {
         this.available = this.root.length > 0;
     }
 
-    /** Record one signal, keyed by its stable id. */
-    putSignal(signal) {
-        if (!this.available) return { ok: false, reason: "store-not-configured" };
-        const target = resolveInside(this.root, "signals", signal.controller, `${fileNameOf(signal.id)}.json`);
-        if (!target.ok) return target;
-        return writeRecord(target.file, signal);
+    /** @returns {{ok: true, file: string} | {ok: false, reason: string}} the events directory. */
+    eventsDir() {
+        return resolveInside(this.root, "events");
+    }
+
+    /** @returns {{ok: true, file: string} | {ok: false, reason: string}} the meta file. */
+    metaFile() {
+        return resolveInside(this.root, "controller-meta.json");
     }
 
     /**
-     * Every recorded signal, across all controllers, plus any unreadable files.
+     * Read the controller meta, defaulting to the beginning of history.
      *
-     * Directory names are encoded, so the records — not the directory names — are the source of each
-     * signal's identity. Walking every directory keeps a binding or controller whose encoded name does
-     * not round-trip from losing its events.
+     * A missing meta is a fresh store; a CORRUPT meta is reported rather than silently reset, because
+     * resetting the sequence would let a new event reuse a number an old cursor had already passed.
+     *
+     * @returns {{ok: true, meta: object} | {ok: false, reason: string}} the meta.
      */
-    allSignals() {
-        if (!this.available) return { signals: [], problems: [] };
-        const signals = [];
-        const problems = [];
-        let directories;
-        try {
-            directories = fs.readdirSync(path.join(this.root, "signals"), { withFileTypes: true });
-        } catch {
-            return { signals, problems };
-        }
-        for (const entry of directories) {
-            if (!entry.isDirectory()) continue;
-            const dir = joinRaw(this.root, "signals", entry.name);
-            if (!dir.ok) continue;
-            const read = readRecords(dir.file);
-            signals.push(...read.records);
-            problems.push(...read.problems);
-        }
-        return { signals, problems };
-    }
-
-    /** Record the separate act of confirming one event. */
-    putConfirmation(controller, signalId, detail) {
+    readMeta() {
         if (!this.available) return { ok: false, reason: "store-not-configured" };
-        const target = resolveInside(this.root, "confirmations", controller, `${fileNameOf(signalId)}.json`);
+        const target = this.metaFile();
         if (!target.ok) return target;
-        return writeRecord(target.file, { signalId, controller, ...detail });
-    }
-
-    /** Whether one event has been confirmed. */
-    isConfirmed(controller, signalId) {
-        if (!this.available) return false;
-        const target = resolveInside(this.root, "confirmations", controller, `${fileNameOf(signalId)}.json`);
-        return target.ok && fs.existsSync(target.file);
-    }
-
-    /** Every confirmation for one controller. */
-    confirmationsFor(controller) {
-        if (!this.available) return { confirmed: new Set(), problems: [] };
-        // The controller is an ID used as a DIRECTORY, so it must be resolved with a trailing file
-        // segment; resolving it as a leaf would name a file, not the directory to enumerate.
-        const dir = resolveInside(this.root, "confirmations", controller, "probe.json");
-        if (!dir.ok) return { confirmed: new Set(), problems: [] };
-        const read = readRecords(path.dirname(dir.file));
-        return { confirmed: new Set(read.records.map((record) => record.signalId).filter((id) => typeof id === "string")), problems: read.problems };
-    }
-
-    /** Record one question's current state. */
-    putQuestion(bindingId, question) {
-        if (!this.available) return { ok: false, reason: "store-not-configured" };
-        const target = resolveInside(this.root, "questions", bindingId, `${fileNameOf(question.id)}.json`);
-        if (!target.ok) return target;
-        return writeRecord(target.file, question);
-    }
-
-    /** One question's record, or why it is unavailable. */
-    getQuestion(bindingId, questionId) {
-        if (!this.available) return { ok: false, reason: "store-not-configured" };
-        const target = resolveInside(this.root, "questions", bindingId, `${fileNameOf(questionId)}.json`);
-        if (!target.ok) return target;
-        return readRecord(target.file);
-    }
-
-    /** Every question, across all bindings, plus any unreadable files. */
-    allQuestions() {
-        if (!this.available) return { questions: [], problems: [] };
-        const questions = [];
-        const problems = [];
-        let directories;
-        try {
-            directories = fs.readdirSync(path.join(this.root, "questions"), { withFileTypes: true });
-        } catch {
-            return { questions, problems };
+        if (!fs.existsSync(target.file)) return { ok: true, meta: { nextSeq: 1, generation: 1 } };
+        const read = readJson(target.file);
+        if (!read.ok) return { ok: false, reason: `controller meta is unreadable: ${read.reason}` };
+        const value = read.value;
+        if (value === null || typeof value !== "object" || !Number.isSafeInteger(value.nextSeq) || value.nextSeq < 1 || !Number.isSafeInteger(value.generation) || value.generation < 1) {
+            return { ok: false, reason: "controller meta is malformed" };
         }
-        for (const entry of directories) {
-            if (!entry.isDirectory()) continue;
-            const dir = joinRaw(this.root, "questions", entry.name);
-            if (!dir.ok) continue;
-            const read = readRecords(dir.file);
-            questions.push(...read.records);
-            problems.push(...read.problems);
-        }
-        return { questions, problems };
+        return { ok: true, meta: { nextSeq: value.nextSeq, generation: value.generation } };
     }
 
     /**
-     * Reclaim storage for records that are finished, within a configured bound.
+     * Reserve the next sequence and write the meta back, BEFORE the event that will use it.
      *
-     * Retention is deliberately narrow, because deleting the wrong thing loses a fact a controller was
-     * owed:
+     * Reserving first is what makes a crash safe: an unused reserved number is a harmless gap, whereas
+     * writing the event first and then discovering the sequence was stale would give two events one
+     * identity. The high-water mark only ever increases.
      *
-     *  - only a signal that the store ALSO records as confirmed is a candidate. An unconfirmed event is
-     *    never removed, no matter how old it is or how far over the cap it pushes the store: the caller
-     *    has not dealt with it yet, so it is still owed, and erasing it to satisfy a limit would silently
-     *    drop a message — exactly what retention must not do;
-     *  - among confirmed events, one is reclaimed only when it is BOTH older than `maxAgeMs` AND beyond
-     *    the newest `maxEvents`, so a burst of recent confirmations is never discarded to satisfy the cap;
-     *  - the matching question record is reclaimed with it, since an answered or cancelled question is
-     *    terminal and no longer needs to be re-read.
+     * @returns {{ok: true, seq: number, generation: number} | {ok: false, reason: string}} the reservation.
+     */
+    reserveSeq() {
+        if (!this.available) return { ok: false, reason: "store-not-configured" };
+        const current = this.readMeta();
+        if (!current.ok) return { ok: false, reason: current.reason };
+        const target = this.metaFile();
+        if (!target.ok) return target;
+        const seq = current.meta.nextSeq;
+        const written = writeJsonAtomic(target.file, { nextSeq: seq + 1, generation: current.meta.generation });
+        if (!written.ok) return { ok: false, reason: `could not reserve a sequence: ${written.reason}` };
+        return { ok: true, seq, generation: current.meta.generation };
+    }
+
+    /**
+     * Advance the generation, invalidating every identity issued before it.
      *
-     * What is removed is REPORTED, and what could not be removed is reported too, so a full store cannot
-     * look like a tidy one. Confirmed-but-retained events keep working for idempotency: an event that is
-     * still on disk is still recognized as already confirmed.
+     * A handover must not let an answer or retry meant for the previous owner act on the new one, so an
+     * identity carries the generation it was issued under and a stale one is refused by comparison
+     * instead of being silently accepted.
      *
-     * @param {object} options - retention bounds.
-     * @param {number} options.maxAgeMs - minimum age before a CONFIRMED event may be reclaimed.
-     * @param {number} options.maxEvents - how many confirmed events are always retained, newest first.
-     * @returns {{removed: ReadonlyArray<string>, failed: ReadonlyArray<string>, retained: number, unconfirmed: number}} the outcome.
+     * @returns {{ok: true, generation: number} | {ok: false, reason: string}} the new generation.
+     */
+    advanceGeneration() {
+        if (!this.available) return { ok: false, reason: "store-not-configured" };
+        const current = this.readMeta();
+        if (!current.ok) return { ok: false, reason: current.reason };
+        const target = this.metaFile();
+        if (!target.ok) return target;
+        const generation = current.meta.generation + 1;
+        const written = writeJsonAtomic(target.file, { nextSeq: current.meta.nextSeq, generation });
+        if (!written.ok) return { ok: false, reason: written.reason };
+        return { ok: true, generation };
+    }
+
+    /** @returns {{ok: true, file: string} | {ok: false, reason: string}} one record's path. */
+    recordFile(id) {
+        return resolveInside(this.root, "events", `${safeFileName(id)}.json`);
+    }
+
+    /**
+     * Write one record atomically.
+     *
+     * The whole record is one file, so there is no partial state: either the event exists with all of
+     * its fields, or it does not exist at all.
+     *
+     * @param {object} record - the complete record.
+     * @returns {{ok: true} | {ok: false, reason: string}} the outcome.
+     */
+    putRecord(record) {
+        if (!this.available) return { ok: false, reason: "store-not-configured" };
+        if (record === null || typeof record !== "object" || typeof record.id !== "string" || record.id.length === 0) {
+            return { ok: false, reason: "a record requires an id" };
+        }
+        const target = this.recordFile(record.id);
+        if (!target.ok) return target;
+        return writeJsonAtomic(target.file, record);
+    }
+
+    /** @param {string} id - the record id. @returns {{ok: true, value: object} | {ok: false, reason: string}} */
+    getRecord(id) {
+        if (!this.available) return { ok: false, reason: "store-not-configured" };
+        const target = this.recordFile(id);
+        if (!target.ok) return target;
+        if (!fs.existsSync(target.file)) return { ok: false, reason: "not-found" };
+        return readJson(target.file);
+    }
+
+    /** Every record, plus any unreadable files. */
+    allRecords() {
+        if (!this.available) return { records: [], problems: [] };
+        const dir = this.eventsDir();
+        if (!dir.ok) return { records: [], problems: [{ file: this.root, reason: dir.reason }] };
+        const records = [];
+        const problems = [];
+        let names;
+        try {
+            names = fs.readdirSync(dir.file);
+        } catch {
+            return { records, problems };
+        }
+        for (const name of names) {
+            if (!name.endsWith(".json")) continue;
+            const read = readJson(path.join(dir.file, name));
+            if (read.ok && read.value !== null && typeof read.value === "object" && typeof read.value.id === "string") records.push(read.value);
+            else problems.push({ file: path.join(dir.file, name), reason: read.ok ? "not a record" : read.reason });
+        }
+        return { records, problems };
+    }
+
+    /**
+     * Confirm one event's NOTIFICATION.
+     *
+     * This is a compare-and-set on the notification axis alone: it says the controller has dealt with
+     * being told, and deliberately says nothing about the business state. A pending question stays
+     * answerable after its notification is confirmed, which is exactly the distinction an earlier
+     * three-file design lost.
+     *
+     * @param {string} id - the record id.
+     * @param {string} [confirmedAt] - when.
+     * @returns {{ok: true, record: object, changed: boolean} | {ok: false, reason: string}} the outcome.
+     */
+    confirmNotification(id, confirmedAt = new Date().toISOString()) {
+        const current = this.getRecord(id);
+        if (!current.ok) return current;
+        if (current.value.notification === NOTIFICATION.CONFIRMED) {
+            return { ok: true, record: current.value, changed: false };
+        }
+        const next = { ...current.value, notification: NOTIFICATION.CONFIRMED, confirmedAt };
+        const written = this.putRecord(next);
+        if (!written.ok) return written;
+        return { ok: true, record: next, changed: true };
+    }
+
+    /**
+     * Move one question's BUSINESS state to a terminal value, if it is still pending.
+     *
+     * A compare-and-set rather than an overwrite, so the first terminal outcome wins and a second one is
+     * reported as already decided instead of replacing it. `answer` is only recorded on the transition.
+     *
+     * @param {string} id - the record id.
+     * @param {object} outcome - `{business, answer?, terminalAt?}`.
+     * @returns {{ok: true, record: object, changed: boolean} | {ok: false, reason: string}} the outcome.
+     */
+    setBusinessOutcome(id, outcome) {
+        const current = this.getRecord(id);
+        if (!current.ok) return current;
+        const record = current.value;
+        if (isTerminalBusiness(record)) {
+            return { ok: true, record, changed: false };
+        }
+        const next = {
+            ...record,
+            business: outcome.business,
+            terminalAt: outcome.terminalAt ?? new Date().toISOString(),
+            ...(outcome.answer === undefined ? {} : { answer: outcome.answer })
+        };
+        const written = this.putRecord(next);
+        if (!written.ok) return written;
+        return { ok: true, record: next, changed: true };
+    }
+
+    /**
+     * Remove records that are finished, within configured bounds.
+     *
+     * A record is reclaimable only when the notification is confirmed AND the business state is terminal
+     * AND it is older than `maxAgeMs` AND it is outside the newest `maxEvents`. Anything still pending or
+     * unconfirmed is NEVER removed, however old or however far over the bound the store has grown,
+     * because such a record is still owed to someone: erasing it to satisfy a limit would silently drop
+     * work. A record that cannot be removed is reported and REMAINS — since one record is one file, a
+     * failed removal leaves that record whole rather than half of it.
+     *
+     * Reclaiming does not lower the sequence high-water mark, which lives in the meta file, so a caller's
+     * cursor keeps meaning what it meant.
+     *
+     * @param {object} bounds - `{maxAgeMs, maxEvents}`.
+     * @returns {{removed: ReadonlyArray<string>, failed: ReadonlyArray<object>, retained: number, pending: number, unconfirmed: number}} the outcome.
      */
     reclaim({ maxAgeMs, maxEvents }) {
-        if (!this.available) return { removed: [], failed: [], retained: 0, unconfirmed: 0 };
+        if (!this.available) return { removed: [], failed: [], retained: 0, pending: 0, unconfirmed: 0 };
         const now = Date.now();
-        const { signals } = this.allSignals();
-        // Group by controller: confirmations are per controller, so a signal from one is never retained or
-        // reclaimed on the strength of another's confirmations.
-        const byController = new Map();
-        for (const signal of signals) {
-            if (signal === null || typeof signal !== "object" || typeof signal.id !== "string") continue;
-            const key = typeof signal.controller === "string" ? signal.controller : "";
-            if (!byController.has(key)) byController.set(key, []);
-            byController.get(key).push(signal);
-        }
+        const { records } = this.allRecords();
         const removed = [];
         const failed = [];
         let retained = 0;
+        let pending = 0;
         let unconfirmed = 0;
-        for (const [controller, list] of byController) {
-            const { confirmed } = this.confirmationsFor(controller);
-            const confirmedList = list.filter((signal) => confirmed.has(signal.id));
-            unconfirmed += list.length - confirmedList.length;
-            const ordered = confirmedList
-                .map((signal) => {
-                    const parsed = Date.parse(typeof signal.at === "string" ? signal.at : "");
-                    return { signal, time: Number.isFinite(parsed) ? parsed : now };
+        const byController = new Map();
+        for (const record of records) {
+            const key = typeof record.controller === "string" ? record.controller : "";
+            if (!byController.has(key)) byController.set(key, []);
+            byController.get(key).push(record);
+        }
+        for (const list of byController.values()) {
+            const eligible = [];
+            for (const record of list) {
+                if (record.notification !== NOTIFICATION.CONFIRMED) { unconfirmed += 1; continue; }
+                if (!isTerminalBusiness(record)) { pending += 1; continue; }
+                eligible.push(record);
+            }
+            const ordered = eligible
+                .map((record) => {
+                    const parsed = Date.parse(typeof record.terminalAt === "string" ? record.terminalAt : record.createdAt ?? "");
+                    return { record, time: Number.isFinite(parsed) ? parsed : now };
                 })
                 .sort((a, b) => b.time - a.time);
             ordered.forEach((entry, index) => {
                 const tooOld = now - entry.time > maxAgeMs;
-                const beyondCap = index >= maxEvents;
-                if (!(tooOld && beyondCap)) {
-                    // Kept: either recent, or within the guaranteed newest window.
-                    retained += 1;
-                    return;
-                }
-                const signal = entry.signal;
-                const signalFile = resolveInside(this.root, "signals", controller, `${fileNameOf(signal.id)}.json`);
-                const confirmFile = resolveInside(this.root, "confirmations", controller, `${fileNameOf(signal.id)}.json`);
-                const questionFile = typeof signal.bindingId === "string" && typeof signal.reference === "string"
-                    ? resolveInside(this.root, "questions", signal.bindingId, `${fileNameOf(signal.reference.replace("collab-question:", ""))}.json`)
-                    : { ok: false, reason: "not a question" };
+                const beyondWindow = index >= maxEvents;
+                if (!(tooOld && beyondWindow)) { retained += 1; return; }
+                const target = this.recordFile(entry.record.id);
                 try {
-                    // The confirmation record is removed LAST: while it exists the event is still known to
-                    // be confirmed, so a crash mid-reclaim cannot resurrect it as outstanding work.
-                    if (signalFile.ok) fs.rmSync(signalFile.file, { force: true });
-                    if (questionFile.ok) fs.rmSync(questionFile.file, { force: true });
-                    if (confirmFile.ok) fs.rmSync(confirmFile.file, { force: true });
-                    removed.push(signal.id);
+                    if (!target.ok) throw new Error(target.reason);
+                    fs.rmSync(target.file, { force: true });
+                    removed.push(entry.record.id);
                 } catch (error) {
-                    // A record that could not be reclaimed stays on disk and is reported, so the store
-                    // never claims to be bounded while it is not.
-                    failed.push({ id: signal.id, reason: error instanceof Error ? error.message : String(error) });
+                    failed.push({ id: entry.record.id, reason: error instanceof Error ? error.message : String(error) });
                     retained += 1;
                 }
             });
         }
-        return { removed, failed, retained, unconfirmed };
+        return { removed, failed, retained, pending, unconfirmed };
     }
 
     /**
-     * Whether the store can actually be written to.
-     *
-     * Checked at startup so a broken store is reported immediately rather than at the first transfer
-     * that mattered. A read-only or uncreatable root is a real failure: the bridge must not accept a
-     * notification it cannot durably record.
+     * Whether the store can actually be written to, checked at startup.
      *
      * @returns {{ok: true} | {ok: false, reason: string}} the outcome.
      */

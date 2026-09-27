@@ -170,7 +170,7 @@ try {
     record("confirming the same event twice is idempotent", again.status === 200 && again.body.idempotent === true, `idempotent=${again.body.idempotent}`);
     record("the confirmed event is gone from its file too", !(await call("/signals/files?controller=codex")).body.signals.some((s) => s.id === target.id), "file removed");
     record("the file projection still holds the unconfirmed events", (await call("/signals/files?controller=codex")).body.signals.length === sessions.length - 1, "files independent of the ack list");
-    record("an unknown signal cannot be confirmed", (await call("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: "no-such-signal" }) })).status === 404, "unknown signal refused");
+    record("an unknown or retired signal cannot be confirmed", [404, 410].includes((await call("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: "no-such-signal" }) })).status), "unknown signal refused");
 
     // ---- 6) a per-controller inbox directory keeps the two controllers apart ----------------
     const dirs = fs.existsSync(inboxRoot) ? fs.readdirSync(inboxRoot).sort() : [];

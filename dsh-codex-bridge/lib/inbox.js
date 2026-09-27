@@ -145,36 +145,6 @@ export function confirmSignal(dir, signalId) {
     }
 }
 
-/**
- * Watch one controller's inbox, closing the scan/subscribe race.
- *
- * The contract is: scan the ACTUAL directory first, then establish the watcher, then scan again. Any
- * event that arrived in the gap is therefore caught by the second scan rather than lost, and the
- * watcher itself is only a prompt to re-read — never the record.
- *
- * @param {string} dir - this controller's inbox directory.
- * @param {(snapshot: {signals: Array<object>, problems: Array<object>}) => void} onSnapshot - called with each fresh reading.
- * @returns {() => void} a disposer that stops watching.
- */
-export function watchInbox(dir, onSnapshot) {
-    fs.mkdirSync(dir, { recursive: true });
-    const emit = () => onSnapshot(readSignals(dir));
-    // 1) backlog first, so an event that predates the wait is delivered immediately.
-    emit();
-    // 2) then observe, and 3) re-scan so anything landing in between is not missed.
-    let watcher = null;
-    try {
-        watcher = fs.watch(dir, { persistent: false }, () => emit());
-    } catch {
-        // Watching is advisory; a platform that cannot watch still works via the caller's polling.
-        watcher = null;
-    }
-    emit();
-    return () => {
-        try { watcher?.close(); } catch { /* already closed */ }
-    };
-}
-
 // Retention is NOT implemented here. An inbox file is a projection of a durable signal, so whether an
 // event may be reclaimed is a question about the SIGNAL's authority — is it confirmed, is it terminal,
 // how old is it — which only the store that owns those records can answer. A directory-level prune that
