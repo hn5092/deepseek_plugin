@@ -216,7 +216,12 @@ try {
     & tar -xf $archive -C $exportDir
     if ($LASTEXITCODE -ne 0) { throw 'could not extract the staged archive' }
 } finally { Pop-Location }
-if (-not (Test-Path -LiteralPath (Join-Path $exportDir 'package.json'))) { throw "the commit did not contain $packageName as a package" }
+if (-not (Test-Path -LiteralPath (Join-Path $exportDir 'package.json'))) {
+    # Nothing can be installed from this commit; the staging directory is this script's own output and is
+    # removed before failing so a failed attempt leaves no residue.
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    throw "the commit did not contain $packageName as a package"
+}
 # Tests are part of the source of truth but are not operational payload; a deployment carries the plugin only.
 Get-ChildItem -LiteralPath $exportDir -Recurse -File -Filter '*.test.mjs' -ErrorAction SilentlyContinue | Remove-Item -Force
 
@@ -230,6 +235,9 @@ New-Item -ItemType Directory -Path $modulesDir -Force | Out-Null
 Copy-Item -LiteralPath $exportDir -Destination $target -Recurse -Force
 $fileCount = (Get-ChildItem -LiteralPath $target -Recurse -File | Measure-Object).Count
 Write-Host "installed $packageName @ $resolved -> $target ($fileCount files)"
+# The staging directory is this script's OWN temporary output, so it is removed once the artifact has been
+# copied. Only this exact path is touched; nothing else under the temp root is inspected or deleted.
+Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 
 # 4) Write one managed block, preserving every unrelated line and every other plugin's row.
 $configLines = @(Get-Content -LiteralPath $ControllerConfig -Encoding UTF8 | Where-Object { $_.Trim().Length -gt 0 })
