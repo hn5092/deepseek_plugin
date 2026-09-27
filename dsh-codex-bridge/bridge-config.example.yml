@@ -49,6 +49,16 @@ storeRoot: C:/Users/Administrator/.dsh/codex-bridge/store
 # volatile, so the Loader commits a new value into the running instance instead of remounting it, and an
 # in-flight question — including one belonging to another controller — is not interrupted. The change is
 # persisted to this file through the shell's own config editor, so it also survives a restart.
+#
+# CONTROLLER IDENTITIES live here, separately from bindings. A credential belongs to the CONTROLLER, not to
+# any one session: retiring a controller's last binding must not retire the controller, or that party could
+# never bind again with the same credential. Declare each control party once. `bind` registers an identity
+# automatically for a party that is not declared yet, and a deployment with no `controllers` list still
+# authenticates through its bindings, so adding this list never locks an existing controller out.
+controllers:
+  - controller: codex
+    tokenRef: CODEX_BRIDGE_TOKEN_EXAMPLE
+
 bindings:
   - bindingId: codex::example
     sessionId: session-example

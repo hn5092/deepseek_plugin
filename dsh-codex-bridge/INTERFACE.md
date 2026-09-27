@@ -1,6 +1,6 @@
 # dsh-codex-bridge：DS↔Codex 双向协作桥
 
-状态：**隔离实例全部验收 GREEN（18 套 401/401，全部 EXIT=0）；未安装主实例、未重启、未推送。**
+状态：**隔离实例全部验收 GREEN（18 套 416/416，全部 EXIT=0）；未安装主实例、未重启、未推送。**
 作者源码：`D:\workspace\_tools\deepseek_plugin\dsh-codex-bridge\`（唯一）。
 
 ## 零之一、重试合同（所有入口同一语义）
@@ -147,9 +147,12 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 ## 三、合同要点
 
 - **控制方身份由凭据决定，不由自报决定**：`connection.admit` 只证明请求来自 operator（**恒为同一 peer**，
-  不区分控制方），因此每个绑定声明 `tokenRef`（凭据**引用**，值经 `ctx.credentials` 解析，**不入 Git/日志/会话**）。
+  不区分控制方），因此每个控制方声明 `tokenRef`（凭据**引用**，值经 `ctx.credentials` 解析，**不入 Git/日志/会话**）。
+  **身份独立于绑定生命周期**：配置 `controllers: [{controller, tokenRef}]` 是身份权威，`bindings` 只用于路由。
+  ⇒ **退役某控制方最后一个绑定不会让它失去身份**，同一凭据仍可绑定新会话；未声明 `controllers` 的旧部署
+  由 `bindings` **派生**身份，升级不会锁死既有控制方。
   请求须带 `x-controller-token`；服务端用解析出的控制方身份，**自报的 `controller` 必须与之一致**（否则 403）。
-  ⇒ 持有 B 合法凭据者**无法**借自报 A 读取/答复/确认 A 的事件。
+  ⇒ 持有 B 合法凭据者**无法**借自报 A 读取/答复/确认 A 的事件；**既未声明也未绑定的陌生方无法自我介绍**（401）。
 - **AI 来源由服务端写死 `codex`**；调用方传 `source:"user"` 会被覆盖，**机器不能伪造人类同意**；人类仍走原生
   `ask_user_question`/approval 入口，本插件不拦截。
 - **绑定身份**：`{bindingId, sessionId, cwd, controller, tokenRef}`；一个控制方可**多绑定、多目录**，
@@ -221,13 +224,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
   `<home>/.credentials.yaml` 或环境解析，**不进命令行、不打印**（实测断言）。
 - 配置示例见 `bridge-config.example.yml`（**只含引用**，无任何密钥值）。
 
-## 四、验收（全部实测，`EXIT=0`，合计 401/401）
+## 四、验收（全部实测，`EXIT=0`，合计 416/416）
 
 `node scripts/<suite>.test.mjs`：
 
 | 套件 | 结果 | 说明 |
 | --- | --- | --- |
-| `collab-rules` | 30/30 | 纯函数规则层：peer 身份反例 + **失效绑定在真正选择处被排除** |
+| `collab-rules` | 31/31 | 纯函数规则层：peer 身份反例 + **失效绑定在真正选择处被排除** + **退役最后一个绑定后身份仍在** |
 | `collab-signals` | 34/34 | 规则层；不再导出按文件年龄的 prune 与无人消费的 watcher |
 | `collab-multi` | 31/31 | 真机：5 会话跨 5 目录 + 第二控制方；**匿/错/冒名一律拒绝** |
 | `collab-loop` | 29/29 | 真机：**真实 `ask_codex` → wait → 答 → 同一调用继续** |
@@ -244,7 +247,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
 | **`collab-hotload`** | **11/11** | **热加载实测**：启动时无插件（404）→ 只改 profile patch → **同一 PID**（无重启）内路由 200、**既有 session 与历史仍在**、绑定/notify/signals/wait 全可用；`--patch` 启动参数文件**不会**热加载（准确限制） |
 | **`collab-ops`** | **25/25** | **消费与运维**：CLI health/bindings/真实 ask→wait-any→answer→**同 tool 继续**/confirm/notify；**不误吞另一会话**；**空截止到达且无输出、无模型调用**；**凭据不出现在任何输出**；安装精确提交（其它插件行保留、不含 tests）→ 健康 → 回滚**逐字节还原** |
 | **`collab-upgrade`** | **33/33** | **升级真实反例**：先装**旧单向桥**→启动宿主→换新 artifact 触发重载 ⇒ **已 import 的模块不换**（collab 仍 404），而 **patch 层确实重载**（移行即 404）、session 与进程身份保留；**健康门**拒匿名旧 200、要求 collab 路由+bindings；**回滚绑定本插件收据**（只移本块、恢复收据记录的旧 artifact、**并发改同块即拒绝**、无收据拒绝猜测）|
-| **`collab-livebind`** | **41/41** | **运行中增量绑定**：B 的**真实在途 ask** 等待时 A 增量绑定新 session ⇒ **B 原问题仍可答、原工具恰好继续一次**、A 新 session 真实 ask/wait/answer 通；**PID 不变**；非法 cwd/不存活 session/抢他人/动他人绑定**全拒绝且不改绑定**；**unbind 有待答问题即拒绝（不隐式 cancel）**；已退绑定不能代答而其**历史保留**；换绑定**已持久化**；**overlay 部署返回 409 configuration-overridden 且不谎报已存** |
+| **`collab-livebind`** | **55/55** | **运行中增量绑定**：B 的**真实在途 ask** 等待时 A 增量绑定新 session ⇒ **B 原问题仍可答、原工具恰好继续一次**、A 新 session 真实 ask/wait/answer 通；**PID 不变**；非法 cwd/不存活 session/抢他人/动他人绑定**全拒绝且不改绑定**；**unbind 有待答问题即拒绝（不隐式 cancel）**；已退绑定不能代答而其**历史保留**；换绑定**已持久化**；**overlay 部署返回 409 configuration-overridden 且不谎报已存** |
 另需 `scripts/isolated-instance.mjs`（可丢弃或 caller-owned home + `--patch` overlay，**真 SIGTERM → 等退出 →
 有界 SIGKILL → 复核**的 stop，**回收本次自有孙进程**，失败日志复制到 caller 指定的证据目录，并导出
 `stopIsClean()` 供各套件共用同一收据判定）与 `scripts/scripted-model/`

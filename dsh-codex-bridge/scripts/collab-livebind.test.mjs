@@ -87,6 +87,14 @@ const writePatch = (extraRows = []) => {
         "        answerTimeoutMs: 30000",
         `        inboxRoot: ${JSON.stringify(path.join(workDir, "inbox").replace(/\\/g, "/"))}`,
         `        storeRoot: ${JSON.stringify(path.join(workDir, "store").replace(/\\/g, "/"))}`,
+        // Identities are declared SEPARATELY from bindings, so a controller keeps its credential after its
+        // last binding is retired. Declaring BOTH here is what lets case 9 prove the reported symptom is
+        // fixed rather than merely avoided.
+        "        controllers:",
+        "          - controller: 'codex-a'",
+        `            tokenRef: '${REF_A}'`,
+        "          - controller: 'codex-b'",
+        `            tokenRef: '${REF_B}'`,
         "        bindings:",
         "          - bindingId: 'a::old'",
         `            sessionId: 'session-a-old'`,
@@ -343,6 +351,86 @@ try {
         historical.every((s) => s.sessionId === sessionGuard), `historical records=${historical.length}`);
 
     record("the host PID never changed across every change", child.pid === pidBefore && child.exitCode === null, `pid=${child.pid}`);
+
+    // ---- 9) A can bind again after its own LAST binding was retired -----------------------
+    // This is the reported production symptom: retire the final binding of a controller and the same
+    // credential could no longer bind anything, because identity had been derived from bindings and died
+    // with the last one. Here B still has a LIVE PENDING question the whole time, so a fix that reached
+    // this by tearing the plugin down would be caught.
+    //
+    // A owns TWO bindings at this point (a::old, a::new), so BOTH are retired to reach the real zero state.
+    for (const bindingId of ["a::old", "a::new"]) {
+        const retired = await callA(url, "/bindings/unbind", {
+            ...cookie, method: "POST", body: JSON.stringify({ bindingId, controller: "codex-a" })
+        });
+        record(`A's binding ${bindingId} can be retired`, retired.status === 200, `status=${retired.status} ${retired.body.error ?? ""}`);
+    }
+
+    const zeroA = await callA(url, "/bindings?controller=codex-a", cookie);
+    record("A now has ZERO bindings", (zeroA.body.bindings ?? []).length === 0, `count=${(zeroA.body.bindings ?? []).length}`);
+
+    // Start a REAL pending question for B, so the re-bind below is proven not to disturb in-flight work.
+    await client.rpc("session/create", { request: { cwd: projDir, sessionId: "session-b-second" } });
+    const bindB2 = await callB(url, "/bindings/bind", {
+        ...cookie, method: "POST",
+        body: JSON.stringify({ sessionId: "session-b-second", cwd: projDir, controller: "codex-b", tokenRef: REF_B, bindingId: "b::second" })
+    });
+    record("B can add a second session", bindB2.status === 200, `status=${bindB2.status}`);
+    const promptB2 = client.rpc("session/prompt", {
+        request: {
+            sessionId: "session-b-second", requestId: crypto.randomUUID(), mode: "queue",
+            content: [{ type: "text", text: 'Call the tool "ask_codex" with a question.' }],
+            clientTimeZone: "Asia/Shanghai"
+        }
+    }).catch(() => { /* answered below on purpose */ });
+    let questionB2 = null;
+    const findB2 = Date.now() + 25_000;
+    while (Date.now() < findB2 && questionB2 === null) {
+        await new Promise((r) => setTimeout(r, 800));
+        const listed = await callB(url, "/questions?sessionId=session-b-second&controller=codex-b", cookie);
+        questionB2 = (listed.body.questions ?? [])[0] ?? null;
+    }
+    record("B has a live pending question while A is at zero bindings", questionB2 !== null, `questionId=${questionB2?.id ?? "none"}`);
+
+    // THE SYMPTOM: the SAME credential that just retired its last binding binds a NEW session.
+    await client.rpc("session/create", { request: { cwd: projDir, sessionId: "session-a-rebind" } });
+    const rebind = await callA(url, "/bindings/bind", {
+        ...cookie, method: "POST",
+        body: JSON.stringify({ sessionId: "session-a-rebind", cwd: projDir, controller: "codex-a", tokenRef: REF_A, bindingId: "a::rebind" })
+    });
+    record("A binds a NEW session with the SAME credential after zero bindings", rebind.status === 200, `status=${rebind.status} ${rebind.body.error ?? ""}`);
+    // `codex-a` was already DECLARED, so no identity row had to be added here; the registration path for a
+    // controller that has never been declared is exercised at the end of this case.
+    record("the re-bind reports clearly whether an identity row was added", rebind.body.identityRegistered === false, `identityRegistered=${rebind.body.identityRegistered}`);
+    const listedA2 = await callA(url, "/bindings?controller=codex-a", cookie);
+    record("A sees the new binding", (listedA2.body.bindings ?? []).some((b) => b.bindingId === "a::rebind"), `ids=${JSON.stringify((listedA2.body.bindings ?? []).map((b) => b.bindingId))}`);
+    record("B's bindings were untouched by A's re-bind", (await callB(url, "/bindings?controller=codex-b", cookie)).body.bindings.some((b) => b.bindingId === "b::existing"), "b::existing present");
+
+    // A wrong credential is still refused with A at one binding, so this is not a blanket accept.
+    const wrongAfter = await callAs("not-a-real-secret")(url, "/bindings?controller=codex-a", { cookie });
+    record("a wrong credential is still refused after the re-bind", wrongAfter.status === 401, `status=${wrongAfter.status}`);
+
+    // A controller that is NEITHER declared nor bound cannot authenticate at all: identity registration is
+    // not a way for an unknown party to introduce itself with a credential the bridge has never been told
+    // about. Only a controller the configuration already names can reach the endpoints.
+    const stranger = await callAs("some-stranger-secret")(url, "/bindings/bind", {
+        cookie, method: "POST",
+        body: JSON.stringify({ sessionId: "session-a-rebind", cwd: projDir, controller: "codex-stranger", tokenRef: "STRANGER_REF", bindingId: "s::1" })
+    });
+    record("an undeclared, unbound controller cannot introduce itself", stranger.status === 401, `status=${stranger.status} ${stranger.body.error ?? ""}`);
+
+    // B's pending question must still be answerable EXACTLY once, with A's changes long past.
+    const answerB2 = await callB(url, "/answer", {
+        ...cookie, method: "POST",
+        body: JSON.stringify({ questionId: questionB2?.id ?? "", text: "B answers after A retired and re-bound.", source: "codex", controller: "codex-b" })
+    });
+    record("B's pending question is still answerable", answerB2.status === 200 && answerB2.body.delivered !== false, `status=${answerB2.status} delivered=${answerB2.body.delivered}`);
+    await promptB2;
+    await new Promise((r) => setTimeout(r, 1500));
+    const snapB2 = await client.snapshot("session-b-second", 300);
+    const resultsB2 = snapB2.records.map((r) => r.event).filter((e) => e && e.type === "tool/result");
+    record("B's tool call resumed EXACTLY once", resultsB2.length === 1, `tool results=${resultsB2.length}`);
+    record("the re-bind did not interrupt B or change its answer", JSON.stringify(resultsB2).includes("B answers after A retired and re-bound."), "answer matched");
 } finally {
     try { child.kill("SIGTERM"); } catch { /* gone */ }
     const stopDeadline = Date.now() + 6000;

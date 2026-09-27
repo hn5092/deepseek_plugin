@@ -7,6 +7,7 @@ import {
     answerVerdict,
     assertSingleOwner,
     bindingsOf,
+    controllerIdentities,
     identifyController,
     isKnownController,
     matchBinding,
@@ -97,6 +98,22 @@ export const Config = z.object({
         tokenRef: z.string(),
         /** False marks a binding superseded by a handover, so an old owner can no longer answer. */
         current: z.boolean().default(true)
+    })).default([]).volatile(),
+    /**
+     * Controller identities: which credential reference authenticates which control party.
+     *
+     * These are declared SEPARATELY from `bindings`, because a credential belongs to the controller and not
+     * to any one session. Retiring a controller's last binding must not retire the controller: if identity
+     * came from `bindings`, that party would become unauthenticatable and could never bind again with the
+     * same credential. Kept volatile for the same reason as `bindings` — a controller may be added or
+     * re-pointed while the bridge runs, and that must not tear down anyone's in-flight questions.
+     *
+     * A deployment written before this list existed still works: identities are also derived from the
+     * declared bindings, so an upgrade cannot lock out a controller that is already bound.
+     */
+    controllers: z.array(z.object({
+        controller: z.string(),
+        tokenRef: z.string()
     })).default([]).volatile(),
     /**
      * Default bound on how long an ask waits for a controller before returning `interrupted`.
@@ -223,6 +240,13 @@ export function apply(ctx, config) {
         return Array.isArray(list) ? list : [];
     };
 
+    /** The declared controller identities, read live for the same reason `bindings` is. */
+    const currentControllers = () => {
+        const raw = config.controllers;
+        const list = raw && typeof raw.get === "function" ? raw.get() : raw;
+        return Array.isArray(list) ? list : [];
+    };
+
     /**
      * The effective bindings, rebuilt whenever the configuration changes.
      *
@@ -232,6 +256,14 @@ export function apply(ctx, config) {
      * the routes without a remount.
      */
     let bindings = [];
+    /**
+     * The effective controller identities, rebuilt with the bindings.
+     *
+     * This is the authority for authentication. It is derived from the declared `controllers` list AND the
+     * bindings, so a controller keeps its identity after its last binding is retired, while a deployment
+     * that predates the list still authenticates through its bindings.
+     */
+    let identities = [];
     const rebuildBindings = () => {
         const next = [];
         for (const raw of currentBindings()) {
@@ -251,6 +283,10 @@ export function apply(ctx, config) {
             }
         }
         bindings = next;
+        // Identities are rebuilt AFTER the bindings, so a binding dropped for a double-owner conflict can
+        // still contribute its identity (an ambiguous session has no answer owner, but its controller is
+        // still a known party).
+        identities = controllerIdentities(currentControllers(), currentBindings());
         return bindings;
     };
     rebuildBindings();
@@ -259,7 +295,8 @@ export function apply(ctx, config) {
     // carries an incremental bind/unbind into the running plugin, and it deliberately does NOT touch any
     // waiter: in-flight questions belong to whoever asked them and are not this change's to interrupt.
     ctx.on("loader/volatile-update", (paths) => {
-        if (!Array.isArray(paths) || !paths.some((entry) => Array.isArray(entry) && entry[0] === "bindings")) return;
+        const touched = (name) => Array.isArray(paths) && paths.some((entry) => Array.isArray(entry) && entry[0] === name);
+        if (!touched("bindings") && !touched("controllers")) return;
         rebuildBindings();
         // A binding may name a credential reference this instance has not seen yet, so the cache is
         // refreshed from the live list. The resolution is asynchronous but nothing waits on it: a request
@@ -377,7 +414,10 @@ export function apply(ctx, config) {
 
     /** Load every declared controller credential from the shell's credential owner. */
     const loadControllerSecrets = async () => {
-        const refs = [...new Set(bindings.map((entry) => entry.tokenRef).filter((ref) => typeof ref === "string" && ref.length > 0))];
+        // References come from the IDENTITIES, not from the bindings: a controller whose last binding was
+        // retired — or one that has not bound anything yet — must still be able to authenticate, and its
+        // secret would otherwise never be resolved.
+        const refs = [...new Set(identities.map((entry) => entry.tokenRef).filter((ref) => typeof ref === "string" && ref.length > 0))];
         for (const ref of refs) {
             try {
                 const resolved = await ctx.credentials.resolve(credentialRef(ref));
@@ -973,7 +1013,7 @@ export function apply(ctx, config) {
         // The controller credential arrives in a dedicated header so it never lands in a URL, a log
         // line, or a referrer the way a query parameter would.
         const offered = typeof request.headers["x-controller-token"] === "string" ? request.headers["x-controller-token"] : "";
-        const identity = identifyController(offered, bindings, resolveControllerSecret);
+        const identity = identifyController(offered, identities, resolveControllerSecret);
         if (!identity.ok) {
             send(response, 401, { error: identity.reason, hint: "present the controller credential in the x-controller-token header" });
             return;
@@ -999,7 +1039,7 @@ export function apply(ctx, config) {
                     send(response, 200, { count: bindings.length, controllers: [...new Set(bindings.map((b) => b.controller))] });
                     return;
                 }
-                if (!isKnownController(bindings, controller)) {
+                if (!isKnownController(identities, controller)) {
                     send(response, 403, { error: "not your binding: controller-not-bound" });
                     return;
                 }
@@ -1029,8 +1069,15 @@ export function apply(ctx, config) {
                 }
                 const acting = controller;
 
-                /** Persist a new declared-binding list through the shell's config owner. */
-                const persist = async (nextRaw) => {
+                /**
+                 * Persist a new declared-binding list through the shell's config owner.
+                 *
+                 * `nextControllers` may also be supplied, so a binding can be written together with the
+                 * identity it needs IN ONE EDIT. That ordering matters: an identity is registered before the
+                 * binding that relies on it, so the stored configuration can never contain a binding whose
+                 * controller cannot be authenticated.
+                 */
+                const persist = async (nextRaw, nextControllers) => {
                     const entry = ctx.fiber && ctx.fiber.entry ? ctx.fiber.entry : null;
                     if (entry === null || typeof ctx.configEditor?.edit !== "function") {
                         return { ok: false, reason: "the configuration owner is unavailable, so the change cannot be persisted" };
@@ -1039,7 +1086,11 @@ export function apply(ctx, config) {
                         // Only THIS plugin's row is edited; the editor derives the next raw config from the
                         // current one, so other plugins' rows and every unrelated field are carried through
                         // untouched.
-                        await ctx.configEditor.edit(entry, (current) => ({ ...current, bindings: nextRaw }));
+                        await ctx.configEditor.edit(entry, (current) => ({
+                            ...current,
+                            ...(nextControllers === undefined ? {} : { controllers: nextControllers }),
+                            bindings: nextRaw
+                        }));
                         return { ok: true };
                     } catch (error) {
                         const reason = messageOf(error);
@@ -1108,11 +1159,17 @@ export function apply(ctx, config) {
 
                     // The new declaration is THIS controller's bindings plus everything else, unchanged.
                     const nextRaw = [...currentBindings(), { bindingId: added.bindingId, sessionId: added.sessionId, cwd: added.cwd, controller: acting, tokenRef: added.tokenRef, current: true }];
-                    const written = await persist(nextRaw);
+                    // The identity is registered in the SAME edit as the binding, and BEFORE it in the
+                    // written document: a stored binding whose controller cannot be authenticated would be
+                    // unroutable, and this is the step that makes a controller with zero bindings able to
+                    // bind its first one again.
+                    const alreadyKnown = controllerIdentities(currentControllers(), []).some((entry) => entry.controller === acting);
+                    const nextControllers = alreadyKnown ? undefined : [...currentControllers(), { controller: acting, tokenRef: added.tokenRef }];
+                    const written = await persist(nextRaw, nextControllers);
                     if (!written.ok) { send(response, written.reason === "configuration-overridden" ? 409 : 500, { error: `the binding could not be persisted: ${written.reason}`, ...(written.detail === undefined ? {} : { detail: written.detail, hint: "this deployment owns the plugin config from a home patch or a command-line overlay, so it must be changed there" }) }); return; }
                     // The volatile commit may land just after the editor resolves; the reply is about what was
                     // PERSISTED, and the effective set is re-derived on the update event.
-                    send(response, 200, { ok: true, binding: added, declared: nextRaw.length });
+                    send(response, 200, { ok: true, binding: added, declared: nextRaw.length, identityRegistered: nextControllers !== undefined });
                     return;
                 }
 
@@ -1168,7 +1225,7 @@ export function apply(ctx, config) {
                 }
                 const acknowledgedRaw = url.searchParams.get("acknowledged");
                 const acknowledged = acknowledgedRaw === null ? [] : acknowledgedRaw.split(",").filter((id) => id.length > 0);
-                if (!isKnownController(bindings, controller)) {
+                if (!isKnownController(identities, controller)) {
                     send(response, 403, { error: `not your binding: controller-not-bound` });
                     return;
                 }
@@ -1194,7 +1251,7 @@ export function apply(ctx, config) {
                     send(response, 403, { error: "stated controller does not match the presented credential" });
                     return;
                 }
-                if (!isKnownController(bindings, controller)) {
+                if (!isKnownController(identities, controller)) {
                     send(response, 403, { error: "not your binding: controller-not-bound" });
                     return;
                 }
@@ -1244,7 +1301,7 @@ export function apply(ctx, config) {
                     return;
                 }
                 const signalId = typeof body.signalId === "string" ? body.signalId : "";
-                if (!isKnownController(bindings, controller)) {
+                if (!isKnownController(identities, controller)) {
                     send(response, 403, { error: "not your binding: controller-not-bound" });
                     return;
                 }
@@ -1307,7 +1364,7 @@ export function apply(ctx, config) {
                 const acknowledgedRaw = url.searchParams.get("acknowledged");
                 const acknowledged = acknowledgedRaw === null ? [] : acknowledgedRaw.split(",").filter((id) => id.length > 0);
                 const maxBatch = Math.min(Math.max(Number(url.searchParams.get("maxBatch") ?? 50) || 50, 1), 200);
-                if (!isKnownController(bindings, controller)) {
+                if (!isKnownController(identities, controller)) {
                     send(response, 403, { error: "not your binding: controller-not-bound" });
                     return;
                 }

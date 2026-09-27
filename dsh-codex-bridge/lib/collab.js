@@ -20,26 +20,70 @@
 export const ANSWER_SOURCES = Object.freeze(["codex"]);
 
 /**
+ * Normalize one declared controller identity.
+ *
+ * A controller's credential belongs to the CONTROLLER, not to any one session binding. Retiring the last
+ * binding of a controller must not retire the controller itself, or that party could never bind again with
+ * the same credential. That is why identity is declared and persisted separately from `bindings`.
+ *
+ * @param {{controller?: unknown, tokenRef?: unknown}} raw - candidate identity.
+ * @returns {{ok: true, identity: {controller: string, tokenRef: string}} | {ok: false, reason: string}} the result.
+ */
+export function normalizeController(raw) {
+    const controller = raw && typeof raw.controller === "string" ? raw.controller.trim() : "";
+    const tokenRef = raw && typeof raw.tokenRef === "string" ? raw.tokenRef.trim() : "";
+    if (controller.length === 0) return { ok: false, reason: "identity requires a controller" };
+    if (tokenRef.length === 0) return { ok: false, reason: "identity requires a tokenRef" };
+    return { ok: true, identity: { controller, tokenRef } };
+}
+
+/**
+ * The controller identities in force: those declared explicitly, plus any implied by a binding.
+ *
+ * `bindings` alone cannot be the source of identity, because a controller with no binding yet — or one
+ * whose last binding was just retired — would become unidentifiable and could never bind again. The
+ * declared `controllers` list is the authority. Bindings are still folded in, so a deployment written
+ * before that list existed keeps working: its controllers are derived rather than lost.
+ *
+ * @param {ReadonlyArray<{controller?: string, tokenRef?: string}>} controllers - declared identities.
+ * @param {ReadonlyArray<{controller?: string, tokenRef?: string}>} bindings - declared bindings.
+ * @returns {ReadonlyArray<{controller: string, tokenRef: string}>} the identities, first declaration winning.
+ */
+export function controllerIdentities(controllers, bindings) {
+    const seen = new Map();
+    const add = (raw) => {
+        const normalized = normalizeController(raw);
+        // The FIRST declaration of a controller wins, so an explicit identity row is never overridden by
+        // an incidental binding, and two contradictory rows cannot both take effect.
+        if (normalized.ok && !seen.has(normalized.identity.controller)) seen.set(normalized.identity.controller, normalized.identity);
+    };
+    for (const entry of controllers || []) add(entry);
+    for (const entry of bindings || []) add(entry);
+    return [...seen.values()];
+}
+
+/**
  * Resolve which controller a request actually is, from a credential the caller must possess.
  *
  * `connection.admit` proves only that a request speaks for the operator; it cannot distinguish one
  * controller from another, so a controller field sent in a body or query is a CLAIM and never an
- * identity. The declared bindings name the credential reference for each controller, and the caller is
- * whichever controller's secret matches. Nothing here compares or returns the secret itself beyond the
- * equality test, and a caller with no match is not identified at all.
+ * identity. Identity is matched against the DECLARED identities, which outlive any single binding, so a
+ * controller that currently has no binding is still itself and can still bind again. Nothing here compares
+ * or returns the secret itself beyond the equality test, and a caller with no match is not identified at
+ * all.
  *
  * @param {string} offered - the secret the caller presented, or an empty string.
- * @param {ReadonlyArray<{controller: string, tokenRef?: string}>} bindings - declared bindings.
+ * @param {ReadonlyArray<{controller: string, tokenRef?: string}>} identities - declared controller identities.
  * @param {(ref: string) => string|null} resolveSecret - resolves a reference to its value, or null.
  * @returns {{ok: true, controller: string} | {ok: false, reason: string}} the identified controller.
  */
-export function identifyController(offered, bindings, resolveSecret) {
+export function identifyController(offered, identities, resolveSecret) {
     if (typeof offered !== "string" || offered.length === 0) return { ok: false, reason: "no-controller-credential" };
-    const candidates = [...new Set((bindings || []).map((entry) => entry.controller))]
+    const candidates = [...new Set((identities || []).map((entry) => entry.controller))]
         .filter((controller) => typeof controller === "string" && controller.length > 0);
     for (const controller of candidates) {
-        const binding = (bindings || []).find((entry) => entry.controller === controller);
-        const ref = binding === undefined ? undefined : binding.tokenRef;
+        const identity = (identities || []).find((entry) => entry.controller === controller);
+        const ref = identity === undefined ? undefined : identity.tokenRef;
         if (typeof ref !== "string" || ref.length === 0) continue;
         const secret = resolveSecret(ref);
         // Constant-time-ish comparison is not required here (the secret is not echoed and the caller
@@ -217,18 +261,19 @@ export function matchBinding(binding, bindings, platform = process.platform) {
 }
 
 /**
- * Whether a controller owns any binding at all.
+ * Whether a controller is a known party at all.
  *
- * Used by the aggregate wait, so a controller that owns several bindings is never refused merely
- * because it did not name one session, while a controller that owns nothing is still refused.
+ * Judged against the DECLARED IDENTITIES, not against bindings: a controller whose last binding was just
+ * retired is still a known controller, and must still be able to bind a new session. If this were answered
+ * from bindings, retiring the final binding would lock that controller out of ever binding again.
  *
- * @param {ReadonlyArray<{controller: string}>} bindings - declared bindings.
+ * @param {ReadonlyArray<{controller: string}>} identities - declared controller identities.
  * @param {string} controller - the asking controller.
  * @returns {boolean} whether it is a known controller.
  */
-export function isKnownController(bindings, controller) {
+export function isKnownController(identities, controller) {
     if (typeof controller !== "string" || controller.length === 0) return false;
-    return (bindings || []).some((entry) => entry.controller === controller);
+    return (identities || []).some((entry) => entry.controller === controller);
 }
 
 /**

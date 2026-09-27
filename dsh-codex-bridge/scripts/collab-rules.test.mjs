@@ -12,7 +12,9 @@ import {
     ANSWER_SOURCES,
     answerVerdict,
     assertSingleOwner,
+    controllerIdentities,
     identifyController,
+    isKnownController,
     matchBinding,
     normalizeBinding,
     pendingQuestions,
@@ -195,6 +197,39 @@ test("a caller without a matching credential is not identified at all", () => {
     assert.equal(identifyController("secret-a", [{ bindingId: "a", sessionId: "s1", cwd: "D:/a", controller: "codex" }], resolve).ok, false);
     // An unresolvable reference never authenticates.
     assert.equal(identifyController("secret-a", bindings, () => null).ok, false);
+});
+
+test("a controller keeps its identity after its LAST binding is retired", () => {
+    // The defect this guards: identity was derived from bindings, so retiring the final binding deleted the
+    // controller itself and the same credential could never bind again.
+    const declared = [{ controller: "codex", tokenRef: "TOKEN_A" }];
+    const secrets = { TOKEN_A: "secret-a" };
+    const resolve = (ref) => secrets[ref] ?? null;
+
+    // With no bindings at all, the controller is still itself.
+    assert.deepEqual(identifyController("secret-a", controllerIdentities(declared, []), resolve), { ok: true, controller: "codex" });
+    // And a completely empty identity list identifies nobody, so this is not a blanket accept.
+    assert.equal(identifyController("secret-a", controllerIdentities([], []), resolve).ok, false, "no declared identity means no controller");
+    // A wrong credential is still refused with zero bindings.
+    assert.equal(identifyController("secret-b", controllerIdentities(declared, []), resolve).ok, false, "a wrong credential stays refused");
+
+    // Retiring the last binding (bindings now empty) leaves identity intact.
+    const afterRetirement = controllerIdentities(declared, []);
+    assert.equal(isKnownController(afterRetirement, "codex"), true, "the controller is still known with zero bindings");
+    assert.deepEqual(identifyController("secret-a", afterRetirement, resolve), { ok: true, controller: "codex" });
+
+    // An identity implied only by a binding is still found, so a deployment written before the declared
+    // list existed keeps authenticating its controllers.
+    const legacy = controllerIdentities([], [{ bindingId: "b", sessionId: "s1", cwd: "D:/a", controller: "old", tokenRef: "TOKEN_OLD" }]);
+    assert.deepEqual(identifyController("secret-old", legacy, (r) => (r === "TOKEN_OLD" ? "secret-old" : null)), { ok: true, controller: "old" });
+
+    // An explicitly declared identity WINS over a conflicting binding for the same controller name.
+    const conflict = controllerIdentities([{ controller: "codex", tokenRef: "TOKEN_A" }], [{ bindingId: "b", sessionId: "s1", cwd: "D:/a", controller: "codex", tokenRef: "TOKEN_STALE" }]);
+    assert.deepEqual(identifyController("secret-a", conflict, resolve), { ok: true, controller: "codex" }, "the declared identity wins");
+    assert.equal(identifyController("secret-stale", conflict, (r) => (r === "TOKEN_STALE" ? "secret-stale" : null)).ok, false, "a stale binding reference cannot authenticate");
+
+    // A malformed identity is dropped rather than becoming an unauthenticatable controller.
+    assert.deepEqual(controllerIdentities([{ controller: "codex" }, { tokenRef: "X" }, { controller: "ok", tokenRef: "Y" }], []), [{ controller: "ok", tokenRef: "Y" }]);
 });
 
 test("the AI answer source is codex only, and the human source is not caller-selectable", () => {
