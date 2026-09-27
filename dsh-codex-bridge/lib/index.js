@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import z from "@deepseek-ai/schemastery";
-import { z as zod } from "zod";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import {
@@ -17,6 +16,7 @@ import {
 } from "./collab.js";
 import { deliverableSignals, normalizeSignal, recoverSignals, signalVerdict, waitOutcome } from "./signals.js";
 import { confirmSignal, inboxDirFor, publishSignal, readSignals } from "./inbox.js";
+import { CollabStore } from "./store.js";
 
 /** Cordis plugin name; the profile patch row id stays independent of it. */
 export const name = "codex-bridge";
@@ -24,13 +24,12 @@ export const name = "codex-bridge";
 /**
  * Host services the bridge needs.
  *
- * `tools` registers the model-facing question tool; `sessionProjections` folds the collaboration
- * events into readable state (the same seam `dsh-permission-presets` uses for its own durable event);
- * `connection` supplies the shell's real admission fence; `sessionController`/`agents` keep the
- * existing message delivery working. Every service read here is declared, because Cordis throws on an
- * undeclared access.
+ * `tools` registers the model-facing tools; `connection` supplies the shell's real admission fence;
+ * `credentials` resolves each controller's credential REFERENCE to its value (the bridge stores no
+ * secret itself); `sessionController`/`agents` keep message delivery and live-session lookup working.
+ * Every service read here is declared, because Cordis throws on an undeclared access.
  */
-export const inject = ["webServer", "sessionController", "agents", "tools", "sessionProjections", "connection", "credentials"];
+export const inject = ["webServer", "sessionController", "agents", "tools", "connection", "credentials"];
 
 /** Refuse oversized request bodies instead of buffering them. */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -41,15 +40,19 @@ const DELIVERY_TIMEOUT_MS = 30_000;
 /** Only a loopback caller may drive a session by default. */
 const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 
-/** The durable event types this plugin owns. */
+/**
+ * The durable event types this plugin owns.
+ *
+ * These names are used ONLY as labels inside the plugin's own store. They are deliberately NOT written
+ * into the Session log: this harness refuses to read a session log containing an event type it does not
+ * know unless the event carries an `ignorable` marker, and `Session.append` exposes no way to set that
+ * marker, so a custom event written there would make the session permanently unreadable (verified on a
+ * real stop/restart: `session "..." contains event type "collab/notify" ... refusing to interpret the
+ * log`). Plugin state therefore lives in this plugin's own durable store, never in the session log.
+ */
 const EVENT_QUESTION = "collab/question";
 const EVENT_ANSWER = "collab/answer";
 const EVENT_CANCEL = "collab/cancel";
-const EVENT_NOTIFY = "collab/notify";
-const EVENT_CONFIRM = "collab/confirm";
-
-/** The projection key folding those events. */
-const PROJECTION_KEY = "collabQuestions";
 
 export const Config = z.object({
     /** Route prefix. Changing it means changing the caller's URL too. */
@@ -96,6 +99,15 @@ export const Config = z.object({
      * configuration rather than code, and only a validated controller id may become a directory name.
      */
     inboxRoot: z.string().default(""),
+    /**
+     * Root of this plugin's own durable store.
+     *
+     * It cannot be the Session log: this harness refuses to read a log containing an event type it does
+     * not know unless the event carries `ignorable: true`, and `Session.append` cannot set that marker,
+     * so a custom event there makes the session unreadable. Defaults to the inbox root, since the file
+     * inbox is already the durable notification surface the operator approved.
+     */
+    storeRoot: z.string().default(""),
     /** How long a signal may be retained before it becomes prunable. */
     inboxMaxAgeMs: z.number().default(7 * 24 * 60 * 60 * 1000),
     /** How many signals one inbox always keeps, newest first. */
@@ -198,34 +210,29 @@ export function apply(ctx, config) {
     const inboxRoot = typeof config.inboxRoot === "string" && config.inboxRoot.length > 0 ? config.inboxRoot : null;
 
     /**
-     * Confirmed event ids, read from the authoritative session events.
+     * Confirmed event ids, read from the durable store.
      *
-     * Confirmation is recorded as a durable event rather than as a client-supplied list, so every view
-     * (the memory projection, the file inbox, and a view rebuilt after a restart) agrees on what has
-     * been dealt with. Reading it from the log on each call is what makes a confirmation survive a
-     * restart without a second writable truth.
+     * Confirmation is a durable, per-event fact rather than a client-supplied list, so every view (the
+     * memory view, the file inbox, and a process restarted against the same store) agrees on what has
+     * been dealt with, and a controller never has to remember what it already confirmed.
      *
+     * @param {string} [controller] - when given, only that controller's confirmations.
      * @returns {Set<string>} the confirmed event ids.
      */
-    const durableConfirmed = () => {
-        const confirmed = new Set();
+    const durableConfirmed = (controller) => {
         try {
-            // Read through the injected agent registry rather than any other service, so this uses the
-            // same live-Agent view the rest of the bridge does.
-            const live = ctx.agents.list();
-            for (const agent of live) {
-                const events = agent && agent.session && agent.session.snapshotEvents ? agent.session.snapshotEvents() : null;
-                if (!Array.isArray(events)) continue;
-                for (const event of events) {
-                    if (event && event.type === EVENT_CONFIRM && event.data && typeof event.data.signalId === "string") {
-                        confirmed.add(event.data.signalId);
-                    }
-                }
+            if (typeof controller === "string" && controller.length > 0) {
+                return store.confirmationsFor(controller).confirmed;
             }
+            const confirmed = new Set();
+            for (const controller of new Set(bindings.map((entry) => entry.controller))) {
+                for (const id of store.confirmationsFor(controller).confirmed) confirmed.add(id);
+            }
+            return confirmed;
         } catch {
-            // An unreadable log means "nothing known confirmed", never "everything confirmed".
+            // A store that cannot be read means "nothing known confirmed", never "everything confirmed".
+            return new Set();
         }
-        return confirmed;
     };
 
     /**
@@ -331,80 +338,55 @@ export function apply(ctx, config) {
         return published;
     };
 
-    // ---- durable events + projection --------------------------------------------------------
-
-    // Fold this plugin's events into readable state through the shell's own projection seam, rather
-    // than keeping a second writable truth beside the session log.
-    ctx.sessionProjections.register({
-        key: PROJECTION_KEY,
-        stateVersion: 1,
-        // The shell validates persisted state before it seeds a fold, so the schema must describe the
-        // real shape: question id -> the facts folded from this plugin's events.
-        stateSchema: zod.record(zod.string(), zod.object({
-            asked: zod.boolean().optional(),
-            seq: zod.number().nullable().optional(),
-            question: zod.string().optional(),
-            answer: zod.object({
-                id: zod.string(),
-                text: zod.string(),
-                source: zod.string(),
-                controller: zod.string().optional(),
-                at: zod.string().optional()
-            }).optional(),
-            cancel: zod.object({
-                id: zod.string(),
-                reason: zod.string().optional()
-            }).optional()
-        }).passthrough()),
-        init: () => ({}),
-        apply: (state, event) => {
-            if (event.type === EVENT_QUESTION) {
-                const id = event.data && event.data.id;
-                if (typeof id !== "string") return state;
-                return { ...state, [id]: { ...(state[id] ?? {}), asked: true, seq: event.data.seq ?? null, question: event.data.question ?? "" } };
-            }
-            if (event.type === EVENT_ANSWER) {
-                const id = event.data && event.data.id;
-                if (typeof id !== "string") return state;
-                return { ...state, [id]: { ...(state[id] ?? {}), answer: event.data } };
-            }
-            if (event.type === EVENT_CANCEL) {
-                const id = event.data && event.data.id;
-                if (typeof id !== "string") return state;
-                return { ...state, [id]: { ...(state[id] ?? {}), cancel: event.data } };
-            }
-            return state;
-        }
-    });
+    // ---- durable store ------------------------------------------------------------------------
 
     /**
-     * The durable events recorded for one question, read from the Session log.
+     * The plugin's own durable store.
      *
-     * The log is authoritative; the projection above is a convenience view. Reading the events gives
-     * the fold in `collab.js` something real to work on, so the same rules apply to a live question and
-     * to one read back after a restart.
+     * This is the single authoritative place a signal, a question and a confirmation live. It is NOT the
+     * Session log, and that is deliberate: this harness refuses to read a session log containing an event
+     * type outside its generated known set unless the envelope carries `ignorable: true`, while
+     * `Session.append` only accepts `sourceEventSeqs` and `surfaceOp`. Writing a custom event therefore
+     * makes the session permanently unreadable, reproduced on a real stop/restart. Records go here.
+     */
+    const store = new CollabStore(config.storeRoot.length > 0 ? config.storeRoot : inboxRoot ?? "");
+    if (store.available) {
+        const probe = store.probeWritable();
+        if (!probe.ok) ctx.logger.error("codex-bridge: the durable store is not writable (%s); notifications will be refused rather than lost", probe.reason);
+    }
+
+    /**
+     * The recorded states of one question, read from this plugin's own durable store.
+     *
+     * The fold in `collab.js` expects a sequence of typed events; the store keeps one record holding the
+     * question's current facts, which is converted to that same shape so identical rules apply to a live
+     * question and to one read back after a restart.
+     *
+     * @param {string} sessionId - the owning session.
+     * @param {string} questionId - the question.
+     * @returns {ReadonlyArray<object> | null} the events, or null when the store cannot be read.
      */
     const eventsFor = (sessionId, questionId) => {
-        try {
-            const agent = ctx.agents.get(sessionId);
-            if (agent === undefined || agent === null) return null;
-            const events = agent.session.snapshotEvents ? agent.session.snapshotEvents() : null;
-            if (!Array.isArray(events)) return null;
-            return events
-                .filter((event) => event && (event.type === EVENT_QUESTION || event.type === EVENT_ANSWER || event.type === EVENT_CANCEL))
-                .filter((event) => event.data && event.data.id === questionId);
-        } catch {
-            return null;
-        }
+        const meta = registry.get(questionId);
+        const bindingId = meta !== undefined && typeof meta.bindingId === "string" ? meta.bindingId : null;
+        if (bindingId === null) return null;
+        const read = store.getQuestion(bindingId, questionId);
+        if (!read.ok) return null;
+        const record = read.value;
+        if (record === null || typeof record !== "object") return null;
+        const events = [{ type: EVENT_QUESTION, data: record }];
+        if (record.answer !== undefined && record.answer !== null) events.push({ type: EVENT_ANSWER, data: record.answer });
+        if (record.cancel !== undefined && record.cancel !== null) events.push({ type: EVENT_CANCEL, data: record.cancel });
+        return events;
     };
 
     /** @param {string} sessionId - session. @param {string} questionId - question. @returns {object} the folded state. */
     const stateOfQuestion = (sessionId, questionId) => {
         const events = eventsFor(sessionId, questionId);
         if (events === null) {
-            // No live Agent: the question cannot be read from this process, which is not the same as
-            // "pending". Reporting it as unknown keeps a restart from looking like a live question.
-            return { status: "unknown", reason: "session-not-live" };
+            // The question cannot be read from the durable store, which is not the same as "pending".
+            // Reporting it as unknown keeps a missing record from looking like a live question.
+            return { status: "unknown", reason: "question-not-recorded" };
         }
         return questionStateOf(events);
     };
@@ -484,9 +466,27 @@ export function apply(ctx, config) {
             // not merely to a session: two bindings may legitimately raise the same local question id.
             const meta = { sessionId, cwd, seq: sequence, askedAt: new Date().toISOString(), question, bindingId: bound.binding.bindingId, controller: bound.binding.controller };
             registry.set(questionId, meta);
-            // Durable first: the question is recorded before anyone can answer it, so the log is the
-            // record even if this process dies while the tool is still waiting.
-            agent.session.append(EVENT_QUESTION, { id: questionId, seq: sequence, question, bindingId: bound.binding.bindingId, controller: bound.binding.controller, ...(typeof args.detail === "string" ? { detail: args.detail } : {}) });
+            // Durable FIRST, in this plugin's own store: the question is recorded before anyone can answer
+            // it, so the fact survives even if this process dies while the tool is still waiting. It is
+            // deliberately not written to the session log — see the store module for why an out-of-repo
+            // event name would make that log permanently unreadable.
+            const stored = store.putQuestion(bound.binding.bindingId, {
+                id: questionId,
+                seq: sequence,
+                question,
+                bindingId: bound.binding.bindingId,
+                controller: bound.binding.controller,
+                sessionId,
+                cwd,
+                askedAt: meta.askedAt,
+                ...(typeof args.detail === "string" ? { detail: args.detail } : {})
+            });
+            if (!stored.ok) {
+                // A question that cannot be recorded durably must not be asked: the tool would wait for an
+                // answer to a question no restart could find.
+                registry.delete(questionId);
+                return { status: "rejected", questionId: "", reason: `question-not-recorded:${stored.reason}` };
+            }
             // Raise the signal AFTER the durable record, so a controller woken by it can always read the
             // event it refers to. The signal carries identity and a reference, never the question body.
             raiseSignal({
@@ -521,7 +521,13 @@ export function apply(ctx, config) {
                     settle({ status: "interrupted", reason: "answer-timeout" });
                 }, timeoutMs);
                 const onAbort = () => {
-                    try { agent.session.append(EVENT_CANCEL, { id: questionId, reason: "caller-cancelled" }); } catch { /* the log may be gone */ }
+                    try {
+                        // Record the cancellation durably, so a late answer is recognizably too late rather
+                        // than looking like the first answer to a live question.
+                        const current = store.getQuestion(bound.binding.bindingId, questionId);
+                        const record = current.ok && current.value && typeof current.value === "object" ? current.value : { id: questionId };
+                        store.putQuestion(bound.binding.bindingId, { ...record, cancel: { id: questionId, reason: "caller-cancelled", at: new Date().toISOString() } });
+                    } catch { /* the store may be gone; the wait still ends */ }
                     settle({ status: "interrupted", reason: "cancelled" });
                 };
                 if (exec.signal) {
@@ -594,23 +600,15 @@ export function apply(ctx, config) {
         if (!raised.ok) {
             ctx.logger.error("codex-bridge: notification %s could not raise a signal: %s", signalId, raised.reason);
         }
-        // The durable event carries the SAME identity, so a rebuild after a restart reconstructs this
-        // event exactly — including its signalId and cursor — instead of inventing a new identity.
-        agent.append(EVENT_NOTIFY, {
-            signalId,
-            eventId,
-            bindingId: binding.bindingId,
-            controller: binding.controller,
-            sessionId: binding.sessionId,
-            cwd: binding.cwd,
-            kind,
-            seq: record.seq,
-            ...(goalId === undefined ? {} : { goalId }),
-            ...(requestId === undefined ? {} : { requestId }),
-            reference: record.reference,
-            text,
-            at
-        });
+        // Record durably in this plugin's own store FIRST, carrying the same identity a rebuild needs, so
+        // a restarted process reconstructs this exact event — including its signalId and cursor — instead
+        // of inventing a new identity. The session log is deliberately not used; a custom event name
+        // there would make the session permanently unreadable.
+        const stored = store.putSignal({ ...record, text });
+        if (!stored.ok) {
+            ctx.logger.error("codex-bridge: notification %s could not be recorded durably: %s", signalId, stored.reason);
+            return { eventId, signalId, raised, fileError: `signal-not-recorded:${stored.reason}` };
+        }
         return { eventId, signalId, raised, fileError: raised.ok ? raised.fileError : `signal-not-raised:${raised.reason}` };
     };
 
@@ -687,6 +685,80 @@ export function apply(ctx, config) {
             return { ok: true, signalId: produced.signalId };
         }
     }));
+
+    // ---- recovery: rebuild from the durable store ---------------------------------------------
+
+    /**
+     * Rebuild the in-memory view from this plugin's durable store.
+     *
+     * The store is the record and memory is only a cache of it. Without this, a restart left `registry`
+     * and `signals` empty, so `wait-any` could not see events that were still on disk and `answer`
+     * reported an unknown question — the durable facts survived while the plugin behaved as if nothing
+     * had happened. Recovery reads the store back:
+     *
+     *  - signals keep the identity they were recorded with, so an id means the same event after a restart
+     *    as before it;
+     *  - confirmations are subtracted, because a confirmed event is not owed to anyone again;
+     *  - `sequence` resumes above the highest recovered value, so a cursor issued before the restart still
+     *    selects only genuinely newer events instead of re-delivering the whole backlog;
+     *  - questions are restored so a still-unanswered one stays answerable, while an answered or
+     *    cancelled one is not.
+     *
+     * A question whose waiting tool call died with the previous process is NOT resurrected: it stays
+     * readable as pending and the tool reports `interrupted` when it is re-run. Nothing is replayed
+     * automatically, and no fake waiter is created.
+     *
+     * @returns {{signals: number, questions: number, cursor: number}} what was recovered.
+     */
+    const recoverFromEvents = () => {
+        let recoveredCount = 0;
+        let questions = 0;
+        try {
+            if (!store.available) return { signals: 0, questions: 0, cursor: sequence };
+            // Questions first: a question's binding is how the durable record is located later.
+            const storedQuestions = store.allQuestions();
+            for (const record of storedQuestions.questions) {
+                if (record === null || typeof record !== "object" || typeof record.id !== "string") continue;
+                if (registry.has(record.id)) continue;
+                const owned = bindings.find((entry) => entry.bindingId === record.bindingId);
+                if (owned === undefined) continue;
+                registry.set(record.id, {
+                    sessionId: typeof record.sessionId === "string" ? record.sessionId : owned.sessionId,
+                    cwd: typeof record.cwd === "string" ? record.cwd : owned.cwd,
+                    seq: typeof record.seq === "number" ? record.seq : 0,
+                    askedAt: typeof record.askedAt === "string" ? record.askedAt : new Date(0).toISOString(),
+                    question: typeof record.question === "string" ? record.question : "",
+                    bindingId: record.bindingId,
+                    controller: typeof record.controller === "string" ? record.controller : owned.controller
+                });
+                questions += 1;
+            }
+            // Signals, minus what the store records as already confirmed.
+            const stored = store.allSignals();
+            const recovered = recoverSignals(stored.signals, [
+                ...durableConfirmed()
+            ]);
+            for (const signal of recovered.signals) {
+                if (!signals.has(signal.id)) recoveredCount += 1;
+                signals.set(signal.id, signal);
+            }
+            // Resume above everything already recorded, so an old cursor cannot re-deliver the backlog
+            // and a new event is never assigned a sequence that collides with a recovered one.
+            const highestQuestionSeq = [...registry.values()].reduce((max, entry) => Math.max(max, entry.seq ?? 0), 0);
+            sequence = Math.max(sequence, recovered.highestSeq, highestQuestionSeq);
+            if (stored.problems.length > 0) {
+                // A corrupt record is reported, never silently treated as "no event".
+                ctx.logger.warn("codex-bridge: %d unreadable record(s) in the durable store", stored.problems.length);
+            }
+            ctx.logger.info("codex-bridge: recovered %d signal(s) and %d question(s) from the durable store (cursor=%d)",
+                recoveredCount, questions, sequence);
+        } catch (error) {
+            // Recovery failing must not take the host down; the bridge starts with what it has, and an
+            // unreadable question then reports `unknown` rather than a wrong answer.
+            ctx.logger.warn("codex-bridge: recovery from the durable store failed: %s", messageOf(error));
+        }
+        return { signals: recoveredCount, questions, cursor: sequence };
+    };
 
     // ---- real terminal failures become error signals -----------------------------------------
 
@@ -809,6 +881,9 @@ export function apply(ctx, config) {
             send(response, admission.rejection, { error: admission.rejection === 401 ? "unauthorized" : "forbidden" });
             return;
         }
+        // Fold in any durable events this process has not seen yet — including everything recorded before
+        // a restart — so a reader never sees an emptied view while the facts sit in the session log.
+        recoverFromEvents();
 
         const url = new URL(request.url, "http://127.0.0.1");
         const route = url.pathname.slice(collabBase.length) || "/";
@@ -933,17 +1008,19 @@ export function apply(ctx, config) {
                     send(response, 403, { error: "not your event" });
                     return;
                 }
-                // Confirmation is DURABLE: it is written as an event on the owning session, so every view
-                // (memory, files, and a view rebuilt after a restart) agrees and it survives a restart.
-                // It is idempotent by event id, so a repeat is the same outcome.
-                const already = durableConfirmed().has(signalId);
+                // Confirmation is DURABLE in the plugin's own store, so every view (memory, the file
+                // inbox, and a process restarted against the same store) agrees on what has been dealt
+                // with and a controller never has to re-send the list it already confirmed. It is keyed by
+                // event id, so a repeat is the same outcome rather than a second fact.
+                const already = durableConfirmed(controller).has(signalId);
                 if (!already) {
-                    const agent = ctx.agents.get(known.sessionId);
-                    if (agent === undefined || agent === null) {
-                        send(response, 409, { error: "session-not-live", signalId, hint: "the confirmation could not be recorded; retry once the session is live" });
+                    const recorded = store.putConfirmation(controller, signalId, { at: new Date().toISOString(), bindingId: known.bindingId, sessionId: known.sessionId });
+                    if (!recorded.ok) {
+                        // Without a durable record the event would reappear after any restart, so the
+                        // confirmation is refused rather than reported as successful.
+                        send(response, 503, { error: `the confirmation could not be recorded: ${recorded.reason}`, signalId });
                         return;
                     }
-                    agent.session.append(EVENT_CONFIRM, { signalId, controller, at: new Date().toISOString() });
                 }
                 // The file is a projection of the same fact, so removing it is part of the same act; a
                 // failure to remove it is reported but cannot un-confirm the authoritative record.
@@ -1118,21 +1195,27 @@ export function apply(ctx, config) {
                     send(response, 200, { ok: true, idempotent: true, questionId, answer: state.answer });
                     return;
                 }
-                const agent = ctx.agents.get(meta.sessionId);
-                if (agent === undefined || agent === null) {
-                    // The Session is no longer live in this process: record nothing and tell the
-                    // controller to resume by identity rather than pretend the answer landed.
-                    send(response, 409, { error: "session-not-live", questionId, hint: "the question stays readable; resume it in a session that owns this id" });
+                // Record the answer durably FIRST: the answer is the terminal fact for this question, so it
+                // must not be observable only through a live in-memory waiter. If it cannot be recorded,
+                // the answer is refused rather than acknowledged.
+                const current = store.getQuestion(matched.binding.bindingId, questionId);
+                const record = current.ok && current.value && typeof current.value === "object" ? current.value : { id: questionId, seq: meta.seq, sessionId: meta.sessionId, cwd: meta.cwd, bindingId: meta.bindingId, controller: matched.binding.controller, question: meta.question, askedAt: meta.askedAt };
+                const answerRecord = { id: questionId, text, source, controller: matched.binding.controller, at: new Date().toISOString() };
+                const written = store.putQuestion(matched.binding.bindingId, { ...record, answer: answerRecord });
+                if (!written.ok) {
+                    send(response, 503, { error: `the answer could not be recorded: ${written.reason}`, questionId });
                     return;
                 }
-                agent.session.append(EVENT_ANSWER, { id: questionId, text, source, controller: matched.binding.controller, at: new Date().toISOString() });
                 const waiter = waiters.get(questionId);
                 if (waiter !== undefined) {
                     // Resume the SAME tool call. Nothing already executed is replayed: the loop simply
                     // receives the tool result it was waiting for.
                     waiter.settle({ status: "answered", answer: text, source });
                 }
-                send(response, 200, { ok: true, questionId, delivered: waiter !== undefined, answer: { text, source } });
+                // A tool cannot be resumed across a restart, so an answer to a question whose waiter died
+                // with the previous process is still recorded and reported as NOT delivered, which tells
+                // the controller the truth instead of implying a continuation that did not happen.
+                send(response, 200, { ok: true, questionId, delivered: waiter !== undefined, answer: { text, source }, ...(waiter === undefined ? { note: "recorded; no live waiting tool call in this process" } : {}) });
                 return;
             }
 

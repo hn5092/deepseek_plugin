@@ -22,6 +22,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { safeFileName } from "./store.js";
 
 /** Only these characters may appear in a controller's directory name, so a controller cannot escape. */
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -63,8 +64,11 @@ export function publishSignal(dir, signal) {
     if (Buffer.byteLength(text, "utf8") > MAX_SIGNAL_BYTES) return { ok: false, reason: "signal too large for the inbox" };
     try {
         fs.mkdirSync(dir, { recursive: true });
-        const finalName = `${signal.id}.json`;
-        const tempName = `.${signal.id}.${randomUUID()}.tmp`;
+        // The id is encoded with the SAME injective mapping the durable store uses: an id such as
+        // `sig-notify-codex::1-...` contains `:`, which Windows reads as an alternate-data-stream
+        // separator, so using the raw id here would fail with a misleading ENOENT.
+        const finalName = `${safeFileName(signal.id)}.json`;
+        const tempName = `.${safeFileName(signal.id)}.${randomUUID()}.tmp`;
         const tempPath = path.join(dir, tempName);
         const finalPath = path.join(dir, finalName);
         fs.writeFileSync(tempPath, text, { encoding: "utf8", flag: "wx" });
@@ -127,9 +131,14 @@ export function readSignals(dir) {
  * @returns {{ok: true, removed: boolean}} whether a file was removed.
  */
 export function confirmSignal(dir, signalId) {
-    if (typeof signalId !== "string" || !SAFE_SEGMENT.test(signalId)) return { ok: true, removed: false };
+    // The id is only ever turned into a FILE NAME through the shared encoder, so it does not need to
+    // satisfy the stricter directory-id pattern — an id containing `:` is perfectly valid and common
+    // (`sig-notify-codex::1-...`), and rejecting it here would silently leave the event unconfirmed.
+    if (typeof signalId !== "string" || signalId.length === 0) return { ok: true, removed: false };
     try {
-        fs.rmSync(path.join(dir, `${signalId}.json`), { force: true });
+        const file = path.join(dir, `${safeFileName(signalId)}.json`);
+        if (!fs.existsSync(file)) return { ok: true, removed: false };
+        fs.rmSync(file, { force: true });
         return { ok: true, removed: true };
     } catch {
         return { ok: true, removed: false };

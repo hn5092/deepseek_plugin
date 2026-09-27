@@ -50,12 +50,15 @@ async function freePort() {
  * @param {{question?: string}|null} [options.scripted] - when set, also load the scripted provider plugin.
  * @param {string|null} [options.inboxRoot] - file-signal inbox root; null leaves it unconfigured.
  * @param {ReadonlyArray<{controller: string, tokenRef: string, token: string}>} [options.controllerTokens] - test controller credentials.
+ * @param {string} [options.home] - reuse an existing DSH home so a restart shares durable state.
  * @returns {Promise<object>} the instance handle.
  */
-export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = 90_000, scripted = null, inboxRoot = null, controllerTokens = [] }) {
+export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = 90_000, scripted = null, inboxRoot = null, controllerTokens = [], home: reuseHome = undefined }) {
     const port = await freePort();
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "collab-instance-"));
-    const home = path.join(workDir, "home");
+    // A restart keeps the CALLER-provided home so durable sessions live across both processes, while the
+    // per-run scratch directory (plugin copy, overlay, log) stays disposable.
+    const home = typeof reuseHome === "string" && reuseHome.length > 0 ? reuseHome : path.join(workDir, "home");
     const profileModules = path.join(home, "profiles", "node_modules");
     const logFile = path.join(workDir, "instance.log");
     fs.mkdirSync(profileModules, { recursive: true });
