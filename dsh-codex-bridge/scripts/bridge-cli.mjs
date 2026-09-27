@@ -20,10 +20,19 @@
  *   node bridge-cli.mjs health
  *   node bridge-cli.mjs bindings   --token-ref REF --controller NAME
  *   node bridge-cli.mjs questions  --token-ref REF --controller NAME --session ID
+ *   node bridge-cli.mjs bind       --token-ref REF --controller NAME --session ID --cwd DIR [--binding-id B]
+ *   node bridge-cli.mjs unbind     --token-ref REF --controller NAME --binding-id B
+ *   node bridge-cli.mjs replace    --token-ref REF --controller NAME --session ID --cwd DIR --retire B [--binding-id B2]
  *   node bridge-cli.mjs wait-any   --token-ref REF --controller NAME [--wait-ms N] [--since N] [--acknowledged ID,ID]
  *   node bridge-cli.mjs answer     --token-ref REF --controller NAME --question ID --text-file FILE
  *   node bridge-cli.mjs confirm    --token-ref REF --controller NAME --signal ID
  *   node bridge-cli.mjs notify     --token-ref REF --controller NAME --session ID --kind delivery|error [--text-file FILE] [--goal-id G] [--request-id R] [--issued-at ISO]
+ *
+ * `bind`, `unbind` and `replace` change ONE controller's own bindings while the bridge keeps running, so a
+ * question another controller is currently waiting on is NOT interrupted. The change is persisted to the
+ * profile, so it also survives a restart. `replace` adds the new binding first and retires the old one
+ * only after the add succeeded. `unbind` is refused while that binding still has pending work, so an
+ * in-flight question is never silently cancelled.
  *
  * Exit codes: 0 the command succeeded, 1 the command was rejected or failed, 2 the invocation was wrong.
  *
@@ -208,6 +217,70 @@ async function main() {
         const result = await control({ url, cookie, base, token, method: "GET", route: `/questions?${query}` });
         process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
         return result.status === 200 ? 0 : 1;
+    }
+
+    if (command === "bind") {
+        // Add ONE binding for this controller, WITHOUT reloading the plugin: any question another
+        // controller is currently waiting on keeps waiting. The controller is taken from the credential by
+        // the server; the value sent here is only a claim that must agree with it.
+        const sessionId = options.get("session");
+        const cwd = options.get("cwd");
+        if (!sessionId) throw new Error("--session is required");
+        if (!cwd) throw new Error("--cwd is required (the session's REAL working directory)");
+        const result = await control({
+            url, cookie, base, token, method: "POST", route: "/bindings/bind",
+            body: {
+                sessionId,
+                cwd,
+                controller,
+                tokenRef,
+                ...(options.has("binding-id") ? { bindingId: options.get("binding-id") } : {})
+            }
+        });
+        process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
+        return result.status === 200 ? 0 : 1;
+    }
+
+    if (command === "unbind") {
+        // Retire one of THIS controller's bindings. Refused while that binding still has pending work, so
+        // an in-flight question is never silently cancelled by a binding change.
+        const bindingId = options.get("binding-id");
+        if (!bindingId) throw new Error("--binding-id is required");
+        const result = await control({
+            url, cookie, base, token, method: "POST", route: "/bindings/unbind",
+            body: { bindingId, controller }
+        });
+        process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
+        return result.status === 200 ? 0 : 1;
+    }
+
+    if (command === "replace") {
+        // Add the new binding FIRST and only then retire the old one. Ordering matters: if the add fails
+        // (a bad cwd, a session that is not live), nothing has been removed and the controller still has a
+        // working binding, so a failed replacement never leaves it unable to answer.
+        const sessionId = options.get("session");
+        const cwd = options.get("cwd");
+        const retire = options.get("retire");
+        if (!sessionId) throw new Error("--session is required");
+        if (!cwd) throw new Error("--cwd is required (the session's REAL working directory)");
+        if (!retire) throw new Error("--retire is required (the bindingId to retire once the new one is live)");
+        const added = await control({
+            url, cookie, base, token, method: "POST", route: "/bindings/bind",
+            body: { sessionId, cwd, controller, tokenRef, ...(options.has("binding-id") ? { bindingId: options.get("binding-id") } : {}) }
+        });
+        if (added.status !== 200) {
+            // The new binding did not take effect, so the old one is deliberately LEFT ALONE.
+            process.stdout.write(`${JSON.stringify({ step: "bind", failed: true, ...added.body }, null, 2)}\n`);
+            return 1;
+        }
+        const removed = await control({
+            url, cookie, base, token, method: "POST", route: "/bindings/unbind",
+            body: { bindingId: retire, controller }
+        });
+        process.stdout.write(`${JSON.stringify({ step: "replace", added: added.body, retired: removed.body }, null, 2)}\n`);
+        // A failure to RETIRE is reported as its own outcome: the new binding is live and usable, and the
+        // old one is still declared, which the caller must know rather than be told a tidy "replaced".
+        return removed.status === 200 ? 0 : 1;
     }
 
     if (command === "wait-any") {

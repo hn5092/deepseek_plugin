@@ -43,6 +43,12 @@ storeRoot: C:/Users/Administrator/.dsh/codex-bridge/store
 # Two bindings claiming the SAME session as a live owner are refused: a session has exactly one answer
 # owner. The plugin also refuses to activate when a session's real directory does not match the `cwd`
 # recorded here, which is what stops a binding from answering for the wrong project.
+#
+# This list can be changed WHILE THE PLUGIN RUNS, without a reload, through
+# `POST {collabPath}/bindings/bind` and `/bindings/unbind` (CLI: `bind`, `unbind`, `replace`). The field is
+# volatile, so the Loader commits a new value into the running instance instead of remounting it, and an
+# in-flight question — including one belonging to another controller — is not interrupted. The change is
+# persisted to this file through the shell's own config editor, so it also survives a restart.
 bindings:
   - bindingId: codex::example
     sessionId: session-example

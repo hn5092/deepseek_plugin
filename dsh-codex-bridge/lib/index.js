@@ -12,7 +12,8 @@ import {
     matchBinding,
     normalizeBinding,
     pendingQuestions,
-    questionStateOf
+    questionStateOf,
+    sameDirectory
 } from "./collab.js";
 import { deliverableSignals, waitOutcome } from "./signals.js";
 import { inboxDirFor, readSignals } from "./inbox.js";
@@ -26,10 +27,12 @@ export const name = "codex-bridge";
  *
  * `tools` registers the model-facing tools; `connection` supplies the shell's real admission fence;
  * `credentials` resolves each controller's credential REFERENCE to its value (the bridge stores no
- * secret itself); `sessionController`/`agents` keep message delivery and live-session lookup working.
+ * secret itself); `sessionController`/`agents` keep message delivery and live-session lookup working;
+ * `configEditor` is the shell's OWN owner for persisting plugin configuration, used so a binding can be
+ * added or retired at runtime without this plugin inventing a second, writable binding store.
  * Every service read here is declared, because Cordis throws on an undeclared access.
  */
-export const inject = ["webServer", "sessionController", "agents", "tools", "connection", "credentials"];
+export const inject = ["webServer", "sessionController", "agents", "tools", "connection", "credentials", "configEditor"];
 
 /** Refuse oversized request bodies instead of buffering them. */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -73,6 +76,14 @@ export const Config = z.object({
      * title or from which window happens to be open. One controller may own MANY bindings across
      * different directories — the (controller, sessionId) pair is the identity, so sessions in
      * different projects are never merged into one.
+     *
+     * This list is VOLATILE on purpose. A controller that starts a new session must be able to add or
+     * retire one binding WITHOUT the plugin being torn down and re-applied, because a remount would
+     * abandon every in-flight question — including other controllers' pending questions, which are not
+     * this controller's to interrupt. A volatile field is committed into the running instance by the
+     * Loader instead of triggering a restart, so the change takes effect live and in-flight work
+     * survives. The on-disk configuration is still the one authority: the value is written through the
+     * shell's own config editor, and this instance reads the committed value.
      */
     bindings: z.array(z.object({
         bindingId: z.string(),
@@ -86,7 +97,7 @@ export const Config = z.object({
         tokenRef: z.string(),
         /** False marks a binding superseded by a handover, so an old owner can no longer answer. */
         current: z.boolean().default(true)
-    })).default([]),
+    })).default([]).volatile(),
     /**
      * Default bound on how long an ask waits for a controller before returning `interrupted`.
      * A bounded wait is deliberate: a tool call must never pin a turn forever.
@@ -197,25 +208,65 @@ export function apply(ctx, config) {
         throw new Error(`codex-bridge: refusing to start: ${retentionCheck.reason}`);
     }
 
-    /** Declared bindings, validated once at startup so a typo cannot silently widen access. */
-    const bindings = [];
-    for (const raw of config.bindings || []) {
-        const normalized = normalizeBinding(raw);
-        if (normalized.ok) bindings.push(normalized.binding);
-        else ctx.logger.warn("codex-bridge: ignoring invalid binding (%s): %o", normalized.reason, raw);
-    }
-    // One session may have exactly one effective answer owner. Two owners would make an answer
-    // ambiguous and could produce two terminal outcomes for one tool call, so an ambiguous session is
-    // refused outright — its bindings are dropped, leaving it with NO answer owner rather than two. A
-    // handover is expressed by marking the predecessor `current: false`.
-    const ownership = assertSingleOwner(bindings);
-    if (!ownership.ok) {
-        const ambiguous = ownership.sessionId;
-        ctx.logger.error("codex-bridge: %s; refusing every binding for that session", ownership.reason);
-        for (let i = bindings.length - 1; i >= 0; i -= 1) {
-            if (bindings[i].sessionId === ambiguous) bindings.splice(i, 1);
+    /**
+     * The declared bindings, as a LIVE value.
+     *
+     * The config field is volatile, so the Loader commits a new list into this same instance rather than
+     * remounting the plugin. Everything below therefore reads through `currentBindings()` instead of
+     * closing over a snapshot taken at apply time — otherwise a newly bound session would be written to
+     * disk and still be invisible to the running instance.
+     */
+    const currentBindings = () => {
+        const raw = config.bindings;
+        // A volatile field arrives as a reference with a `get()`; an ordinary one arrives as the value.
+        const list = raw && typeof raw.get === "function" ? raw.get() : raw;
+        return Array.isArray(list) ? list : [];
+    };
+
+    /**
+     * The effective bindings, rebuilt whenever the configuration changes.
+     *
+     * `let` rather than `const` is the whole point: the volatile update commits a new list into THIS
+     * instance, so the binding set has to be re-derived in place. Every caller below reads `bindings` at
+     * call time, so reassigning here is what makes an incrementally added binding visible to the tools and
+     * the routes without a remount.
+     */
+    let bindings = [];
+    const rebuildBindings = () => {
+        const next = [];
+        for (const raw of currentBindings()) {
+            const normalized = normalizeBinding(raw);
+            if (normalized.ok) next.push(normalized.binding);
+            else ctx.logger.warn("codex-bridge: ignoring invalid binding (%s): %o", normalized.reason, raw);
         }
-    }
+        // One session may have exactly one effective answer owner. Two owners would make an answer
+        // ambiguous and could produce two terminal outcomes for one tool call, so an ambiguous session is
+        // refused outright — its bindings are dropped, leaving it with NO answer owner rather than two. A
+        // handover is expressed by marking the predecessor `current: false`.
+        const ownership = assertSingleOwner(next);
+        if (!ownership.ok) {
+            ctx.logger.error("codex-bridge: %s; refusing every binding for that session", ownership.reason);
+            for (let i = next.length - 1; i >= 0; i -= 1) {
+                if (next[i].sessionId === ownership.sessionId) next.splice(i, 1);
+            }
+        }
+        bindings = next;
+        return bindings;
+    };
+    rebuildBindings();
+
+    // A volatile config change is delivered as an event on the owning fiber. Rebuilding here is what
+    // carries an incremental bind/unbind into the running plugin, and it deliberately does NOT touch any
+    // waiter: in-flight questions belong to whoever asked them and are not this change's to interrupt.
+    ctx.on("loader/volatile-update", (paths) => {
+        if (!Array.isArray(paths) || !paths.some((entry) => Array.isArray(entry) && entry[0] === "bindings")) return;
+        rebuildBindings();
+        // A binding may name a credential reference this instance has not seen yet, so the cache is
+        // refreshed from the live list. The resolution is asynchronous but nothing waits on it: a request
+        // that arrives first is simply refused as unauthenticated, which is the safe direction.
+        void loadControllerSecrets();
+        ctx.logger.info("codex-bridge: bindings updated live (%d declared)", bindings.length);
+    });
 
     /**
      * The collaboration state owner.
@@ -953,6 +1004,158 @@ export function apply(ctx, config) {
                     return;
                 }
                 send(response, 200, { bindings: bindingsOf(bindings, controller) });
+                return;
+            }
+
+            // ---- incremental binding, WITHOUT remounting the plugin --------------------------------
+            //
+            // A controller that starts a new session needs its binding added, and a controller that has
+            // retired a session needs it gone. Doing that by editing the profile and reloading the plugin
+            // would tear the plugin down and abandon every in-flight question — including OTHER
+            // controllers' pending questions, which this change has no business interrupting. Both routes
+            // therefore persist through the shell's own config editor, whose volatile commit reaches THIS
+            // running instance without a restart.
+            if (request.method === "POST" && (route === "/bindings/bind" || route === "/bindings/unbind")) {
+                const body = await readBody(request);
+                if (body === null) { send(response, 413, { error: "request body too large" }); return; }
+                let parsed;
+                try { parsed = JSON.parse(body.length === 0 ? "{}" : body); }
+                catch { send(response, 400, { error: "body must be JSON" }); return; }
+                // The credential already resolved the controller; a stated name must agree with it. Identity
+                // is NEVER taken from the body, so a caller cannot act as another controller by asking.
+                if (!claimAgrees(parsed.controller)) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
+                const acting = controller;
+
+                /** Persist a new declared-binding list through the shell's config owner. */
+                const persist = async (nextRaw) => {
+                    const entry = ctx.fiber && ctx.fiber.entry ? ctx.fiber.entry : null;
+                    if (entry === null || typeof ctx.configEditor?.edit !== "function") {
+                        return { ok: false, reason: "the configuration owner is unavailable, so the change cannot be persisted" };
+                    }
+                    try {
+                        // Only THIS plugin's row is edited; the editor derives the next raw config from the
+                        // current one, so other plugins' rows and every unrelated field are carried through
+                        // untouched.
+                        await ctx.configEditor.edit(entry, (current) => ({ ...current, bindings: nextRaw }));
+                        return { ok: true };
+                    } catch (error) {
+                        const reason = messageOf(error);
+                        // The shell refuses to persist when a HOME PATCH or command-line overlay owns this
+                        // plugin's effective configuration: the profile file would no longer be what the
+                        // Loader reads, so writing it would silently do nothing. That is a real deployment
+                        // constraint rather than a transient failure, and the caller is told which one it is
+                        // instead of receiving a bare error.
+                        if (/overridden by a home patch or command-line overlay/.test(reason)) {
+                            return { ok: false, reason: "configuration-overridden", detail: reason };
+                        }
+                        return { ok: false, reason };
+                    }
+                };
+
+                if (route === "/bindings/bind") {
+                    const candidate = {
+                        bindingId: typeof parsed.bindingId === "string" ? parsed.bindingId : undefined,
+                        sessionId: typeof parsed.sessionId === "string" ? parsed.sessionId : undefined,
+                        cwd: typeof parsed.cwd === "string" ? parsed.cwd : undefined,
+                        // The controller is the AUTHENTICATED one, never the one in the body.
+                        controller: acting,
+                        tokenRef: typeof parsed.tokenRef === "string" ? parsed.tokenRef : undefined,
+                        current: true
+                    };
+                    const normalized = normalizeBinding(candidate);
+                    if (!normalized.ok) { send(response, 400, { error: normalized.reason }); return; }
+                    const added = normalized.binding;
+
+                    // The session must really exist AND its actual directory must be the one declared. A
+                    // binding whose cwd is merely well-formed would answer for the wrong project.
+                    if (typeof parsed.tokenRef !== "string" || parsed.tokenRef.trim().length === 0) {
+                        send(response, 400, { error: "binding requires a tokenRef so this controller can be authenticated" });
+                        return;
+                    }
+                    const live = ctx.agents && typeof ctx.agents.get === "function" ? ctx.agents.get(added.sessionId) : null;
+                    if (live === null || live === undefined) {
+                        send(response, 404, { error: "session-not-live", sessionId: added.sessionId, hint: "a binding may only be added for a session the shell currently knows" });
+                        return;
+                    }
+                    const actualCwd = live.session && live.session.header && typeof live.session.header.cwd === "string" ? live.session.header.cwd : "";
+                    if (actualCwd.length === 0 || !sameDirectory(actualCwd, added.cwd)) {
+                        send(response, 409, { error: "cwd-does-not-match-the-session", sessionId: added.sessionId, expected: added.cwd });
+                        return;
+                    }
+
+                    const mine = bindingsOf(bindings, acting);
+                    // Re-adding the same binding is idempotent rather than an error: a retry after a lost
+                    // response must not be told it is doing something wrong.
+                    const same = mine.find((entry) => entry.bindingId === added.bindingId);
+                    if (same !== undefined && same.sessionId === added.sessionId && same.cwd === added.cwd && same.tokenRef === added.tokenRef) {
+                        send(response, 200, { ok: true, idempotent: true, binding: same });
+                        return;
+                    }
+                    if (mine.some((entry) => entry.bindingId === added.bindingId)) {
+                        send(response, 409, { error: "binding-id-already-declared", bindingId: added.bindingId });
+                        return;
+                    }
+                    // A session may have exactly ONE current owner. Claiming a session that another live
+                    // binding already owns is refused rather than silently taking it over.
+                    const owners = bindings.filter((entry) => entry.sessionId === added.sessionId && entry.current !== false);
+                    if (owners.length > 0) {
+                        send(response, 409, { error: "session-already-has-an-answer-owner", sessionId: added.sessionId, owner: owners[0].controller });
+                        return;
+                    }
+
+                    // The new declaration is THIS controller's bindings plus everything else, unchanged.
+                    const nextRaw = [...currentBindings(), { bindingId: added.bindingId, sessionId: added.sessionId, cwd: added.cwd, controller: acting, tokenRef: added.tokenRef, current: true }];
+                    const written = await persist(nextRaw);
+                    if (!written.ok) { send(response, written.reason === "configuration-overridden" ? 409 : 500, { error: `the binding could not be persisted: ${written.reason}`, ...(written.detail === undefined ? {} : { detail: written.detail, hint: "this deployment owns the plugin config from a home patch or a command-line overlay, so it must be changed there" }) }); return; }
+                    // The volatile commit may land just after the editor resolves; the reply is about what was
+                    // PERSISTED, and the effective set is re-derived on the update event.
+                    send(response, 200, { ok: true, binding: added, declared: nextRaw.length });
+                    return;
+                }
+
+                // unbind
+                const targetId = typeof parsed.bindingId === "string" ? parsed.bindingId.trim() : "";
+                if (targetId.length === 0) { send(response, 400, { error: "bindingId is required" }); return; }
+                const mine = bindingsOf(bindings, acting);
+                const target = mine.find((entry) => entry.bindingId === targetId);
+                if (target === undefined) {
+                    // Not this controller's binding. The same answer is given whether it belongs to someone
+                    // else or does not exist, so the endpoint cannot be used to probe another's bindings.
+                    send(response, 403, { error: "not your binding", bindingId: targetId });
+                    return;
+                }
+
+                // Refuse while the binding still has live work. Removing it would strand a question whose
+                // asker is waiting, and silently cancelling someone's in-flight business is exactly what
+                // this endpoint must not do.
+                const pending = pendingQuestions(listForBinding(target), undefined);
+                if (pending.length > 0) {
+                    send(response, 409, { error: "binding-has-pending-questions", bindingId: targetId, pending: pending.length, hint: "answer or let them expire before unbinding" });
+                    return;
+                }
+                const stillRunning = agentIsRunning(target.sessionId);
+                if (stillRunning.running === true) {
+                    send(response, 409, { error: "session-is-running", bindingId: targetId, hint: "unbinding would abandon the turn in progress" });
+                    return;
+                }
+
+                // Only this binding is dropped; every other row — this controller's and other controllers'
+                // — is carried through verbatim.
+                const nextRaw = currentBindings().filter((entry, index) => {
+                    const normalized = normalizeBinding(entry);
+                    if (!normalized.ok) return true;
+                    return !(normalized.binding.controller === acting && normalized.binding.bindingId === targetId);
+                });
+                if (nextRaw.length === currentBindings().length) {
+                    send(response, 409, { error: "binding-not-removable", bindingId: targetId, hint: "the declared row could not be identified unambiguously" });
+                    return;
+                }
+                const written = await persist(nextRaw);
+                if (!written.ok) { send(response, written.reason === "configuration-overridden" ? 409 : 500, { error: `the change could not be persisted: ${written.reason}`, ...(written.detail === undefined ? {} : { detail: written.detail, hint: "this deployment owns the plugin config from a home patch or a command-line overlay, so it must be changed there" }) }); return; }
+                send(response, 200, { ok: true, removed: targetId, declared: nextRaw.length });
                 return;
             }
 

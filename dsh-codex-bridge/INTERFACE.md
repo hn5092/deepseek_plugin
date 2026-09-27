@@ -1,6 +1,6 @@
 # dsh-codex-bridge：DS↔Codex 双向协作桥
 
-状态：**隔离实例全部验收 GREEN（17 套 360/360，全部 EXIT=0）；未安装主实例、未重启、未推送。**
+状态：**隔离实例全部验收 GREEN（18 套 401/401，全部 EXIT=0）；未安装主实例、未重启、未推送。**
 作者源码：`D:\workspace\_tools\deepseek_plugin\dsh-codex-bridge\`（唯一）。
 
 ## 零之一、重试合同（所有入口同一语义）
@@ -123,6 +123,23 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 | GET | `/wait-any?controller=&waitMs=&since=&maxBatch=&acknowledged=` | **跨该控制方所有绑定**等待，任一事件（**含 delivery**）即返回；有界批次 + cursor |
 | GET | `/signals/files?controller=` | **文件收件箱**投影（每事件一文件） |
 | POST | `/signals/confirm` | `{controller,signalId}` 确认（与投递分离、按事件独立、幂等） |
+| POST | `/bindings/bind` | **运行中增量**加一条**自己的**绑定：`{sessionId,cwd,controller,tokenRef,bindingId?}`；session 必须存活且 **cwd 与真实目录一致** |
+| POST | `/bindings/unbind` | **运行中增量**移除一条**自己的**绑定：`{bindingId,controller}`；**该绑定有待答问题或会话在跑 ⇒ 拒绝** |
+
+### 运行中换绑定（**不 dispose、不中断他人**）
+
+- 换会话**不再需要改整个 profile 并重载**。`bindings` 在 schema 中声明为 **volatile**，配置变更由 Loader
+  **提交进正在运行的实例**，因此**在途 ask（含其它控制方的 pending 问题）不被中断**。
+- 持久化走**宿主自己的配置 owner** `ctx.configEditor.edit(entry, ...)`：只改**本插件这一行**，
+  其它插件行与无关字段逐字保留；**不新增第二份可写绑定表**（profile 配置仍是唯一权威）。
+- **安全**：身份取自 `x-controller-token`，自报 `controller` 必须一致；只能增删**自己的**绑定；
+  非法 cwd / session 不存活 / 抢他人 session / 动他人绑定 **一律拒绝且不改变任何绑定**。
+- **不隐式 cancel**：`unbind` 在该绑定仍有**待答问题**或**会话正在跑**时拒绝；要退绑定先让工作结束。
+- **失败可恢复**：持久化失败**如实返回错误**（不谎报成功）；`replace` **先加新绑定、成功后再退旧的**，
+  加失败则旧绑定**原样保留**。
+- **准确限制**：若该插件的配置被 **home patch 或命令行 `--patch` overlay** 覆盖（`configEditor` 会拒绝写
+  profile，因为那时 profile 已不是 Loader 真正读的层），接口返回 **409 `configuration-overridden`** 及原因，
+  **不静默无效、不谎报已存**。此时应改那个覆盖层，或改为 profile-owned 部署。
 
 ### DS 侧工具
 `ask_codex({question, detail?, timeoutMs?})` → `{status, answer?, source?, questionId, reason?}`。
@@ -204,7 +221,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
   `<home>/.credentials.yaml` 或环境解析，**不进命令行、不打印**（实测断言）。
 - 配置示例见 `bridge-config.example.yml`（**只含引用**，无任何密钥值）。
 
-## 四、验收（全部实测，`EXIT=0`，合计 360/360）
+## 四、验收（全部实测，`EXIT=0`，合计 401/401）
 
 `node scripts/<suite>.test.mjs`：
 
@@ -227,6 +244,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
 | **`collab-hotload`** | **11/11** | **热加载实测**：启动时无插件（404）→ 只改 profile patch → **同一 PID**（无重启）内路由 200、**既有 session 与历史仍在**、绑定/notify/signals/wait 全可用；`--patch` 启动参数文件**不会**热加载（准确限制） |
 | **`collab-ops`** | **25/25** | **消费与运维**：CLI health/bindings/真实 ask→wait-any→answer→**同 tool 继续**/confirm/notify；**不误吞另一会话**；**空截止到达且无输出、无模型调用**；**凭据不出现在任何输出**；安装精确提交（其它插件行保留、不含 tests）→ 健康 → 回滚**逐字节还原** |
 | **`collab-upgrade`** | **33/33** | **升级真实反例**：先装**旧单向桥**→启动宿主→换新 artifact 触发重载 ⇒ **已 import 的模块不换**（collab 仍 404），而 **patch 层确实重载**（移行即 404）、session 与进程身份保留；**健康门**拒匿名旧 200、要求 collab 路由+bindings；**回滚绑定本插件收据**（只移本块、恢复收据记录的旧 artifact、**并发改同块即拒绝**、无收据拒绝猜测）|
+| **`collab-livebind`** | **41/41** | **运行中增量绑定**：B 的**真实在途 ask** 等待时 A 增量绑定新 session ⇒ **B 原问题仍可答、原工具恰好继续一次**、A 新 session 真实 ask/wait/answer 通；**PID 不变**；非法 cwd/不存活 session/抢他人/动他人绑定**全拒绝且不改绑定**；**unbind 有待答问题即拒绝（不隐式 cancel）**；已退绑定不能代答而其**历史保留**；换绑定**已持久化**；**overlay 部署返回 409 configuration-overridden 且不谎报已存** |
 另需 `scripts/isolated-instance.mjs`（可丢弃或 caller-owned home + `--patch` overlay，**真 SIGTERM → 等退出 →
 有界 SIGKILL → 复核**的 stop，**回收本次自有孙进程**，失败日志复制到 caller 指定的证据目录，并导出
 `stopIsClean()` 供各套件共用同一收据判定）与 `scripts/scripted-model/`

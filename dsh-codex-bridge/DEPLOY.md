@@ -93,7 +93,35 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Install-CodexBridge.
 - 旧 artifact 一直保留在上述归档目录，需要时可手工换回。脚本**不删除未知目录**，
   且移动/递归删除前会校验路径位于 profile 的 `node_modules` 或本次 stage 内。
 
-## 五、两个控制方（Codex）怎么用
+## 五、运行中换会话绑定（**不重启、不中断他人**）
+
+新 DS 会话开始后**不要**再改整个 profile 重载 —— 那会 **dispose 本插件并中断所有在途 ask**，
+包括**其它控制方**正在等待的问题。用增量入口：
+
+```powershell
+# 加一条自己的绑定（session 必须存活，且 --cwd 是它的真实目录）
+node dsh-codex-bridge\scripts\bridge-cli.mjs bind --url-file <launch-url-file> `
+  --token-ref <你的tokenRef> --controller codex --session <新sessionId> --cwd <真实目录>
+
+# 换绑：先加新的，成功后再退旧的（加失败则旧绑定原样保留）
+node dsh-codex-bridge\scripts\bridge-cli.mjs replace --url-file <launch-url-file> `
+  --token-ref <你的tokenRef> --controller codex --session <新sessionId> --cwd <真实目录> --retire <旧bindingId>
+
+# 退掉一条（该绑定仍有待答问题或会话在跑时会拒绝）
+node dsh-codex-bridge\scripts\bridge-cli.mjs unbind --url-file <launch-url-file> `
+  --token-ref <你的tokenRef> --controller codex --binding-id <bindingId>
+```
+
+- **他人不受影响**：变更只改**本插件的一行**、只动**你自己的绑定**；其它控制方的绑定与**活 waiter 保留**。
+- **不隐式 cancel**：有待答问题时 `unbind` 返回 409，**不会**替你取消正在做的业务。
+- **已持久化**：变更写进 profile，**重启后仍在**；不会"显示成功而重启丢绑定"。
+- **越权拒绝**：身份来自凭据；非法 cwd、session 不存活、抢他人 session、动他人绑定都拒绝且**不改任何绑定**。
+
+> **注意**：若该插件的配置被 **home patch 或命令行 `--patch` overlay** 覆盖，`bind`/`unbind` 会返回
+> **409 `configuration-overridden`** —— 宿主不允许写 profile，因为那时 profile 已不是 Loader 真正读的层。
+> 本机主实例用 **profile patch**（无 `--patch`），可直接使用；若换成 overlay 部署，需改那个 overlay 文件。
+
+## 六、两个控制方（Codex）怎么用
 
 两侧都用同一套接口，只是 `controller` 名与 `tokenRef` 不同。**每次调用只做三件事**：
 
