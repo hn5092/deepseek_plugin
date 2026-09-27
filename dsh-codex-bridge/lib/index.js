@@ -298,12 +298,19 @@ export function apply(ctx, config) {
         const candidate = { ...normalized.signal, seq: sequence + 1 };
         const verdict = signalVerdict(signals.get(candidate.id) ?? null, candidate);
         if (verdict.action === "conflict") return { ok: false, reason: verdict.reason };
-        // A repeat of the SAME identity adds no second event. Its file may still need republishing if an
-        // earlier write failed, but that must never create another business event.
+        // A repeat of the SAME identity adds no second event. Its durable record and its file may still
+        // need rewriting if an earlier write failed, but that must never create another business event.
         if (verdict.action === "same") {
             const known = signals.get(candidate.id);
+            const persisted = store.putSignal(known);
             const republish = republishSignal(known);
-            return { ok: true, signal: known, duplicate: true, ...(republish.ok ? {} : { fileError: republish.reason }) };
+            return {
+                ok: true,
+                signal: known,
+                duplicate: true,
+                ...(persisted.ok ? {} : { fileError: `signal-not-recorded:${persisted.reason}` }),
+                ...(persisted.ok && !republish.ok ? { fileError: republish.reason } : {})
+            };
         }
         sequence += 1;
         signals.set(candidate.id, candidate);
@@ -588,27 +595,29 @@ export function apply(ctx, config) {
             seq: sequence,
             ...(goalId === undefined ? {} : { goalId }),
             ...(requestId === undefined ? {} : { requestId }),
-            reference: `collab-notify:${binding.sessionId}:${at}`,
+            // The reference is IDENTITY, so it is derived from what the event IS and never from when it
+            // was sent: a timestamp here would give the same logical notification a different identity on
+            // every retry, turning a legitimate retry into a conflict. The time lives in `at`, which is
+            // deliberately not part of the identity.
+            reference: `collab-notify:${binding.bindingId}:${eventId}`,
             at
         };
-        // Raise the signal once. Its file projection is published as part of raising it, and the outcome
-        // is returned so a caller learns the truth instead of assuming delivery.
-        const raised = raiseSignal(record);
-        // A signal that could not be raised means the controller will not be woken. The durable event is
-        // still written below (so the fact is not lost), but the failure is propagated so no caller can
-        // mistake this for a delivered notification.
-        if (!raised.ok) {
-            ctx.logger.error("codex-bridge: notification %s could not raise a signal: %s", signalId, raised.reason);
-        }
-        // Record durably in this plugin's own store FIRST, carrying the same identity a rebuild needs, so
-        // a restarted process reconstructs this exact event — including its signalId and cursor — instead
-        // of inventing a new identity. The session log is deliberately not used; a custom event name
-        // there would make the session permanently unreadable.
+        // Record durably BEFORE the event becomes visible, so an event that could not be stored is never
+        // offered as if it existed. Re-recording the same identity replaces the record in place, which is
+        // what makes a retry idempotent rather than duplicative.
         const stored = store.putSignal({ ...record, text });
         if (!stored.ok) {
             ctx.logger.error("codex-bridge: notification %s could not be recorded durably: %s", signalId, stored.reason);
-            return { eventId, signalId, raised, fileError: `signal-not-recorded:${stored.reason}` };
+            return { eventId, signalId, raised: { ok: false, reason: `signal-not-recorded:${stored.reason}` }, fileError: `signal-not-recorded:${stored.reason}` };
         }
+        // Only now raise it: a signal that is visible must be one a restart can also find.
+        const raised = raiseSignal(record);
+        if (!raised.ok) {
+            ctx.logger.error("codex-bridge: notification %s could not raise a signal: %s", signalId, raised.reason);
+        }
+        // The DURABLE record is what makes the event recoverable, and the FILE is only how a controller
+        // may be notified. They are reported separately on purpose: a successful durable write is not
+        // invalidated by a failed notification file, and a caller must be able to tell which failed.
         return { eventId, signalId, raised, fileError: raised.ok ? raised.fileError : `signal-not-raised:${raised.reason}` };
     };
 
@@ -1264,9 +1273,9 @@ export function apply(ctx, config) {
                 // notified, and the stable event id makes its retry safe.
                 if (produced.fileError !== undefined) {
                     send(response, 502, {
-                        error: "notification recorded and signalled, but its file projection failed",
-                        sessionId, kind, signalId: produced.signalId, fileError: produced.fileError,
-                        hint: "retry this same notification; the event id is stable so no second business event is created"
+                        error: "the notification could not be fully delivered",
+                        sessionId, kind, signalId: produced.signalId, detail: produced.fileError,
+                        hint: "a durable record and a retry, if any, are safe: the event id is stable so no second business event is created"
                     });
                     return;
                 }

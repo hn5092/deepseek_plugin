@@ -51,9 +51,10 @@ async function freePort() {
  * @param {string|null} [options.inboxRoot] - file-signal inbox root; null leaves it unconfigured.
  * @param {ReadonlyArray<{controller: string, tokenRef: string, token: string}>} [options.controllerTokens] - test controller credentials.
  * @param {string} [options.home] - reuse an existing DSH home so a restart shares durable state.
+ * @param {string|null} [options.storeRoot] - durable store root; defaults to the inbox root.
  * @returns {Promise<object>} the instance handle.
  */
-export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = 90_000, scripted = null, inboxRoot = null, controllerTokens = [], home: reuseHome = undefined }) {
+export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = 90_000, scripted = null, inboxRoot = null, controllerTokens = [], home: reuseHome = undefined, storeRoot = null }) {
     const port = await freePort();
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "collab-instance-"));
     // A restart keeps the CALLER-provided home so durable sessions live across both processes, while the
@@ -111,6 +112,7 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
         "        collabPath: /codex-collab",
         `        answerTimeoutMs: ${answerTimeoutMs}`,
         ...(inboxRoot === null ? [] : [`        inboxRoot: ${JSON.stringify(inboxRoot.replace(/\\/g, "/"))}`]),
+        ...(storeRoot === null ? [] : [`        storeRoot: ${JSON.stringify(String(storeRoot).replace(/\\/g, "/"))}`]),
         "        bindings:",
         ...(bindingLines.length > 0 ? bindingLines : ["          []"]),
         ...scriptedLines,
