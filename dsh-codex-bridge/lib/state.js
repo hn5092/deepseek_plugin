@@ -41,6 +41,24 @@ import { normalizeSignal, signalVerdict } from "./signals.js";
 export const KINDS = Object.freeze(["question", "delivery", "error"]);
 
 /**
+ * Resolve the retention bounds an owner will use for its whole life.
+ *
+ * These are the numbers that decide when a finished record may be reclaimed AND whether a retried
+ * identity is considered expired, so they must be settled before the first read or write rather than
+ * assigned by whichever code path happens to run first. A caller that cannot supply valid bounds gets the
+ * conservative built-in ones, which is a deliberate choice: an owner is not allowed to exist without
+ * bounds, because "no bound" would mean "never expire anything".
+ *
+ * @param {{maxAgeMs?: unknown, maxEvents?: unknown}} [bounds] - configured bounds.
+ * @returns {{maxAgeMs: number, maxEvents: number}} the bounds in force.
+ */
+export function normalizeRetention(bounds) {
+    const maxAgeMs = Number.isSafeInteger(bounds?.maxAgeMs) && bounds.maxAgeMs >= 0 ? bounds.maxAgeMs : 7 * 24 * 60 * 60 * 1000;
+    const maxEvents = Number.isSafeInteger(bounds?.maxEvents) && bounds.maxEvents >= 1 ? bounds.maxEvents : 500;
+    return { maxAgeMs, maxEvents };
+}
+
+/**
  * The signal view of a record: what the HTTP surface and the controller see.
  *
  * Derived on read, never stored twice, so there is no second copy that can disagree with the record.
@@ -76,12 +94,22 @@ export function isOutstanding(record) {
  */
 export class BridgeState {
     /**
-     * @param {object} config - `{storeRoot, inboxRoot, logger}`.
+     * @param {object} config - `{storeRoot, inboxRoot, logger, retention}`.
      */
-    constructor({ storeRoot, inboxRoot, logger }) {
+    constructor({ storeRoot, inboxRoot, logger, retention }) {
         this.store = new CollabStore(storeRoot);
         this.inboxRoot = typeof inboxRoot === "string" && inboxRoot.length > 0 ? inboxRoot : null;
         this.logger = logger;
+        /**
+         * The retention bounds, injected ONCE at construction from the validated configuration.
+         *
+         * This must not be a default that some later call happens to overwrite: `publish` consults the
+         * bounds to decide whether a retried identity has expired, so a wrong value here silently changes
+         * which retries are accepted — a fresh instance, and any instance just restarted, would judge by
+         * whatever default was baked in rather than by what the operator configured. The bounds are
+         * therefore a constructor input and never a runtime side effect of taking a particular path.
+         */
+        this.retention = normalizeRetention(retention);
         /** Cache of every record, keyed by id. Rebuildable from the store. */
         this.records = new Map();
         /** Live waiters only: id -> settle. Never recovered. */
@@ -104,11 +132,16 @@ export class BridgeState {
     load() {
         this.records.clear();
         if (!this.store.available) return { ok: false, loaded: 0, problems: [], reason: "store-not-configured" };
-        const { records, problems } = this.store.allRecords();
+        const { records, problems, readable, reason: readReason } = this.store.allRecords();
+        // A directory that could not be READ is not an empty store. Reporting success here would let a
+        // producer publish over records it never saw, so it is a load failure with the original reason.
+        if (!readable) {
+            return { ok: false, loaded: 0, problems, reason: `records could not be read: ${readReason}` };
+        }
         for (const record of records) this.records.set(record.id, record);
-        // A meta file that cannot be read would reset the sequence, letting a new event reuse a number an
-        // existing cursor had already passed, so it is treated as a load failure rather than defaulted.
-        const meta = this.store.readMeta();
+        // The meta is read with the knowledge that records exist, so a LOST meta beside real records is
+        // reported instead of silently restarting the sequence at 1.
+        const meta = this.store.readMeta({ recordsPresent: records.length > 0 });
         if (!meta.ok) return { ok: false, loaded: records.length, problems, reason: meta.reason };
         if (problems.length > 0) {
             // An unreadable record is reported. It is NOT silently skipped: continuing could hide a
@@ -323,7 +356,7 @@ export class BridgeState {
         if (this.onChange !== null) this.onChange();
         // Retention runs at this boundary too, so a confirmed-then-finished question is bounded without
         // waiting for a later confirmation that may never come.
-        if (applied.changed) this.reclaim(this.retention);
+        if (applied.changed) this.reclaim();
         return { ok: true, record: winner, changed: applied.changed, delivered };
     }
 
@@ -408,9 +441,10 @@ export class BridgeState {
      * @param {object} bounds - `{maxAgeMs, maxEvents}`.
      * @returns {{removed: ReadonlyArray<string>, failed: ReadonlyArray<object>, retained: number, pending: number, unconfirmed: number, reloaded: number}} the outcome.
      */
-    reclaim(bounds) {
-        this.retention = bounds;
-        const outcome = this.store.reclaim(bounds);
+    reclaim() {
+        // The bounds are the owner's, injected at construction. Accepting them here would reintroduce the
+        // defect this replaced: a configuration that only takes effect once some path happens to run.
+        const outcome = this.store.reclaim(this.retention);
         /** @type {ReadonlyArray<string>} */
         const removed = outcome.removed;
         // Rebuild rather than delete keys: the store is the truth, and a rebuild also drops anything the
@@ -420,9 +454,6 @@ export class BridgeState {
         if (removed.length > 0 && this.onChange !== null) this.onChange();
         return { ...outcome, reloaded: reloaded.loaded };
     }
-
-    /** The retention bounds currently in force, used when judging an expired retry. */
-    retention = { maxAgeMs: 7 * 24 * 60 * 60 * 1000, maxEvents: 500 };
 }
 
 export { CollabStore, NOTIFICATION, NOTICE_STATE, QUESTION_STATE, isTerminalBusiness };

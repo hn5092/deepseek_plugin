@@ -148,21 +148,48 @@ export class CollabStore {
     }
 
     /**
-     * Read the controller meta, defaulting to the beginning of history.
+     * Read the controller meta.
      *
-     * A missing meta is a fresh store; a CORRUPT meta is reported rather than silently reset, because
-     * resetting the sequence would let a new event reuse a number an old cursor had already passed.
+     * `existsSync` is deliberately NOT used: it answers only "is there something here", and returns false
+     * for a file that exists but cannot be read, which would be indistinguishable from a fresh store and
+     * would silently restart the sequence at 1. The file is read directly instead, and the error is
+     * classified:
      *
+     *  - a genuinely absent meta is a fresh store ONLY when there are no records either. A missing meta
+     *    beside existing records means the sequence history was lost, and restarting at 1 would hand out
+     *    numbers an existing cursor has already passed, so it is reported as a problem;
+     *  - an unreadable or malformed meta is reported, never defaulted.
+     *
+     * @param {{recordsPresent?: boolean}} [context] - whether records already exist in the store.
      * @returns {{ok: true, meta: object} | {ok: false, reason: string}} the meta.
      */
-    readMeta() {
+    readMeta(context = {}) {
         if (!this.available) return { ok: false, reason: "store-not-configured" };
         const target = this.metaFile();
         if (!target.ok) return target;
-        if (!fs.existsSync(target.file)) return { ok: true, meta: { nextSeq: 1, generation: 1 } };
-        const read = readJson(target.file);
-        if (!read.ok) return { ok: false, reason: `controller meta is unreadable: ${read.reason}` };
-        const value = read.value;
+        let raw;
+        try {
+            raw = fs.readFileSync(target.file, "utf8");
+        } catch (error) {
+            const code = error && typeof error.code === "string" ? error.code : "";
+            if (code === "ENOENT") {
+                // No meta at all. Acceptable only for a store that also has no records; otherwise the
+                // sequence history is gone and continuing would reuse numbers.
+                if (context.recordsPresent === true) {
+                    return { ok: false, reason: "controller meta is missing while records exist; the sequence history was lost" };
+                }
+                return { ok: true, meta: { nextSeq: 1, generation: 1 } };
+            }
+            // Permissions, IO, a directory where the file should be: a real failure, reported as such.
+            const reason = error instanceof Error ? error.message : String(error);
+            return { ok: false, reason: `controller meta could not be read: ${reason}` };
+        }
+        let value;
+        try {
+            value = JSON.parse(raw);
+        } catch (error) {
+            return { ok: false, reason: `controller meta is not valid JSON: ${error instanceof Error ? error.message : String(error)}` };
+        }
         if (value === null || typeof value !== "object" || !Number.isSafeInteger(value.nextSeq) || value.nextSeq < 1 || !Number.isSafeInteger(value.generation) || value.generation < 1) {
             return { ok: false, reason: "controller meta is malformed" };
         }
@@ -225,16 +252,25 @@ export class CollabStore {
 
     /** Every record, plus any unreadable files. */
     allRecords() {
-        if (!this.available) return { records: [], problems: [] };
+        if (!this.available) return { records: [], problems: [], readable: false, reason: "store-not-configured" };
         const dir = this.eventsDir();
-        if (!dir.ok) return { records: [], problems: [{ file: this.root, reason: dir.reason }] };
+        if (!dir.ok) return { records: [], problems: [{ file: this.root, reason: dir.reason }], readable: false, reason: dir.reason };
         const records = [];
         const problems = [];
         let names;
         try {
             names = fs.readdirSync(dir.file);
-        } catch {
-            return { records, problems };
+        } catch (error) {
+            // An events directory that does not exist yet is a genuinely empty store — that is the only
+            // error treated as "nothing is here". Anything else (permissions, IO, a file where the
+            // directory should be) means the records COULD NOT BE READ, which is not the same fact and must
+            // never be reported as an empty store: a caller that believed it would publish over records it
+            // never saw.
+            const code = error && typeof error.code === "string" ? error.code : "";
+            const missing = code === "ENOENT";
+            if (missing) return { records, problems, readable: true, reason: "no records yet" };
+            const reason = error instanceof Error ? error.message : String(error);
+            return { records, problems: [{ file: dir.file, reason }], readable: false, reason };
         }
         for (const name of names) {
             if (!name.endsWith(".json")) continue;
@@ -242,7 +278,7 @@ export class CollabStore {
             if (read.ok && read.value !== null && typeof read.value === "object" && typeof read.value.id === "string") records.push(read.value);
             else problems.push({ file: path.join(dir.file, name), reason: read.ok ? "not a record" : read.reason });
         }
-        return { records, problems };
+        return { records, problems, readable: true, reason: problems.length > 0 ? `${problems.length} unreadable record(s)` : "ok" };
     }
 
     /**
@@ -314,9 +350,13 @@ export class CollabStore {
      * @returns {{removed: ReadonlyArray<string>, failed: ReadonlyArray<object>, retained: number, pending: number, unconfirmed: number}} the outcome.
      */
     reclaim({ maxAgeMs, maxEvents }) {
-        if (!this.available) return { removed: [], failed: [], retained: 0, pending: 0, unconfirmed: 0 };
+        if (!this.available) return { removed: [], failed: [], retained: 0, pending: 0, unconfirmed: 0, reason: "store-not-configured" };
         const now = Date.now();
-        const { records } = this.allRecords();
+        const scan = this.allRecords();
+        // Reclaiming over records that could not be read would remove nothing and report a tidy store.
+        // The failure is surfaced instead, so a caller can tell "nothing was due" from "nothing was seen".
+        if (!scan.readable) return { removed: [], failed: [], retained: 0, pending: 0, unconfirmed: 0, reason: scan.reason };
+        const { records } = scan;
         const removed = [];
         const failed = [];
         let retained = 0;

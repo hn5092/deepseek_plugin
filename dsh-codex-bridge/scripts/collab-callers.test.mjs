@@ -13,6 +13,9 @@
  *  3. PRODUCER-BEFORE-CONTROLLER — after a real restart the model's producer (and the native observer)
  *     must act on the LOADED state, not on an empty cache, so an already-confirmed record is not
  *     resurrected by a producer that ran before the controller's first read.
+ *  4. CONFIGURED-BOUNDS-FROM-THE-FIRST-WRITE — the retention window must be the CONFIGURED one before any
+ *     reclaim has happened, on a fresh instance and again after a restart, and an unreadable store must
+ *     refuse production instead of looking empty.
  *
  * Run: node scripts/collab-callers.test.mjs
  *
@@ -181,14 +184,19 @@ try {
     }
 
     // ---- 3) a producer must act on LOADED state after a real restart -----------------------
+    // A window long enough that the confirmed record is still RETAINED across the restart, which is what
+    // makes the retry expectation "idempotent" rather than "expired".
     const home = path.join(workDir, "home");
     const storeRoot = path.join(workDir, "store3");
     fs.mkdirSync(home, { recursive: true });
+    const longWindowMs = 60_000;
     const firstRun = await startIsolatedInstance({
         pluginRoot, bindings, controllerTokens, answerTimeoutMs: 8000,
-        inboxRoot: path.join(workDir, "inbox3"), storeRoot, home
+        inboxRoot: path.join(workDir, "inbox3"), storeRoot, home,
+        extraConfig: { inboxMaxAgeMs: longWindowMs, inboxMaxEvents: 500 }
     });
     let confirmedId = null;
+    let originalSeq = null;
     try {
         const call3 = makeCaller(firstRun);
         const client = new DshClient(new URL(firstRun.url), 55_000);
@@ -198,9 +206,12 @@ try {
         const issuedAt = new Date().toISOString();
         const created = await call3("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "survives restart", requestId: "restart-producer", issuedAt }) });
         confirmedId = created.body.signalId;
+        originalSeq = new CollabStore(storeRoot).getRecord(confirmedId).value.seq;
         await call3("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: confirmedId }) });
         const before = await call3("/signals?controller=codex");
         record("the event is confirmed before the restart", !(before.body.signals ?? []).some((s) => s.id === confirmedId), `count=${(before.body.signals ?? []).length}`);
+        record("the record is RETAINED, not reclaimed, so a retry of it must be idempotent",
+            new CollabStore(storeRoot).getRecord(confirmedId).ok, "present before the restart");
     } finally {
         // No `keepLog`: a retained scratch directory would be a silent leak, and the receipt is asserted so
         // a host that failed to stop cannot pass unnoticed. The caller-owned home lives outside it and is
@@ -212,28 +223,150 @@ try {
 
     const secondRun = await startIsolatedInstance({
         pluginRoot, bindings, controllerTokens, answerTimeoutMs: 8000,
-        inboxRoot: path.join(workDir, "inbox3"), storeRoot, home
+        inboxRoot: path.join(workDir, "inbox3"), storeRoot, home,
+        extraConfig: { inboxMaxAgeMs: longWindowMs, inboxMaxEvents: 500 }
     });
     try {
         const call4 = makeCaller(secondRun);
         const client = new DshClient(new URL(secondRun.url), 55_000);
         await client.login();
         secondRun.cookie = client.cookie;
+        // The session is adopted first: a Session must exist for a producer to act on it at all, and
+        // `session/create` is an idempotent adoption of the SAME log rather than a controller read. The
+        // ordering being tested is that the PRODUCER runs before the controller's first GET, which still
+        // holds — no `/signals`, `/questions` or `/wait` call has been made yet.
+        await client.rpc("session/create", { request: { cwd: projDir, sessionId } });
 
-        // The PRODUCER acts FIRST, before the controller reads anything: the model retries the same event.
-        // A producer running on an unloaded cache would see no record and could create a fresh one.
-        const retry = await call4("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "survives restart", requestId: "restart-producer", issuedAt: new Date(Date.now() - 1000).toISOString() }) });
-        record("a producer retrying a confirmed event after a restart is answered as expired", retry.status >= 400, `status=${retry.status} detail=${retry.body.detail ?? ""}`);
+        // The PRODUCER acts FIRST, before the controller reads anything. Because the record is retained,
+        // the contract says this retry is the SAME event: it must be accepted IDEMPOTENTLY, must not create
+        // a second record, and must not come back as outstanding work. A producer running against an
+        // unloaded cache would instead see nothing and mint a fresh event, which is the defect this guards.
+        const retry = await call4("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "survives restart", requestId: "restart-producer", issuedAt: new Date().toISOString() }) });
+        record("a producer retrying a RETAINED event after a restart is accepted idempotently",
+            retry.status === 200 && retry.body.signalId === confirmedId, `status=${retry.status} sameId=${retry.body.signalId === confirmedId}`);
+        const afterRetry = new CollabStore(storeRoot);
+        record("the retry did not mint a second record", (afterRetry.allRecords().records.filter((r) => r.id === confirmedId)).length === 1, "one record with that id");
+        record("the retry kept the ORIGINAL sequence, so it is the same event", afterRetry.getRecord(confirmedId).value.seq === originalSeq, `seq=${afterRetry.getRecord(confirmedId).value.seq} original=${originalSeq}`);
 
         // Only NOW does the controller read for the first time.
         const after = await call4("/signals?controller=codex");
-        record("the confirmed event did NOT come back after the restart", !(after.body.signals ?? []).some((s) => s.id === confirmedId), `count=${(after.body.signals ?? []).length}`);
+        record("the confirmed event did NOT come back as outstanding after the restart", !(after.body.signals ?? []).some((s) => s.id === confirmedId), `count=${(after.body.signals ?? []).length}`);
         const confirmedAfter = await call4("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: confirmedId }) });
-        record("the record is still known as confirmed, so confirming it again is idempotent or retired", confirmedAfter.status === 200 || confirmedAfter.status === 410, `status=${confirmedAfter.status}`);
+        record("confirming the retained record again is idempotent", confirmedAfter.status === 200 && confirmedAfter.body.idempotent === true, `status=${confirmedAfter.status} idempotent=${confirmedAfter.body.idempotent}`);
     } finally {
         const outcome = await secondRun.stop();
         const verdict = stopIsClean(outcome);
         record("the restarted instance stopped with no residue", verdict.clean, verdict.problems.join("; ") || "clean");
+    }
+
+    // ---- 4) the CONFIGURED window applies from the first write, and a broken store is refused ----
+    // The defect this guards: the owner's window defaulted to seven days and was only overwritten when a
+    // reclaim happened to run, so a fresh instance judged retries by the default. Here NOTHING is confirmed
+    // and NO reclaim is triggered, so only a correctly injected configuration can reject the retry.
+    {
+        const narrowWindowMs = 1000;
+        const narrowStore = path.join(workDir, "store-narrow");
+        const narrow = await startIsolatedInstance({
+            pluginRoot, bindings, controllerTokens, answerTimeoutMs: 8000,
+            inboxRoot: path.join(workDir, "inbox-narrow"), storeRoot: narrowStore,
+            extraConfig: { inboxMaxAgeMs: narrowWindowMs, inboxMaxEvents: 500 }
+        });
+        try {
+            const call5 = makeCaller(narrow);
+            const client = new DshClient(new URL(narrow.url), 55_000);
+            await client.login();
+            narrow.cookie = client.cookie;
+            await client.rpc("session/create", { request: { cwd: projDir, sessionId } });
+
+            // An issue time two seconds before "now" is outside a one-second window. No confirm and no
+            // reclaim has run on this instance, so the rejection can only come from the injected config.
+            const staleIssuedAt = new Date(Date.now() - 2000).toISOString();
+            const refused = await call5("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "stale", requestId: "narrow-stale", issuedAt: staleIssuedAt }) });
+            record("a fresh instance rejects a stale retry by the CONFIGURED window, with no prior reclaim",
+                refused.status >= 400 && /expired/.test(JSON.stringify(refused.body)), `status=${refused.status} detail=${refused.body.detail ?? ""}`);
+            record("the refused stale retry created no record",
+                !new CollabStore(narrowStore).allRecords().records.some((r) => r.id.includes("narrow-stale")), "no record with that id");
+
+            // The SAME window applies to a normal new notification, which must still work.
+            const fresh = await call5("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "fresh" }) });
+            record("a normal new notification is unaffected by the narrow window", fresh.status === 200, `status=${fresh.status}`);
+        } finally {
+            const outcome = await narrow.stop();
+            const verdict = stopIsClean(outcome);
+            record("the narrow-window instance stopped with no residue", verdict.clean, verdict.problems.join("; ") || "clean");
+        }
+
+        // After a RESTART on the same home the configured window must still apply to the first write.
+        const narrowHome = path.join(workDir, "home-narrow");
+        fs.mkdirSync(narrowHome, { recursive: true });
+        const firstNarrow = await startIsolatedInstance({
+            pluginRoot, bindings, controllerTokens, answerTimeoutMs: 8000,
+            inboxRoot: path.join(workDir, "inbox-narrow2"), storeRoot: narrowStore, home: narrowHome,
+            extraConfig: { inboxMaxAgeMs: narrowWindowMs, inboxMaxEvents: 500 }
+        });
+        try {
+            const call6 = makeCaller(firstNarrow);
+            const client = new DshClient(new URL(firstNarrow.url), 55_000);
+            await client.login();
+            firstNarrow.cookie = client.cookie;
+            await client.rpc("session/create", { request: { cwd: projDir, sessionId } });
+            await call6("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "existing" }) });
+        } finally {
+            await firstNarrow.stop();
+        }
+        const secondNarrow = await startIsolatedInstance({
+            pluginRoot, bindings, controllerTokens, answerTimeoutMs: 8000,
+            inboxRoot: path.join(workDir, "inbox-narrow2"), storeRoot: narrowStore, home: narrowHome,
+            extraConfig: { inboxMaxAgeMs: narrowWindowMs, inboxMaxEvents: 500 }
+        });
+        try {
+            const call7 = makeCaller(secondNarrow);
+            const client = new DshClient(new URL(secondNarrow.url), 55_000);
+            await client.login();
+            secondNarrow.cookie = client.cookie;
+            await client.rpc("session/create", { request: { cwd: projDir, sessionId } });
+            const staleAfterRestart = await call7("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "stale", requestId: "narrow-restart", issuedAt: new Date(Date.now() - 2000).toISOString() }) });
+            record("after a restart the first write still uses the CONFIGURED window, not a default",
+                staleAfterRestart.status >= 400 && /expired/.test(JSON.stringify(staleAfterRestart.body)), `status=${staleAfterRestart.status} detail=${staleAfterRestart.body.detail ?? ""}`);
+        } finally {
+            const outcome = await secondNarrow.stop();
+            const verdict = stopIsClean(outcome);
+            record("the restarted narrow-window instance stopped with no residue", verdict.clean, verdict.problems.join("; ") || "clean");
+        }
+    }
+
+    // ---- 5) a store that cannot be READ must refuse production, not look empty ----------------
+    // A file placed where the events DIRECTORY must be produces a real read error that is not ENOENT. It
+    // must be reported and production refused; it must NOT be mistaken for "no records yet".
+    {
+        const blockedStore = path.join(workDir, "store-blocked");
+        fs.mkdirSync(blockedStore, { recursive: true });
+        fs.writeFileSync(path.join(blockedStore, "events"), "a file where the events directory must be", "utf8");
+        const blocked = await startIsolatedInstance({
+            pluginRoot, bindings, controllerTokens, answerTimeoutMs: 6000,
+            inboxRoot: path.join(workDir, "inbox-blocked"), storeRoot: blockedStore,
+            evidenceDir: path.join(workDir, "evidence")
+        });
+        try {
+            const call8 = makeCaller(blocked);
+            const client = new DshClient(new URL(blocked.url), 55_000);
+            await client.login();
+            blocked.cookie = client.cookie;
+            await client.rpc("session/create", { request: { cwd: projDir, sessionId } });
+            const refused = await call8("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "must not be written" }) });
+            record("an unreadable store refuses production instead of reporting success", refused.status >= 500, `status=${refused.status} detail=${refused.body.detail ?? refused.body.error ?? ""}`);
+            // The refusal must carry the REAL error, not a generic message and not an empty-store claim:
+            // `ENOTDIR` here is the concrete read failure, and it has to survive to the caller so an
+            // operator can tell a broken store from a fresh one.
+            const detail = String(refused.body.detail ?? "");
+            record("the refusal names the real read failure, so the error is not swallowed",
+                /store-not-loaded/.test(detail) && /ENOTDIR|could not be read/.test(detail), detail.slice(0, 150));
+            record("nothing was written into the broken store", fs.readFileSync(path.join(blockedStore, "events"), "utf8") === "a file where the events directory must be", "the placeholder file is untouched");
+        } finally {
+            const outcome = await blocked.stop();
+            const verdict = stopIsClean(outcome);
+            record("the instance with the broken store stopped with no residue", verdict.clean, verdict.problems.join("; ") || "clean");
+        }
     }
 } finally {
     if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });

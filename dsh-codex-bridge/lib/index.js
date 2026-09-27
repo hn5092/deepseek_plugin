@@ -230,7 +230,10 @@ export function apply(ctx, config) {
     const state = new BridgeState({
         storeRoot: config.storeRoot.length > 0 ? config.storeRoot : config.inboxRoot,
         inboxRoot: config.inboxRoot,
-        logger: ctx.logger
+        logger: ctx.logger,
+        // The validated bounds are injected ONCE, here, so the owner judges expiry and reclamation by the
+        // operator's configuration from its very first read — not by a default until some later path runs.
+        retention: { maxAgeMs: config.inboxMaxAgeMs, maxEvents: config.inboxMaxEvents }
     });
     /** The configured inbox root, or null when file signalling is not configured. */
     const inboxRoot = config.inboxRoot.length > 0 ? config.inboxRoot : null;
@@ -1072,7 +1075,7 @@ export function apply(ctx, config) {
                 // boundary where the notification has provably been dealt with. It removes only records
                 // that are confirmed AND terminal AND past both bounds, so a pending question is never
                 // touched, and its outcome is reported rather than assumed.
-                const reclaimed = state.reclaim({ maxAgeMs: config.inboxMaxAgeMs, maxEvents: config.inboxMaxEvents });
+                const reclaimed = state.reclaim();
                 if (reclaimed.failed.length > 0) {
                     ctx.logger.warn("codex-bridge: %d record(s) could not be reclaimed and remain on disk", reclaimed.failed.length);
                 }
