@@ -19,7 +19,11 @@ import {
     signalVerdict,
     waitOutcome
 } from "../lib/signals.js";
-import { confirmSignal, inboxDirFor, pruneInbox, publishSignal, readSignals, watchInbox } from "../lib/inbox.js";
+import { confirmSignal, inboxDirFor, publishSignal, readSignals, watchInbox } from "../lib/inbox.js";
+// Imported under a local name purely to ASSERT its absence: a directory-level prune with file-age-only
+// semantics would delete events a controller had not confirmed, so the module must not offer one.
+import * as inboxModule from "../lib/inbox.js";
+const pruneInbox = inboxModule.pruneInbox;
 
 let passed = 0;
 const cases = [];
@@ -308,17 +312,13 @@ test("an event published between the scan and the watcher is caught by the re-sc
     assert.ok(flat.includes("raced"), `the raced event must be observed; saw ${JSON.stringify(seen)}`);
 });
 
-test("pruning keeps recent events and never hides an unconfirmed backlog silently", () => {
-    const dir = inboxDirFor(inboxRoot, "prune").dir;
-    const old = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-    for (let i = 0; i < 5; i += 1) {
-        publishSignal(dir, normalizeSignal({ ...baseSignal, id: `old-${i}`, at: old }).signal);
-    }
-    // A cap of 2 with a 1-minute age limit: the newest two stay regardless of age.
-    const result = pruneInbox(dir, { maxAgeMs: 60_000, maxEvents: 2 });
-    assert.equal(result.retained, 2, "the newest events are retained");
-    assert.equal(result.removed.length, 3, "the drop is reported, not silent");
-    assert.equal(readSignals(dir).signals.length, 2);
+// Retention is owned by the store, not by the inbox directory (see `CollabStore.reclaim`), and it is
+// exercised against the real production class in `collab-durability`/`collab-five` where the store is
+// live. What is asserted HERE is the property an inbox-level prune used to violate: an UNCONFIRMED event
+// is never removable just because a cap was reached. The inbox module no longer exports a prune at all,
+// so this guards against it being reintroduced with file-age-only semantics.
+test("the inbox module exposes no directory-level prune that could drop unconfirmed events", () => {
+    assert.equal(typeof pruneInbox, "undefined", "retention must be decided by the store that knows what is confirmed");
 });
 
 // The inbox root is removed AFTER the cases have run, in the runner below: removing it here would only

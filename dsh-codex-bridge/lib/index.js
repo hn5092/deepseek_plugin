@@ -367,6 +367,50 @@ export function apply(ctx, config) {
         return published;
     };
 
+    /**
+     * THE owner of the notification-file projection.
+     *
+     * The inbox is a projection of the durable signals, so it must never become a second truth that can
+     * disagree with them. This one function keeps it reconciled, and every surface reads the projection
+     * through it:
+     *
+     *  - REPAIR: a signal recorded durably but missing its file (a crash between the two writes, a
+     *    previously unwritable inbox, a file deleted by hand) has the file written again. Without this a
+     *    restart would show a signal in the API while its file was silently absent.
+     *  - FILTER: a signal the authoritative store records as CONFIRMED is excluded even if its file still
+     *    exists. A file that could not be deleted must not turn a confirmed event back into outstanding
+     *    work — the file's presence is not the fact; the confirmation is.
+     *  - DROP: a file with no corresponding durable signal is not delivered, because nothing recorded it.
+     *
+     * @param {string} controller - the controller whose view is being built.
+     * @returns {{signals: ReadonlyArray<object>, repaired: number, unrecorded: number, confirmed: ReadonlySet<string>}} the reconciled view.
+     */
+    const projectSignals = (controller) => {
+        const confirmed = durableConfirmed(controller);
+        const durable = [...signals.values()].filter((signal) => signal.controller === controller);
+        const durableById = new Map(durable.map((signal) => [signal.id, signal]));
+        // 1) Repair: every durable, unconfirmed signal must have its file.
+        let repaired = 0;
+        for (const signal of durable) {
+            if (confirmed.has(signal.id)) continue;
+            const republished = republishSignal(signal);
+            if (republished.ok) repaired += 1;
+        }
+        // 2) Deliver only what the store records and has not confirmed.
+        const deliverable = durable.filter((signal) => !confirmed.has(signal.id));
+        const recorded = new Set(deliverable.map((signal) => signal.id));
+        // 3) Report files that no durable signal backs, so a stray file is visible rather than delivered.
+        let unrecorded = 0;
+        if (inboxRoot !== null) {
+            const dir = inboxDirFor(inboxRoot, controller);
+            if (dir.ok) {
+                const onDisk = readSignals(dir.dir).signals;
+                unrecorded = onDisk.filter((signal) => !durableById.has(signal.id)).length;
+            }
+        }
+        return { signals: deliverable, repaired, unrecorded, confirmed, recorded };
+    };
+
     // ---- durable store ------------------------------------------------------------------------
 
     /**
@@ -472,7 +516,8 @@ export function apply(ctx, config) {
                     answer: { type: "string" },
                     source: { type: "string" },
                     questionId: { type: "string", required: true },
-                    reason: { type: "string" }
+                    reason: { type: "string" },
+                    deliveryWarning: { type: "string" }
                 }
             },
             render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }]
@@ -546,6 +591,16 @@ export function apply(ctx, config) {
                 } catch { /* the store may be gone; the cancellation is best effort */ }
                 return { status: "rejected", questionId: "", reason: `question-signal-not-raised:${raised.reason}` };
             }
+            // The signal is durably recorded and raised, but its FILE could not be written. This is the
+            // case the store being writable does not cover: the inbox can be unwritable on its own. The
+            // controller may still be reached through the API, so the question is NOT withdrawn — but the
+            // tool reports the degraded delivery instead of pretending the notification was reliable.
+            const fileWarning = raised.fileError === undefined
+                ? null
+                : `question-signal-file-not-delivered:${raised.fileError}`;
+            if (fileWarning !== null) {
+                ctx.logger.warn("codex-bridge: question %s raised but its notification file failed: %s", questionId, raised.fileError);
+            }
 
             const timeoutMs = Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
                 ? Math.min(args.timeoutMs, config.answerTimeoutMs)
@@ -589,7 +644,10 @@ export function apply(ctx, config) {
                 status: answer.status,
                 ...(typeof answer.answer === "string" ? { answer: answer.answer } : {}),
                 ...(typeof answer.source === "string" ? { source: answer.source } : {}),
-                ...(typeof answer.reason === "string" ? { reason: answer.reason } : {})
+                ...(typeof answer.reason === "string" ? { reason: answer.reason } : {}),
+                // A degraded notification is reported in the RESULT, so the model can see that the
+                // controller's file inbox is not working even though the question itself is fine.
+                ...(fileWarning === null ? {} : { deliveryWarning: fileWarning })
             };
         }
     }));
@@ -802,8 +860,20 @@ export function apply(ctx, config) {
                 // A corrupt record is reported, never silently treated as "no event".
                 ctx.logger.warn("codex-bridge: %d unreadable record(s) in the durable store", stored.problems.length);
             }
-            ctx.logger.info("codex-bridge: recovered %d signal(s) and %d question(s) from the durable store (cursor=%d)",
-                recoveredCount, questions, sequence);
+            // Repair the notification projection as part of recovering: a signal that is recorded durably
+            // but lost its file (a crash between the two writes, a previously unwritable inbox, or a file
+            // removed by hand) must have that file written again, or the API would show an event whose
+            // notification silently does not exist.
+            let repaired = 0;
+            for (const controller of new Set([...signals.values()].map((signal) => signal.controller))) {
+                const projection = projectSignals(controller);
+                repaired += projection.repaired > 0 ? 1 : 0;
+                if (projection.unrecorded > 0) {
+                    ctx.logger.warn("codex-bridge: %d inbox file(s) for %s have no durable record and are not delivered", projection.unrecorded, controller);
+                }
+            }
+            ctx.logger.info("codex-bridge: recovered %d signal(s) and %d question(s) from the durable store (cursor=%d, projection-repaired=%s)",
+                recoveredCount, questions, sequence, repaired > 0 ? "yes" : "no");
         } catch (error) {
             // Recovery failing must not take the host down; the bridge starts with what it has, and an
             // unreadable question then reports `unknown` rather than a wrong answer.
@@ -1027,10 +1097,16 @@ export function apply(ctx, config) {
                     send(response, 403, { error: `not your binding: controller-not-bound` });
                     return;
                 }
-                // Durably confirmed events are excluded for every caller, not only for one that remembers
-                // to send its own list, so all views agree on what has been dealt with.
-                const deliverable = deliverableSignals([...signals.values()], controller, [...durableConfirmed(), ...acknowledged]);
-                send(response, 200, { signals: deliverable, cursor: deliverable.length > 0 ? deliverable[deliverable.length - 1].seq : null });
+                // Every read of what this controller is owed goes through the projection owner, so the view
+                // is reconciled with the durable records (missing files repaired, confirmed events
+                // excluded) instead of each route re-deriving it and drifting.
+                const projection = projectSignals(controller);
+                const deliverable = deliverableSignals(projection.signals, controller, acknowledged);
+                send(response, 200, {
+                    signals: deliverable,
+                    cursor: deliverable.length > 0 ? deliverable[deliverable.length - 1].seq : null,
+                    ...(projection.unrecorded > 0 ? { unrecordedFiles: projection.unrecorded } : {})
+                });
                 return;
             }
 
@@ -1056,7 +1132,18 @@ export function apply(ctx, config) {
                     return;
                 }
                 const snapshot = readSignals(dir.dir);
-                send(response, 200, { configured: true, signals: snapshot.signals, problems: snapshot.problems });
+                // The files view reports what is ACTUALLY owed, not merely what is on disk. A file whose
+                // event the authoritative store records as confirmed is filtered out even if it could not
+                // be deleted: otherwise a permissions problem would resurrect a handled event as
+                // outstanding work, which is precisely the confusion confirmation exists to prevent.
+                const confirmed = durableConfirmed(controller);
+                const outstanding = snapshot.signals.filter((signal) => typeof signal.id !== "string" || !confirmed.has(signal.id));
+                send(response, 200, {
+                    configured: true,
+                    signals: outstanding,
+                    problems: snapshot.problems,
+                    ...(outstanding.length !== snapshot.signals.length ? { filteredConfirmed: snapshot.signals.length - outstanding.length } : {})
+                });
                 return;
             }
 
@@ -1105,14 +1192,27 @@ export function apply(ctx, config) {
                         send(response, 503, { error: `the confirmation could not be recorded: ${recorded.reason}`, signalId });
                         return;
                     }
+                    // Confirmation is the moment a record becomes reclaimable, so retention runs here —
+                    // the one boundary where an event provably stops being owed. It only ever removes
+                    // records that are confirmed AND terminal AND past both bounds, so unconfirmed work is
+                    // never touched, and its result is reported rather than assumed.
+                    const reclaimed = store.reclaim({ maxAgeMs: config.inboxMaxAgeMs, maxEvents: config.inboxMaxEvents });
+                    if (reclaimed.failed.length > 0) {
+                        ctx.logger.warn("codex-bridge: %d confirmed record(s) could not be reclaimed and remain on disk", reclaimed.failed.length);
+                    }
                 }
-                // The file is a projection of the same fact, so removing it is part of the same act; a
-                // failure to remove it is reported but cannot un-confirm the authoritative record.
+                // The file is a projection of the same fact, so removing it is part of the same act. A
+                // failure to remove it is REPORTED instead of discarded: the authoritative record still
+                // stands, but the caller must know the projection is out of step, and the files view will
+                // keep filtering that event out so it cannot return as outstanding work.
                 let fileNote = null;
                 if (inboxRoot !== null) {
                     const dir = inboxDirFor(inboxRoot, controller);
-                    if (dir.ok) confirmSignal(dir.dir, signalId);
-                    else fileNote = dir.reason;
+                    if (!dir.ok) fileNote = dir.reason;
+                    else {
+                        const removal = confirmSignal(dir.dir, signalId);
+                        if (removal.removed !== true) fileNote = "the inbox file could not be removed";
+                    }
                 }
                 send(response, 200, { ok: true, confirmed: true, idempotent: already, signalId, ...(fileNote === null ? {} : { fileNote }) });
                 return;
@@ -1142,9 +1242,12 @@ export function apply(ctx, config) {
                     // event. There is no caller-supplied "deliveryComplete" switch here: letting the
                     // CONSUMER declare whether the producer finished inverted the contract, and meant a
                     // controller could not be woken by the very event it exists to receive.
-                    signals: [...signals.values()],
+                    //
+                    // The projection owner supplies the signals so an event that is confirmed (or has no
+                    // durable record) is never handed out as new work, no matter what is on disk.
+                    signals: projectSignals(controller).signals,
                     controller,
-                    acknowledged: [...durableConfirmed(), ...acknowledged],
+                    acknowledged: [...durableConfirmed(controller), ...acknowledged],
                     since,
                     maxBatch
                 });

@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startIsolatedInstance } from "./isolated-instance.mjs";
+import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -192,7 +192,8 @@ try {
 } finally {
     // The stop receipt is asserted, not discarded: a suite must not pass while leaving a process behind.
     const outcome = await inst.stop();
-    record("the instance stopped cleanly", outcome.stopped === true && outcome.residue.length === 0, `stopped=${outcome.stopped} residue=${outcome.residue.length}`);
+    const stopVerdict = stopIsClean(outcome);
+    record("the instance stopped cleanly", stopVerdict.clean, stopVerdict.problems.join("; ") || "clean");
     fs.rmSync(workDir, { recursive: true, force: true });
 }
 

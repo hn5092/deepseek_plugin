@@ -35,8 +35,8 @@ export const Config = z.object({
 });
 
 export function apply(ctx, config) {
-    /** How many model calls have been served, so the script can advance. */
-    const state = { calls: 0 };
+    /** How many scripted turns have been served, keyed by session identity. */
+    const state = { calls: new Map() };
 
     const adapter = {
         /** @param provider - route id. @returns {object} display metadata. */
@@ -78,14 +78,44 @@ export function apply(ctx, config) {
             };
         },
         /**
-         * Serve one scripted call: first a tool call, then a plain completion.
+         * Serve one scripted call, tracking state PER SESSION.
+         *
+         * The script is keyed on `options.sessionId`, which the harness stamps on every loop request
+         * ("Session identity stamped by the loop for request routing"). A single adapter-global counter
+         * was wrong: with several sessions open, only whichever request arrived first would ask, and every
+         * other session went straight to a plain completion, so a multi-session scenario could never
+         * produce several real questions. Per-session state makes the script independent of arrival order.
+         *
+         * Auxiliary calls the loop makes on a session's behalf (`purpose`: compaction or session-title) are
+         * NOT part of the scripted conversation and must not advance it, or a title request would consume
+         * the turn that was meant to ask.
+         *
+         * @param {object} options - the generation options; `sessionId` identifies the session.
          * @returns {AsyncIterable<object>} the chunk stream.
          */
-        async *stream() {
-            state.calls += 1;
-            if (state.calls === 1) {
+        async *stream(options) {
+            const purpose = options && options.purpose;
+            if (purpose === "compaction" || purpose === "session-title") {
+                // An auxiliary request: answer plainly and leave the session's scripted position untouched.
+                const note = "Acknowledged.";
+                yield { type: "block-start", index: 0, blockType: "text" };
+                yield { type: "text-delta", index: 0, text: note };
+                yield { type: "block-end", index: 0, block: { type: "text", text: note } };
+                yield { type: "usage", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+                yield { type: "finish", reason: { kind: "stop" } };
+                return;
+            }
+            // One script position per session. A request with no session identity shares a single position,
+            // which is the correct behaviour for a hand-built one-shot call.
+            const key = options && typeof options.sessionId === "string" && options.sessionId.length > 0
+                ? options.sessionId
+                : "(no-session)";
+            const turn = (state.calls.get(key) ?? 0) + 1;
+            state.calls.set(key, turn);
+            if (turn === 1) {
                 // Ask the question through the REAL tool, which then pauses for the controller.
-                const id = "call-scripted-1";
+                // The call id is namespaced by session so several sessions asking at once stay distinct.
+                const id = `call-scripted-1-${key}`;
                 // A pre-built argument object lets the same scripted provider drive a tool other than the
                 // question tool (for example `notify_controller`), so each real tool path can be exercised.
                 const args = config.toolArguments.length > 0
@@ -98,7 +128,8 @@ export function apply(ctx, config) {
                 yield { type: "finish", reason: { kind: "tool-calls" } };
                 return;
             }
-            // Second call: report completion, so the turn ends after the answer was consumed.
+            // Every later call on this session: report completion and finish, so the turn ends after the
+            // answer was consumed. Exactly one ask per session, then done.
             const text = "Acknowledged the controller's answer.";
             yield { type: "block-start", index: 0, blockType: "text" };
             yield { type: "text-delta", index: 0, text };

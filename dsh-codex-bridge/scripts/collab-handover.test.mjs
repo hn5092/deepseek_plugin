@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startIsolatedInstance } from "./isolated-instance.mjs";
+import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -129,7 +129,8 @@ try {
     record("the notification is attributed to the new binding", notifyAsNew.status === 200 && notifyAsNew.body.bindingId === "codex::new", `binding=${notifyAsNew.body.bindingId}`);
 } finally {
     const outcome = await inst.stop();
-    record("the instance stopped with no residue", outcome.stopped === true && outcome.residue.length === 0, `stopped=${outcome.stopped} residue=${outcome.residue.length}`);
+    const stopVerdict = stopIsClean(outcome);
+    record("the instance stopped with no residue", stopVerdict.clean, stopVerdict.problems.join("; ") || "clean");
     if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
 }
 

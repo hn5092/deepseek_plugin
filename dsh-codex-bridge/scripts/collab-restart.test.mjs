@@ -19,7 +19,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startIsolatedInstance } from "./isolated-instance.mjs";
+import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -91,7 +91,8 @@ try {
         // The stop receipt is asserted rather than logged: a suite must not pass while leaving a host
         // running. `keepLog` is NOT used — a retained scratch directory is a silent leak.
         const stopResult = await first.stop();
-        record("the first host really stopped and its scratch was removed", stopResult.stopped === true && stopResult.residue.length === 0, `stopped=${stopResult.stopped} residue=${stopResult.residue.length}`);
+        const firstStopVerdict = stopIsClean(stopResult);
+        record("the first host really stopped and its scratch was removed", firstStopVerdict.clean, firstStopVerdict.problems.join("; ") || "clean");
     }
 
     // ---- restart on the SAME home ---------------------------------------------------------
@@ -144,7 +145,8 @@ try {
         // retained directory or a surviving host cannot pass unnoticed.
         fs.copyFileSync(second.logFile, path.join(workDir, "second-host.log"));
         const stopResult = await second.stop();
-        record("the second host stopped cleanly and its scratch was removed", stopResult.stopped === true && stopResult.residue.length === 0, `stopped=${stopResult.stopped} residue=${stopResult.residue.length}`);
+        const secondStopVerdict = stopIsClean(stopResult);
+        record("the second host stopped cleanly and its scratch was removed", secondStopVerdict.clean, secondStopVerdict.problems.join("; ") || "clean");
         // Now that the run is over, remove the shared home and verify it is gone.
         fs.rmSync(sharedHome, { recursive: true, force: true });
         record("the shared home is removed and verified gone", fs.existsSync(sharedHome) === false, "no residue");

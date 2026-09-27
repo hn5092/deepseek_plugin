@@ -163,9 +163,17 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
             ? preserveEvidence(evidenceDir, "isolated-instance-exit.log", raw)
             : null;
         try { fs.closeSync(out); } catch { /* already closed */ }
-        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* nothing else to do */ }
+        // Any helper this failed launch may have started is reaped too, then the scratch directory is
+        // removed and its absence VERIFIED: a failed start must not leave residue behind while reporting
+        // only that the start failed.
+        const reapFail = await reapOwnProcessesDetailed([workDir, home], 4000);
+        const leftoverProcesses = reapFail.remaining;
+        let scratchRemoved = false;
+        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* verified next */ }
+        scratchRemoved = !fs.existsSync(workDir);
         throw new Error(
-            `instance exited immediately (code ${child.exitCode}) on port ${port}`
+            `instance exited immediately (code ${child.exitCode}) on port ${port}; scratchRemoved=${scratchRemoved}`
+            + `; leftoverProcesses=${leftoverProcesses.length}; reapQueryFailed=${reapFail.queryFailed}`
             + `${preserved === null ? "" : `; raw log preserved at ${preserved}`}\nLog:\n${raw.slice(-2500)}`
         );
     }
@@ -204,14 +212,17 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
         //     one running is a real leak that a passing suite would otherwise hide. Processes whose
         //     command line names THIS run's scratch directory or home are reaped, and only those, so no
         //     unrelated process can be affected.
-        const leaked = await reapOwnProcesses([workDir, home], 6000);
+        const reap = await reapOwnProcessesDetailed([workDir, home], 6000);
+        const leaked = reap.remaining;
+        // A reap whose CHECK failed must not read as "nothing was left".
+        const reapQueryFailed = reap.queryFailed;
         try { fs.closeSync(out); } catch { /* already closed */ }
 
         // 3) A process that did not exit must NOT be reported as stopped.
         if (!gone) {
-            return { stopped: false, exitCode: child.exitCode, forced, dirRemoved: false, residue: [workDir], preservedHome: null, leaked };
+            return { stopped: false, exitCode: child.exitCode, forced, dirRemoved: false, residue: [workDir], preservedHome: null, leaked, reapQueryFailed };
         }
-        if (keepLog) return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: false, residue: [], preservedHome: null, leaked };
+        if (keepLog) return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: false, residue: [], preservedHome: null, leaked, reapQueryFailed };
 
         // 4) Remove this run's scratch directory. A caller-owned home lives OUTSIDE it, so preserving the
         // home and cleaning the scratch are independent and neither is reported as the other's residue.
@@ -220,14 +231,14 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
         const safeToRemove = path.dirname(workDir) === os.tmpdir() && path.basename(workDir).startsWith("collab-instance-");
         if (!safeToRemove) {
             residue.push(workDir);
-            return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: false, residue, preservedHome: null, leaked };
+            return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: false, residue, preservedHome: null, leaked, reapQueryFailed };
         }
         try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* verified below */ }
         if (fs.existsSync(workDir)) residue.push(workDir);
         // The caller's home is reported as PRESERVED, not as residue: the caller owns it and decides when
         // it is finished with. Conflating the two would make a clean run look leaky and hide a real leak.
         const preservedHome = ownsHome ? null : home;
-        return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: !fs.existsSync(workDir), residue, preservedHome, leaked };
+        return { stopped: true, exitCode: child.exitCode, forced, dirRemoved: !fs.existsSync(workDir), residue, preservedHome, leaked, reapQueryFailed };
     }
 
     if (url === null) {
@@ -297,42 +308,91 @@ async function waitForExit(child, timeoutMs) {
  *
  * @param {ReadonlyArray<string>} ownedPaths - absolute paths that identify this run.
  * @param {number} timeoutMs - how long to wait for them to disappear.
- * @returns {Promise<ReadonlyArray<number>>} the PIDs that were still running after the wait.
+ * @returns {Promise<{remaining: ReadonlyArray<number>, queryFailed: boolean}>} leftover PIDs and whether the check itself worked.
  */
-async function reapOwnProcesses(ownedPaths, timeoutMs) {
-    if (process.platform !== "win32") return [];
+async function reapOwnProcessesDetailed(ownedPaths, timeoutMs) {
+    if (process.platform !== "win32") return { remaining: [], queryFailed: false };
     const markers = ownedPaths.filter((p) => typeof p === "string" && p.length > 0).map((p) => p.toLowerCase());
-    if (markers.length === 0) return [];
-    /** Snapshot the PIDs whose command line names one of this run's paths. */
+    if (markers.length === 0) return { remaining: [], queryFailed: false };
+    /**
+     * Snapshot the PIDs whose command line names one of this run's paths.
+     *
+     * A query that FAILS is reported as `failed` rather than as an empty list: an empty list means "nothing
+     * is left", and returning that when the process table could not be read would turn a blind spot into a
+     * false clean receipt.
+     *
+     * @returns {{pids: ReadonlyArray<number>, failed: boolean}} the owned PIDs and whether the query worked.
+     */
     const findOwned = () => {
         const script = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
             + "Where-Object { $_.CommandLine -ne $null } | "
             + "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
         const result = spawnSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 20_000 });
-        if (result.status !== 0 || typeof result.stdout !== "string" || result.stdout.trim().length === 0) return [];
+        if (result.error !== undefined && result.error !== null) return { pids: [], failed: true };
+        if (result.status !== 0) return { pids: [], failed: true };
+        if (typeof result.stdout !== "string") return { pids: [], failed: true };
+        // No output is a legitimate "no matching processes" only when the command itself succeeded.
+        if (result.stdout.trim().length === 0) return { pids: [], failed: false };
         let rows;
-        try { rows = JSON.parse(result.stdout); } catch { return []; }
+        try { rows = JSON.parse(result.stdout); } catch { return { pids: [], failed: true }; }
         const list = Array.isArray(rows) ? rows : [rows];
-        return list
+        const pids = list
             .filter((row) => row && typeof row.CommandLine === "string")
             .filter((row) => markers.some((marker) => row.CommandLine.toLowerCase().includes(marker)))
             .map((row) => Number(row.ProcessId))
             .filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+        return { pids, failed: false };
     };
+    /** @returns {boolean} whether the kill command itself ran. */
     const kill = (pids) => {
-        if (pids.length === 0) return;
+        if (pids.length === 0) return true;
         const script = pids.map((pid) => `Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`).join("; ");
-        spawnSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 20_000 });
+        const result = spawnSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 20_000 });
+        return !(result.error !== undefined && result.error !== null) && result.status === 0;
     };
 
-    let remaining = findOwned();
-    if (remaining.length === 0) return [];
-    kill(remaining);
+    const first = findOwned();
+    if (first.failed) return { remaining: [], queryFailed: true };
+    if (first.pids.length === 0) return { remaining: [], queryFailed: false };
+    const killed = kill(first.pids);
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 250));
-        remaining = findOwned();
-        if (remaining.length === 0) return [];
+        const next = findOwned();
+        if (next.failed) return { remaining: [], queryFailed: true };
+        if (next.pids.length === 0) return { remaining: [], queryFailed: !killed };
     }
-    return remaining;
+    return { remaining: first.pids, queryFailed: !killed };
+}
+
+/**
+ * End any process still running that belongs to THIS isolated run.
+ * @param {ReadonlyArray<string>} ownedPaths - absolute paths that identify this run.
+ * @param {number} timeoutMs - how long to wait for them to disappear.
+ * @returns {Promise<ReadonlyArray<number>>} the PIDs still running.
+ */
+async function reapOwnProcesses(ownedPaths, timeoutMs) {
+    const result = await reapOwnProcessesDetailed(ownedPaths, timeoutMs);
+    return result.remaining;
+}
+
+/**
+ * Whether a stop receipt shows a genuinely clean stop.
+ *
+ * Lives here, next to the receipt it judges, so every suite asserts the SAME conditions instead of each
+ * inventing a weaker check. A stop counts as clean only when the child really exited, no scratch
+ * directory was left, no process of this run survived, and the leak CHECK itself worked — the last one
+ * matters because a failed process query used to look identical to "nothing was left".
+ *
+ * @param {object} receipt - the value `stop()` returned.
+ * @returns {{clean: boolean, problems: ReadonlyArray<string>}} the judgment and why.
+ */
+export function stopIsClean(receipt) {
+    const problems = [];
+    if (receipt === null || typeof receipt !== "object") return { clean: false, problems: ["no stop receipt"] };
+    if (receipt.stopped !== true) problems.push(`child did not exit (exitCode=${receipt.exitCode})`);
+    if ((receipt.residue ?? []).length > 0) problems.push(`residue: ${receipt.residue.join(", ")}`);
+    if ((receipt.leaked ?? []).length > 0) problems.push(`leaked PIDs: ${receipt.leaked.join(", ")}`);
+    if (receipt.reapQueryFailed === true) problems.push("the process check itself failed, so leaks cannot be ruled out");
+    return { clean: problems.length === 0, problems };
 }

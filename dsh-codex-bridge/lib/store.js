@@ -287,6 +287,89 @@ export class CollabStore {
     }
 
     /**
+     * Reclaim storage for records that are finished, within a configured bound.
+     *
+     * Retention is deliberately narrow, because deleting the wrong thing loses a fact a controller was
+     * owed:
+     *
+     *  - only a signal that the store ALSO records as confirmed is a candidate. An unconfirmed event is
+     *    never removed, no matter how old it is or how far over the cap it pushes the store: the caller
+     *    has not dealt with it yet, so it is still owed, and erasing it to satisfy a limit would silently
+     *    drop a message — exactly what retention must not do;
+     *  - among confirmed events, one is reclaimed only when it is BOTH older than `maxAgeMs` AND beyond
+     *    the newest `maxEvents`, so a burst of recent confirmations is never discarded to satisfy the cap;
+     *  - the matching question record is reclaimed with it, since an answered or cancelled question is
+     *    terminal and no longer needs to be re-read.
+     *
+     * What is removed is REPORTED, and what could not be removed is reported too, so a full store cannot
+     * look like a tidy one. Confirmed-but-retained events keep working for idempotency: an event that is
+     * still on disk is still recognized as already confirmed.
+     *
+     * @param {object} options - retention bounds.
+     * @param {number} options.maxAgeMs - minimum age before a CONFIRMED event may be reclaimed.
+     * @param {number} options.maxEvents - how many confirmed events are always retained, newest first.
+     * @returns {{removed: ReadonlyArray<string>, failed: ReadonlyArray<string>, retained: number, unconfirmed: number}} the outcome.
+     */
+    reclaim({ maxAgeMs, maxEvents }) {
+        if (!this.available) return { removed: [], failed: [], retained: 0, unconfirmed: 0 };
+        const now = Date.now();
+        const { signals } = this.allSignals();
+        // Group by controller: confirmations are per controller, so a signal from one is never retained or
+        // reclaimed on the strength of another's confirmations.
+        const byController = new Map();
+        for (const signal of signals) {
+            if (signal === null || typeof signal !== "object" || typeof signal.id !== "string") continue;
+            const key = typeof signal.controller === "string" ? signal.controller : "";
+            if (!byController.has(key)) byController.set(key, []);
+            byController.get(key).push(signal);
+        }
+        const removed = [];
+        const failed = [];
+        let retained = 0;
+        let unconfirmed = 0;
+        for (const [controller, list] of byController) {
+            const { confirmed } = this.confirmationsFor(controller);
+            const confirmedList = list.filter((signal) => confirmed.has(signal.id));
+            unconfirmed += list.length - confirmedList.length;
+            const ordered = confirmedList
+                .map((signal) => {
+                    const parsed = Date.parse(typeof signal.at === "string" ? signal.at : "");
+                    return { signal, time: Number.isFinite(parsed) ? parsed : now };
+                })
+                .sort((a, b) => b.time - a.time);
+            ordered.forEach((entry, index) => {
+                const tooOld = now - entry.time > maxAgeMs;
+                const beyondCap = index >= maxEvents;
+                if (!(tooOld && beyondCap)) {
+                    // Kept: either recent, or within the guaranteed newest window.
+                    retained += 1;
+                    return;
+                }
+                const signal = entry.signal;
+                const signalFile = resolveInside(this.root, "signals", controller, `${fileNameOf(signal.id)}.json`);
+                const confirmFile = resolveInside(this.root, "confirmations", controller, `${fileNameOf(signal.id)}.json`);
+                const questionFile = typeof signal.bindingId === "string" && typeof signal.reference === "string"
+                    ? resolveInside(this.root, "questions", signal.bindingId, `${fileNameOf(signal.reference.replace("collab-question:", ""))}.json`)
+                    : { ok: false, reason: "not a question" };
+                try {
+                    // The confirmation record is removed LAST: while it exists the event is still known to
+                    // be confirmed, so a crash mid-reclaim cannot resurrect it as outstanding work.
+                    if (signalFile.ok) fs.rmSync(signalFile.file, { force: true });
+                    if (questionFile.ok) fs.rmSync(questionFile.file, { force: true });
+                    if (confirmFile.ok) fs.rmSync(confirmFile.file, { force: true });
+                    removed.push(signal.id);
+                } catch (error) {
+                    // A record that could not be reclaimed stays on disk and is reported, so the store
+                    // never claims to be bounded while it is not.
+                    failed.push({ id: signal.id, reason: error instanceof Error ? error.message : String(error) });
+                    retained += 1;
+                }
+            });
+        }
+        return { removed, failed, retained, unconfirmed };
+    }
+
+    /**
      * Whether the store can actually be written to.
      *
      * Checked at startup so a broken store is reported immediately rather than at the first transfer

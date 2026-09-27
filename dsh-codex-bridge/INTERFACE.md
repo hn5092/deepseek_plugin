@@ -1,6 +1,6 @@
 # dsh-codex-bridge：DS↔Codex 双向协作桥
 
-状态：**隔离实例全部验收 GREEN（9 套 190/190，全部 EXIT=0）；未安装主实例、未重启、未推送。**
+状态：**隔离实例全部验收 GREEN（11 套 219/219，全部 EXIT=0）；未安装主实例、未重启、未推送。**
 作者源码：`D:\workspace\_tools\deepseek_plugin\dsh-codex-bridge\`（唯一）。
 
 ## 一、它解决什么
@@ -64,25 +64,28 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 - **重启**：确认不重现、未确认可补收、**旧 cursor 不漏新事件**、**不重放**；未恢复的工具等待**不复活**，
   答复照常落盘并回 `delivered:false` 说明本进程无活等待。
 
-## 四、验收（全部实测，`EXIT=0`，合计 190/190）
+## 四、验收（全部实测，`EXIT=0`，合计 219/219）
 
 `node scripts/<suite>.test.mjs`：
 
 | 套件 | 结果 | 说明 |
 | --- | --- | --- |
 | `collab-rules` | 30/30 | 纯函数规则层：peer 身份反例 + **失效绑定在真正选择处被排除** |
-| `collab-signals` | 35/35 | 信号规则 + 文件收件箱（扫描/订阅竞态） |
+| `collab-signals` | 36/36 | 信号规则 + 文件收件箱（扫描/订阅竞态、清理断言） |
 | `collab-multi` | 31/31 | 真机：5 会话跨 5 目录 + 第二控制方；**匿/错/冒名一律拒绝** |
 | `collab-loop` | 29/29 | 真机：**真实 `ask_codex` → wait → 答 → 同一调用继续** |
 | `collab-restart` | 14/14 | 真停 host → 同 home 重启：确认不重现、补收、cursor、无重放 |
-| **`collab-pending-restart`** | **16/16** | **真 `ask_codex` 留下 pending 问题 → 真重启**：问题与**其信号**一并重建、`wait-any` 取到、`confirm` 认得、答复 `delivered:false` |
-| `collab-durability` | 14/14 | store 不可写则拒绝；**真实 `notify_controller` 工具返回 `ok:false`**；重试幂等；并发单一终态 |
+| `collab-pending-restart` | 16/16 | **真 `ask_codex` 留下 pending 问题 → 真重启**：问题与**其信号**一并重建 |
+| `collab-durability` | 20/20 | store 不可写则拒绝；**真实工具返回 `ok:false`**；**store 可写但 inbox 不可写**：问题保留、API 仍可取、**工具如实报 `deliveryWarning`** |
 | `collab-native` | 9/9 | 原生 Goal 完成 → delivery（带 Goal 身份）；普通 turn 结束无信号 |
-| **`collab-handover`** | **12/12** | **失效绑定排在最前仍不命中**：真 ask 落到新 owner、旧 owner 读/答**403**、晚答不解析问题、notify 归属新 binding |
+| `collab-handover` | 12/12 | **失效绑定排在最前仍不命中**：旧 owner 读/答 403 |
+| **`collab-five`** | **8/8** | **5 会话并发真 ask → `wait-any` 批收 → 逐问独立答复 → 各原调用恰好继续一次、只读到自己的答复** |
+| **`collab-projection`** | **14/14** | **投影修复**（文件被删后读回自动补建）、**确认过滤**（残留文件不复活已确认事件）、**有界回收**（已确认且过界才回收；**未确认永不因上限删除**） |
 
 另需 `scripts/isolated-instance.mjs`（可丢弃或 caller-owned home + `--patch` overlay，**真 SIGTERM → 等退出 →
-有界 SIGKILL → 复核**的 stop，失败日志复制到 caller 指定的证据目录）与 `scripts/scripted-model/`
-（**测试专用**可控 provider，可驱动任一真实工具）。
+有界 SIGKILL → 复核**的 stop，**回收本次自有孙进程**，失败日志复制到 caller 指定的证据目录，并导出
+`stopIsClean()` 供各套件共用同一收据判定）与 `scripts/scripted-model/`
+（**测试专用**可控 provider：脚本状态**按 `options.sessionId` 分片**，排除辅助调用，**每会话恰好 ask 一次**）。
 
 ## 五、限制（如实）
 

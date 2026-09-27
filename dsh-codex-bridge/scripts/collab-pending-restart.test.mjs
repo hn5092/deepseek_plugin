@@ -20,7 +20,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startIsolatedInstance } from "./isolated-instance.mjs";
+import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -166,7 +166,8 @@ try {
     const outcome = await second.stop();
     // The home is caller-owned and deliberately preserved; only a leaking SCRATCH directory would be
     // this run's fault, so that is what is asserted.
-    record("the restarted host stopped with no scratch residue", outcome.stopped === true && outcome.residue.length === 0, `stopped=${outcome.stopped} residue=${outcome.residue.length}`);
+    const stopVerdict = stopIsClean(outcome);
+    record("the restarted host stopped with no scratch residue", stopVerdict.clean, stopVerdict.problems.join("; ") || "clean");
     record("the caller-owned home was preserved across the restart, not silently deleted", outcome.preservedHome === sharedHome, `preserved=${outcome.preservedHome === sharedHome}`);
     // Now that the whole scenario is over, the shared home is removed and verified gone.
     fs.rmSync(sharedHome, { recursive: true, force: true });

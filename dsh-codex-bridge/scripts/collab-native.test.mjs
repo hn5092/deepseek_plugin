@@ -21,7 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startIsolatedInstance } from "./isolated-instance.mjs";
+import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -108,7 +108,8 @@ try {
     }
 } finally {
     const stopped = await inst.stop();
-    record("the instance stopped with no residue", stopped.stopped === true && stopped.residue.length === 0, `residue=${stopped.residue.length}`);
+    const stopVerdict = stopIsClean(stopped);
+    record("the instance stopped with no residue", stopVerdict.clean, stopVerdict.problems.join("; ") || "clean");
     if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
 }
 

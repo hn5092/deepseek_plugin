@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startIsolatedInstance } from "./isolated-instance.mjs";
+import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -128,8 +128,12 @@ try {
     record("an unbound controller cannot wait on these bindings", otherController.status === 403, `status=${otherController.status}`);
 
     // ---- 4) an explicit notification raises a signal; a plain finished turn does not -------
+    // The contract is specifically about DELIVERY: a finished turn says nothing about whether the
+    // business result is complete, so it must not produce a delivery. The count of ALL signals is not the
+    // right measure — the scripted provider asks a question on session B's first turn, which is a
+    // legitimate question signal and not what this rule is about.
     const beforeNotify = await call("/signals?controller=codex");
-    const beforeCount = (beforeNotify.body.signals ?? []).length;
+    const beforeDeliveries = (beforeNotify.body.signals ?? []).filter((s) => s.kind === "delivery").length;
 
     await client.rpc("session/prompt", {
         request: { sessionId: sessionB, requestId: crypto.randomUUID(), mode: "queue", content: [{ type: "text", text: "Just answer briefly." }], clientTimeZone: "Asia/Shanghai" }
@@ -137,7 +141,8 @@ try {
     // Let the turn finish; a finished turn alone must NOT create a delivery signal.
     await new Promise((r) => setTimeout(r, 4000));
     const afterTurn = await call("/signals?controller=codex");
-    record("a finished turn alone does not become a delivery signal", (afterTurn.body.signals ?? []).length === beforeCount, `before=${beforeCount} after=${(afterTurn.body.signals ?? []).length}`);
+    const afterDeliveries = (afterTurn.body.signals ?? []).filter((s) => s.kind === "delivery").length;
+    record("a finished turn alone does not become a delivery signal", afterDeliveries === beforeDeliveries, `deliveries before=${beforeDeliveries} after=${afterDeliveries}`);
 
     const notified = await call("/notify", { method: "POST", body: JSON.stringify({ sessionId: sessionB, controller: "codex", kind: "delivery", text: "slice complete" }) });
     record("an explicit delivery notification is accepted", notified.status === 200, `status=${notified.status}`);
@@ -177,7 +182,8 @@ try {
 } finally {
     // The stop receipt is asserted, not discarded: a suite must not pass while leaving a process behind.
     const outcome = await inst.stop();
-    record("the instance stopped cleanly", outcome.stopped === true && outcome.residue.length === 0, `stopped=${outcome.stopped} residue=${outcome.residue.length}`);
+    const stopVerdict = stopIsClean(outcome);
+    record("the instance stopped cleanly", stopVerdict.clean, stopVerdict.problems.join("; ") || "clean");
     fs.rmSync(workDir, { recursive: true, force: true });
 }
 

@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startIsolatedInstance } from "./isolated-instance.mjs";
+import { startIsolatedInstance, stopIsClean } from "./isolated-instance.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -110,9 +110,10 @@ try {
 
     // ---- 2) a healthy store: concurrent answer and cancel, one terminal state ---------------
     const healthyStore = path.join(workDir, "store");
+    const healthyInbox = path.join(workDir, "inbox");
     const healthy = await startIsolatedInstance({
         pluginRoot, bindings, controllerTokens, answerTimeoutMs: 6000,
-        inboxRoot: path.join(workDir, "inbox"), storeRoot: healthyStore
+        inboxRoot: healthyInbox, storeRoot: healthyStore
     });
     try {
         const client = new DshClient(new URL(healthy.url), 55_000);
@@ -172,7 +173,68 @@ try {
         const late = await callOn(healthy, "/answer", { method: "POST", body: JSON.stringify({ questionId: cancelId, text: "too late", source: "codex", controller: "codex" }) });
         record("an answer to a cancelled question is refused", late.status === 409, `status=${late.status}`);
     } finally {
-        await healthy.stop();
+        const outcome = await healthy.stop();
+        const verdict = stopIsClean(outcome);
+        record("the healthy instance stopped with no residue", verdict.clean, verdict.problems.join("; ") || "clean");
+    }
+
+    // ---- 3) store WRITABLE but inbox NOT: the question is kept, the degraded notice is reported ---
+    // This is the case that "the store is unwritable" does not cover. The durable record must still be
+    // made and the question must remain answerable through the API, while the failure of the FILE
+    // notification is REPORTED rather than hidden — a broken file inbox must not silently masquerade as
+    // a reliable notification, and must not discard a question that is perfectly answerable.
+    const degradedInbox = path.join(workDir, "inbox-blocked");
+    fs.writeFileSync(degradedInbox, "a file where the inbox directory must be", "utf8");
+    const degraded = await startIsolatedInstance({
+        pluginRoot, bindings, controllerTokens, answerTimeoutMs: 8000,
+        inboxRoot: degradedInbox, storeRoot: path.join(workDir, "store-degraded"),
+        scripted: { question: "Is the degraded inbox reported?" },
+        evidenceDir: path.join(workDir, "evidence")
+    });
+    try {
+        const client3 = new DshClient(new URL(degraded.url), 55_000);
+        await client3.login();
+        degraded.cookie = client3.cookie;
+        await client3.rpc("session/create", { request: { cwd: projDir, sessionId } });
+
+        void client3.rpc("session/prompt", {
+            request: {
+                sessionId,
+                requestId: crypto.randomUUID(),
+                mode: "queue",
+                content: [{ type: "text", text: 'Call the tool "ask_codex" with a question.' }],
+                clientTimeZone: "Asia/Shanghai"
+            }
+        }).catch(() => { /* the tool result is what is under test */ });
+
+        let pending = null;
+        for (let i = 0; i < 30 && pending === null; i += 1) {
+            await new Promise((r) => setTimeout(r, 500));
+            const listed = await callOn(degraded, `/questions?sessionId=${sessionId}&controller=codex`);
+            pending = (listed.body.questions ?? [])[0] ?? null;
+        }
+        record("a question survives an unwritable file inbox", pending !== null, pending ? `id=${pending.id}` : "no question recorded");
+
+        // The durable signal must still be visible through the API even though its file could not be made.
+        const signals = await callOn(degraded, "/signals?controller=codex");
+        record("the question is still offered through the API when the inbox is broken", (signals.body.signals ?? []).some((s) => s.kind === "question"), `kinds=${JSON.stringify((signals.body.signals ?? []).map((s) => s.kind))}`);
+
+        // The question is still answerable, so a degraded notification did not cost the work itself.
+        if (pending !== null) {
+            const answered = await callOn(degraded, "/answer", { method: "POST", body: JSON.stringify({ questionId: pending.id, text: "yes, reported", source: "codex", controller: "codex" }) });
+            record("the question is still answerable despite the broken inbox", answered.status === 200 && answered.body.ok === true, `status=${answered.status}`);
+        }
+
+        // The model-facing tool must surface the degraded notification rather than implying success. The
+        // tool result only exists AFTER the call completes, so it is read once the answer has resumed it.
+        await new Promise((r) => setTimeout(r, 4000));
+        const snap = await client3.snapshot(sessionId, 200);
+        const toolText = JSON.stringify(snap.records.map((r) => r.event).filter((e) => e && e.type === "tool/result").map((e) => e.data));
+        record("the real tool reports the degraded file delivery", /deliveryWarning/.test(toolText) && /not-delivered/.test(toolText), toolText.slice(0, 200));
+    } finally {
+        const outcome = await degraded.stop();
+        const verdict = stopIsClean(outcome);
+        record("the degraded instance stopped with no residue", verdict.clean, verdict.problems.join("; ") || "clean");
     }
 } finally {
     if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });

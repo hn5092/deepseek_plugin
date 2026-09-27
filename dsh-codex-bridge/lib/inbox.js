@@ -175,38 +175,8 @@ export function watchInbox(dir, onSnapshot) {
     };
 }
 
-/**
- * Bound one inbox's retention.
- *
- * Everything a caller has not confirmed is still owed to them, so pruning is reported rather than
- * silent: the result says exactly which events were dropped. An event is dropped only when it is
- * BOTH older than `maxAgeMs` AND beyond the newest `maxEvents`, so a burst of recent events is never
- * discarded to satisfy the cap, and a backlog of unconfirmed events is never quietly erased to make
- * the inbox look empty.
- *
- * @param {string} dir - this controller's inbox directory.
- * @param {object} options - retention options.
- * @param {number} options.maxAgeMs - an event must be at least this old to be eligible.
- * @param {number} options.maxEvents - the newest events always retained.
- * @returns {{removed: ReadonlyArray<string>, retained: number}} the dropped ids and how many remain.
- */
-export function pruneInbox(dir, { maxAgeMs, maxEvents }) {
-    const now = Date.now();
-    const { signals } = readSignals(dir);
-    const ordered = signals
-        .map((signal) => {
-            const parsed = Date.parse(signal.at ?? "");
-            return { id: signal.id, time: Number.isFinite(parsed) ? parsed : now };
-        })
-        .sort((a, b) => b.time - a.time);
-
-    const removed = [];
-    ordered.forEach((entry, index) => {
-        const tooOld = now - entry.time > maxAgeMs;
-        const beyondCap = index >= maxEvents;
-        if (!(tooOld && beyondCap)) return;
-        const result = confirmSignal(dir, entry.id);
-        if (result.removed) removed.push(entry.id);
-    });
-    return { removed, retained: ordered.length - removed.length };
-}
+// Retention is NOT implemented here. An inbox file is a projection of a durable signal, so whether an
+// event may be reclaimed is a question about the SIGNAL's authority — is it confirmed, is it terminal,
+// how old is it — which only the store that owns those records can answer. A directory-level prune that
+// decides by file age alone would delete events a controller had not confirmed yet, dropping owed
+// messages to satisfy a cap. See `CollabStore.reclaim`.
