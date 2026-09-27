@@ -2,16 +2,20 @@ import { randomUUID } from "node:crypto";
 import z from "@deepseek-ai/schemastery";
 import { z as zod } from "zod";
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import {
+    ANSWER_SOURCES,
     answerVerdict,
+    assertSingleOwner,
     bindingsOf,
+    identifyController,
     isKnownController,
     matchBinding,
     normalizeBinding,
     pendingQuestions,
     questionStateOf
 } from "./collab.js";
-import { deliverableSignals, normalizeSignal, signalVerdict, waitOutcome } from "./signals.js";
+import { deliverableSignals, normalizeSignal, recoverSignals, signalVerdict, waitOutcome } from "./signals.js";
 import { confirmSignal, inboxDirFor, publishSignal, readSignals } from "./inbox.js";
 
 /** Cordis plugin name; the profile patch row id stays independent of it. */
@@ -26,7 +30,7 @@ export const name = "codex-bridge";
  * existing message delivery working. Every service read here is declared, because Cordis throws on an
  * undeclared access.
  */
-export const inject = ["webServer", "sessionController", "agents", "tools", "sessionProjections", "connection"];
+export const inject = ["webServer", "sessionController", "agents", "tools", "sessionProjections", "connection", "credentials"];
 
 /** Refuse oversized request bodies instead of buffering them. */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -41,6 +45,8 @@ const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 const EVENT_QUESTION = "collab/question";
 const EVENT_ANSWER = "collab/answer";
 const EVENT_CANCEL = "collab/cancel";
+const EVENT_NOTIFY = "collab/notify";
+const EVENT_CONFIRM = "collab/confirm";
 
 /** The projection key folding those events. */
 const PROJECTION_KEY = "collabQuestions";
@@ -69,7 +75,14 @@ export const Config = z.object({
         bindingId: z.string(),
         sessionId: z.string(),
         cwd: z.string(),
-        controller: z.string()
+        controller: z.string(),
+        /**
+         * Credential reference that identifies this controller. The secret itself lives in the
+         * credentials service and is never part of configuration, the session, or the repository.
+         */
+        tokenRef: z.string(),
+        /** False marks a binding superseded by a handover, so an old owner can no longer answer. */
+        current: z.boolean().default(true)
     })).default([]),
     /**
      * Default bound on how long an ask waits for a controller before returning `interrupted`.
@@ -150,6 +163,18 @@ export function apply(ctx, config) {
         if (normalized.ok) bindings.push(normalized.binding);
         else ctx.logger.warn("codex-bridge: ignoring invalid binding (%s): %o", normalized.reason, raw);
     }
+    // One session may have exactly one effective answer owner. Two owners would make an answer
+    // ambiguous and could produce two terminal outcomes for one tool call, so an ambiguous session is
+    // refused outright — its bindings are dropped, leaving it with NO answer owner rather than two. A
+    // handover is expressed by marking the predecessor `current: false`.
+    const ownership = assertSingleOwner(bindings);
+    if (!ownership.ok) {
+        const ambiguous = ownership.sessionId;
+        ctx.logger.error("codex-bridge: %s; refusing every binding for that session", ownership.reason);
+        for (let i = bindings.length - 1; i >= 0; i -= 1) {
+            if (bindings[i].sessionId === ambiguous) bindings.splice(i, 1);
+        }
+    }
 
     /** Live waiters only: `questionId` -> resolver. Not a record; the log is the record. */
     const waiters = new Map();
@@ -173,6 +198,84 @@ export function apply(ctx, config) {
     const inboxRoot = typeof config.inboxRoot === "string" && config.inboxRoot.length > 0 ? config.inboxRoot : null;
 
     /**
+     * Confirmed event ids, read from the authoritative session events.
+     *
+     * Confirmation is recorded as a durable event rather than as a client-supplied list, so every view
+     * (the memory projection, the file inbox, and a view rebuilt after a restart) agrees on what has
+     * been dealt with. Reading it from the log on each call is what makes a confirmation survive a
+     * restart without a second writable truth.
+     *
+     * @returns {Set<string>} the confirmed event ids.
+     */
+    const durableConfirmed = () => {
+        const confirmed = new Set();
+        try {
+            // Read through the injected agent registry rather than any other service, so this uses the
+            // same live-Agent view the rest of the bridge does.
+            const live = ctx.agents.list();
+            for (const agent of live) {
+                const events = agent && agent.session && agent.session.snapshotEvents ? agent.session.snapshotEvents() : null;
+                if (!Array.isArray(events)) continue;
+                for (const event of events) {
+                    if (event && event.type === EVENT_CONFIRM && event.data && typeof event.data.signalId === "string") {
+                        confirmed.add(event.data.signalId);
+                    }
+                }
+            }
+        } catch {
+            // An unreadable log means "nothing known confirmed", never "everything confirmed".
+        }
+        return confirmed;
+    };
+
+    /**
+     * Secrets resolved once at startup, keyed by credential reference.
+     *
+     * Kept in memory only for the life of the instance, never written to the session, a log or Git.
+     * Resolving once also means a request never triggers a credential read on the hot path.
+     */
+    const controllerSecrets = new Map();
+
+    /** Load every declared controller credential from the shell's credential owner. */
+    const loadControllerSecrets = async () => {
+        const refs = [...new Set(bindings.map((entry) => entry.tokenRef).filter((ref) => typeof ref === "string" && ref.length > 0))];
+        for (const ref of refs) {
+            try {
+                const resolved = await ctx.credentials.resolve(credentialRef(ref));
+                const value = resolved && typeof resolved.value === "string" ? resolved.value : "";
+                if (value.length > 0) controllerSecrets.set(ref, value);
+                else ctx.logger.warn("codex-bridge: controller credential %s is not configured; that controller cannot authenticate", ref);
+            } catch (error) {
+                ctx.logger.warn("codex-bridge: controller credential %s could not be resolved: %s", ref, messageOf(error));
+            }
+        }
+    };
+
+    /**
+     * Resolve a controller's credential reference to its secret, from the startup cache.
+     *
+     * The bridge never stores a secret of its own: the reference is configuration, the value lives in
+     * the credentials service, and nothing resolved here is logged, echoed or persisted. An
+     * unresolvable reference yields null, which makes that controller unauthenticatable rather than
+     * silently acceptable.
+     *
+     * @param {string} ref - credential reference name declared on a binding.
+     * @returns {string|null} the secret, or null when it cannot be resolved.
+     */
+    const resolveControllerSecret = (ref) => {
+        const cached = controllerSecrets.get(ref);
+        return typeof cached === "string" && cached.length > 0 ? cached : null;
+    };
+
+    // Load the declared controller credentials now, and expose the load for the readiness gate below.
+    // Until this resolves, controllerSecrets is empty and every collaboration request is refused as
+    // unidentified — the fail-closed direction, never the permissive one.
+    let secretsReady = false;
+    const secretsLoaded = loadControllerSecrets().then(() => { secretsReady = true; });
+    /** @returns {boolean} whether the credential cache has been populated. */
+    const controllerAuthReady = () => secretsReady;
+
+    /**
      * Record one signal and notify waiters.
      *
      * The optional file projection is published first, so a controller that is watching files sees the
@@ -188,16 +291,44 @@ export function apply(ctx, config) {
         const candidate = { ...normalized.signal, seq: sequence + 1 };
         const verdict = signalVerdict(signals.get(candidate.id) ?? null, candidate);
         if (verdict.action === "conflict") return { ok: false, reason: verdict.reason };
-        if (verdict.action === "same") return { ok: true, signal: signals.get(candidate.id), duplicate: true };
+        // A repeat of the SAME identity adds no second event. Its file may still need republishing if an
+        // earlier write failed, but that must never create another business event.
+        if (verdict.action === "same") {
+            const known = signals.get(candidate.id);
+            const republish = republishSignal(known);
+            return { ok: true, signal: known, duplicate: true, ...(republish.ok ? {} : { fileError: republish.reason }) };
+        }
         sequence += 1;
         signals.set(candidate.id, candidate);
-        if (inboxRoot !== null) {
-            const dir = inboxDirFor(inboxRoot, candidate.controller);
-            if (dir.ok) publishSignal(dir.dir, candidate);
-            else ctx.logger.warn("codex-bridge: inbox refused for controller %o: %s", candidate.controller, dir.reason);
-        }
+        // The in-memory record is authoritative for this process and always succeeds; the FILE is a
+        // notification projection and CAN fail (a read-only root, a full disk). Its failure is reported
+        // rather than swallowed, because the caller must not believe a controller was reliably notified.
+        const file = republishSignal(candidate);
         for (const wake of [...signalWaiters]) wake();
-        return { ok: true, signal: candidate, duplicate: false };
+        return { ok: true, signal: candidate, duplicate: false, ...(file.ok ? {} : { fileError: file.reason }) };
+    };
+
+    /**
+     * Write one signal's file into its controller's inbox.
+     *
+     * Publishing is idempotent by event id: retrying after a failure overwrites the same final name and
+     * never produces a second business event. A controller whose directory cannot be resolved (an
+     * unsafe id, or no configured root) is reported as a failure rather than silently skipped.
+     *
+     * @param {object} signal - a normalized signal.
+     * @returns {{ok: true, file: string} | {ok: false, reason: string}} the outcome.
+     */
+    const republishSignal = (signal) => {
+        if (inboxRoot === null) return { ok: false, reason: "file-inbox-not-configured" };
+        const dir = inboxDirFor(inboxRoot, signal.controller);
+        if (!dir.ok) return { ok: false, reason: dir.reason };
+        const published = publishSignal(dir.dir, signal);
+        if (!published.ok) {
+            // Visible in the plugin log as well, so an operator can see a broken inbox without reading
+            // the response of whichever call happened to notice first.
+            ctx.logger.warn("codex-bridge: signal %s could not be written to the inbox: %s", signal.id, published.reason);
+        }
+        return published;
     };
 
     // ---- durable events + projection --------------------------------------------------------
@@ -410,6 +541,198 @@ export function apply(ctx, config) {
         }
     }));
 
+    /**
+     * Record one notification durably and raise its signal.
+     *
+     * Shared by the DS-side tool and the passive `/notify` route, so both paths produce the same event,
+     * the same identity fields and the same signal — one producer, not two implementations that can
+     * drift. The durable event is the record; the signal and its file are notifications about it.
+     *
+     * @param {object} input - the notification.
+     * @param {object} input.agent - the owning agent.
+     * @param {object} input.binding - the binding that owns this session.
+     * @param {string} input.kind - "delivery" or "error".
+     * @param {string} input.text - short summary.
+     * @param {string} [input.goalId] - Goal identity.
+     * @param {string} [input.requestId] - request identity.
+     * @param {string} input.at - ISO timestamp.
+     * @returns {{eventId: string, signalId: string, raised: object}} the produced identities.
+     */
+    const produceNotification = async ({ agent, binding, kind, text, goalId, requestId, at }) => {
+        // A stable event id: retrying the same notification (same binding, kind, goal and request at the
+        // same instant is not the identity — the identity is derived from what the notification IS) must
+        // not create a second business event. Callers that retry pass the same requestId, so that is the
+        // natural identity when present; otherwise a fresh id is right because it is a new notification.
+        const eventId = typeof requestId === "string" && requestId.length > 0
+            ? `notify-${binding.bindingId}-${requestId}-${kind}`
+            : `notify-${randomUUID()}`;
+        const signalId = `sig-${eventId}`;
+        sequence += 1;
+        const record = {
+            // `id` is the signal identity every rule keys on; `signalId` is the same value under the name
+            // the durable event and the HTTP surface use, so both spellings agree rather than drifting.
+            id: signalId,
+            signalId,
+            eventId,
+            bindingId: binding.bindingId,
+            controller: binding.controller,
+            sessionId: binding.sessionId,
+            cwd: binding.cwd,
+            kind,
+            seq: sequence,
+            ...(goalId === undefined ? {} : { goalId }),
+            ...(requestId === undefined ? {} : { requestId }),
+            reference: `collab-notify:${binding.sessionId}:${at}`,
+            at
+        };
+        // Raise the signal once. Its file projection is published as part of raising it, and the outcome
+        // is returned so a caller learns the truth instead of assuming delivery.
+        const raised = raiseSignal(record);
+        // A signal that could not be raised means the controller will not be woken. The durable event is
+        // still written below (so the fact is not lost), but the failure is propagated so no caller can
+        // mistake this for a delivered notification.
+        if (!raised.ok) {
+            ctx.logger.error("codex-bridge: notification %s could not raise a signal: %s", signalId, raised.reason);
+        }
+        // The durable event carries the SAME identity, so a rebuild after a restart reconstructs this
+        // event exactly — including its signalId and cursor — instead of inventing a new identity.
+        agent.append(EVENT_NOTIFY, {
+            signalId,
+            eventId,
+            bindingId: binding.bindingId,
+            controller: binding.controller,
+            sessionId: binding.sessionId,
+            cwd: binding.cwd,
+            kind,
+            seq: record.seq,
+            ...(goalId === undefined ? {} : { goalId }),
+            ...(requestId === undefined ? {} : { requestId }),
+            reference: record.reference,
+            text,
+            at
+        });
+        return { eventId, signalId, raised, fileError: raised.ok ? raised.fileError : `signal-not-raised:${raised.reason}` };
+    };
+
+    /** The DS-side producer for completion and failure.
+     *
+     * A delivery or an abnormal stop must be declared by the session that actually did the work, through
+     * a formal caller — not inferred from an ordinary finished turn, and not fabricated by whoever is
+     * watching. This tool is that caller: it records the notification durably and raises the signal the
+     * controller waits on.
+     *
+     * `error` is also raised automatically when the loop ends a turn with a real terminal error (see the
+     * `turn/end` listener below), so an abnormal stop is reported even if the model never gets to call
+     * this tool.
+     */
+    ctx.tools.register(defineTool({
+        name: "notify_controller",
+        description: "Tell the controlling agent (Codex) that this session's business result is complete, or that it stopped abnormally. A finished turn alone is not a delivery; call this when the work is actually done or has failed.",
+        parameters: {
+            kind: {
+                type: "string",
+                required: true,
+                description: "delivery for a completed result, error for an abnormal stop."
+            },
+            text: {
+                type: "string",
+                description: "Short summary of what completed, or what failed."
+            },
+            goalId: {
+                type: "string",
+                description: "Optional Goal identity this result belongs to."
+            },
+            requestId: {
+                type: "string",
+                description: "Optional request identity this result answers."
+            }
+        },
+        output: {
+            schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    ok: { type: "boolean", required: true },
+                    signalId: { type: "string" },
+                    reason: { type: "string" }
+                }
+            },
+            render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }]
+        },
+        async execute(args, exec) {
+            const kind = typeof args.kind === "string" ? args.kind : "";
+            if (kind !== "delivery" && kind !== "error") {
+                return { ok: false, reason: "kind must be delivery or error" };
+            }
+            const agent = exec.agent;
+            const sessionId = agent && agent.id;
+            if (typeof sessionId !== "string" || sessionId.length === 0) {
+                return { ok: false, reason: "notify_controller requires a Session identity" };
+            }
+            const cwd = typeof agent.session?.header?.cwd === "string" ? agent.session.header.cwd : "";
+            const bound = matchBinding({ sessionId, cwd }, bindings);
+            if (!bound.allowed) {
+                return { ok: false, reason: `not-a-controlled-session:${bound.reason}` };
+            }
+            const at = new Date().toISOString();
+            const produced = await produceNotification({
+                agent: agent.session,
+                binding: bound.binding,
+                kind,
+                text: typeof args.text === "string" ? args.text : "",
+                ...(typeof args.goalId === "string" && args.goalId.length > 0 ? { goalId: args.goalId } : {}),
+                ...(typeof args.requestId === "string" && args.requestId.length > 0 ? { requestId: args.requestId } : {}),
+                at
+            });
+            return { ok: true, signalId: produced.signalId };
+        }
+    }));
+
+    // ---- real terminal failures become error signals -----------------------------------------
+
+    /**
+     * Report an ABNORMAL END of a turn as an `error` signal.
+     *
+     * A normal `turn/end` is explicitly NOT a delivery: the turn ending says nothing about whether the
+     * business result is complete, which is why only the session's own `notify_controller` declares a
+     * delivery. A turn that ends with a real terminal error, however, is a genuine abnormal stop, and
+     * the controller must hear about it even if the model never got to call the tool. This is the
+     * automatic half; the tool is the explicit half.
+     */
+    ctx.on("session/event", (session, event) => {
+        try {
+            if (event === null || event === undefined || event.type !== "turn/end") return;
+            const reason = event.data && event.data.reason;
+            if (reason === null || reason === undefined || reason.kind !== "error") return;
+            const sessionId = session && typeof session.id === "string" ? session.id : "";
+            if (sessionId.length === 0) return;
+            const headerCwd = session.header && typeof session.header.cwd === "string" ? session.header.cwd : "";
+            const bound = matchBinding({ sessionId, cwd: headerCwd }, bindings);
+            if (!bound.allowed) return;
+            const message = reason.error && typeof reason.error.message === "string" ? reason.error.message : "";
+            const requestId = typeof event.data.requestId === "string" ? event.data.requestId : undefined;
+            // Identity is derived from the failure itself, so a re-delivered turn/end for the SAME failed
+            // turn raises the SAME signal instead of a second business event.
+            //
+            // DEFERRED deliberately: `session/event` is emitted from inside the session's own append, and
+            // appending from within an observer re-enters the publisher ("session append cannot reenter
+            // while another append is being published") and takes the whole host down. Recording the
+            // notification on a later tick leaves the append that triggered us to finish first.
+            setImmediate(() => {
+                produceNotification({
+                    agent: session,
+                    binding: bound.binding,
+                    kind: "error",
+                    text: message,
+                    ...(requestId === undefined ? {} : { requestId: `turn-error-${requestId}` }),
+                    at: new Date().toISOString()
+                }).catch((error) => ctx.logger.warn("codex-bridge: could not report a terminal turn failure: %s", messageOf(error)));
+            });
+        } catch (error) {
+            ctx.logger.warn("codex-bridge: could not report a terminal turn failure: %s", messageOf(error));
+        }
+    });
+
     // ---- existing passive delivery ----------------------------------------------------------
 
     /** Sessions the shell currently knows about, used to reject typos instead of queueing into the void. */
@@ -461,8 +784,18 @@ export function apply(ctx, config) {
     /**
      * Collaboration surface.
      *
-     * Every request passes the shell's OWN admission fence first (`connection.admit`): the Host/Origin
-     * check and browser authentication. A loopback address is not treated as authorization.
+     * Two independent gates, because they prove different things:
+     *
+     * 1. `connection.admit` proves the request speaks for THIS deployment's operator off the loopback
+     *    interface. It is necessary but NOT sufficient — it maps every accepted request to the same
+     *    `operator` peer, so it cannot tell one controller from another.
+     * 2. A per-controller CREDENTIAL identifies WHICH controller is calling. The declared bindings name
+     *    a credential reference for each controller, and the request must present the matching secret;
+     *    the server then uses the controller it resolved, never a name the caller supplied.
+     *
+     * A `controller` field in a query or body is therefore treated as a claim that must agree with the
+     * resolved identity, never as the identity itself. The secret is compared in memory only: it is
+     * never logged, echoed, or written to the session.
      */
     const collabHandler = async (request, response) => {
         const admission = ctx.connection && typeof ctx.connection.admit === "function"
@@ -479,12 +812,37 @@ export function apply(ctx, config) {
 
         const url = new URL(request.url, "http://127.0.0.1");
         const route = url.pathname.slice(collabBase.length) || "/";
+        // Wait for the credential cache before identifying anyone: a request that arrives during the
+        // first milliseconds is answered 503 (retryable) rather than 401 (which would wrongly blame the
+        // caller's credential).
+        if (!controllerAuthReady()) {
+            await secretsLoaded;
+        }
+        // The controller credential arrives in a dedicated header so it never lands in a URL, a log
+        // line, or a referrer the way a query parameter would.
+        const offered = typeof request.headers["x-controller-token"] === "string" ? request.headers["x-controller-token"] : "";
+        const identity = identifyController(offered, bindings, resolveControllerSecret);
+        if (!identity.ok) {
+            send(response, 401, { error: identity.reason, hint: "present the controller credential in the x-controller-token header" });
+            return;
+        }
+        const controller = identity.controller;
+        /**
+         * Refuse a request whose stated controller disagrees with the credential it presented.
+         * @param {unknown} claimed - the controller name from a query or body.
+         * @returns {boolean} whether the claim is absent or matches.
+         */
+        const claimAgrees = (claimed) => claimed === undefined || claimed === null || claimed === "" || claimed === controller;
         try {
             if (request.method === "GET" && route === "/bindings") {
                 // A controller sees its OWN bindings, never a global list, so independent controllers
                 // cannot discover each other's sessions. With no controller named, the declared count is
                 // reported without identities.
-                const controller = url.searchParams.get("controller") || "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(url.searchParams.get("controller"))) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 if (controller.length === 0) {
                     send(response, 200, { count: bindings.length, controllers: [...new Set(bindings.map((b) => b.controller))] });
                     return;
@@ -499,14 +857,20 @@ export function apply(ctx, config) {
 
             if (request.method === "GET" && route === "/signals") {
                 // The pure projection of what this controller is owed, independent of any wait.
-                const controller = url.searchParams.get("controller") || "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(url.searchParams.get("controller"))) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 const acknowledgedRaw = url.searchParams.get("acknowledged");
                 const acknowledged = acknowledgedRaw === null ? [] : acknowledgedRaw.split(",").filter((id) => id.length > 0);
                 if (!isKnownController(bindings, controller)) {
                     send(response, 403, { error: `not your binding: controller-not-bound` });
                     return;
                 }
-                const deliverable = deliverableSignals([...signals.values()], controller, acknowledged);
+                // Durably confirmed events are excluded for every caller, not only for one that remembers
+                // to send its own list, so all views agree on what has been dealt with.
+                const deliverable = deliverableSignals([...signals.values()], controller, [...durableConfirmed(), ...acknowledged]);
                 send(response, 200, { signals: deliverable, cursor: deliverable.length > 0 ? deliverable[deliverable.length - 1].seq : null });
                 return;
             }
@@ -514,7 +878,11 @@ export function apply(ctx, config) {
             if (request.method === "GET" && route === "/signals/files") {
                 // Read the FILE projection directly. The directory is re-read every call, so a missed
                 // watcher notification cannot hide an event.
-                const controller = url.searchParams.get("controller") || "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(url.searchParams.get("controller"))) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 if (!isKnownController(bindings, controller)) {
                     send(response, 403, { error: "not your binding: controller-not-bound" });
                     return;
@@ -544,34 +912,62 @@ export function apply(ctx, config) {
                     send(response, 400, { error: "body is not JSON" });
                     return;
                 }
-                const controller = typeof body.controller === "string" ? body.controller : "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(typeof body.controller === "string" ? body.controller : "")) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 const signalId = typeof body.signalId === "string" ? body.signalId : "";
                 if (!isKnownController(bindings, controller)) {
                     send(response, 403, { error: "not your binding: controller-not-bound" });
                     return;
                 }
-                if (inboxRoot === null) {
-                    send(response, 200, { ok: true, confirmed: false, reason: "file-inbox-not-configured" });
+                const known = signals.get(signalId);
+                if (known === undefined) {
+                    send(response, 404, { error: `unknown signal "${signalId}"` });
                     return;
                 }
-                const dir = inboxDirFor(inboxRoot, controller);
-                if (!dir.ok) {
-                    send(response, 400, { error: dir.reason });
+                // Only the binding that owns the event may confirm it: one controller cannot retire
+                // another's event, and a superseded binding cannot retire its successor's.
+                if (known.controller !== controller) {
+                    send(response, 403, { error: "not your event" });
                     return;
                 }
-                confirmSignal(dir.dir, signalId);
-                send(response, 200, { ok: true, confirmed: true, signalId });
+                // Confirmation is DURABLE: it is written as an event on the owning session, so every view
+                // (memory, files, and a view rebuilt after a restart) agrees and it survives a restart.
+                // It is idempotent by event id, so a repeat is the same outcome.
+                const already = durableConfirmed().has(signalId);
+                if (!already) {
+                    const agent = ctx.agents.get(known.sessionId);
+                    if (agent === undefined || agent === null) {
+                        send(response, 409, { error: "session-not-live", signalId, hint: "the confirmation could not be recorded; retry once the session is live" });
+                        return;
+                    }
+                    agent.session.append(EVENT_CONFIRM, { signalId, controller, at: new Date().toISOString() });
+                }
+                // The file is a projection of the same fact, so removing it is part of the same act; a
+                // failure to remove it is reported but cannot un-confirm the authoritative record.
+                let fileNote = null;
+                if (inboxRoot !== null) {
+                    const dir = inboxDirFor(inboxRoot, controller);
+                    if (dir.ok) confirmSignal(dir.dir, signalId);
+                    else fileNote = dir.reason;
+                }
+                send(response, 200, { ok: true, confirmed: true, idempotent: already, signalId, ...(fileNote === null ? {} : { fileNote }) });
                 return;
             }
 
             if (request.method === "GET" && route === "/wait-any") {
                 // Wait across ALL of this controller's bound sessions; the first wakeworthy event wins.
                 // Backlog returns immediately, so a controller that was away does not wait at all.
-                const controller = url.searchParams.get("controller") || "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(url.searchParams.get("controller"))) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 const sinceRaw = url.searchParams.get("since");
                 const since = sinceRaw === null ? undefined : Number(sinceRaw);
                 const waitMs = Math.min(Math.max(Number(url.searchParams.get("waitMs") ?? 30_000) || 30_000, 0), 120_000);
-                const deliveryComplete = url.searchParams.get("deliveryComplete") === "true";
                 const acknowledgedRaw = url.searchParams.get("acknowledged");
                 const acknowledged = acknowledgedRaw === null ? [] : acknowledgedRaw.split(",").filter((id) => id.length > 0);
                 const maxBatch = Math.min(Math.max(Number(url.searchParams.get("maxBatch") ?? 50) || 50, 1), 200);
@@ -581,9 +977,13 @@ export function apply(ctx, config) {
                 }
                 /** Read the current outcome across ALL of this controller's bindings. */
                 const current = () => waitOutcome({
-                    signals: [...signals.values()].filter((entry) => entry.kind !== "delivery" || deliveryComplete),
+                    // A delivery is a production-declared completion, so it is wake-worthy like any other
+                    // event. There is no caller-supplied "deliveryComplete" switch here: letting the
+                    // CONSUMER declare whether the producer finished inverted the contract, and meant a
+                    // controller could not be woken by the very event it exists to receive.
+                    signals: [...signals.values()],
                     controller,
-                    acknowledged,
+                    acknowledged: [...durableConfirmed(), ...acknowledged],
                     since,
                     maxBatch
                 });
@@ -614,7 +1014,11 @@ export function apply(ctx, config) {
 
             if (request.method === "GET" && route === "/questions") {
                 const sessionId = url.searchParams.get("sessionId") || "";
-                const controller = url.searchParams.get("controller") || "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(url.searchParams.get("controller"))) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 const sinceRaw = url.searchParams.get("since");
                 const since = sinceRaw === null ? undefined : Number(sinceRaw);
                 const matched = matchBinding({ sessionId, controller }, bindings);
@@ -634,7 +1038,11 @@ export function apply(ctx, config) {
                 // Backlog first, then a bounded wait for new work. No permanent connection and no
                 // unbounded queue: the caller gets a cursor and may reconnect at it.
                 const sessionId = url.searchParams.get("sessionId") || "";
-                const controller = url.searchParams.get("controller") || "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(url.searchParams.get("controller"))) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 const sinceRaw = url.searchParams.get("since");
                 const since = sinceRaw === null ? undefined : Number(sinceRaw);
                 const waitMs = Math.min(Math.max(Number(url.searchParams.get("waitMs") ?? 30_000) || 30_000, 0), 120_000);
@@ -673,17 +1081,32 @@ export function apply(ctx, config) {
                 }
                 const questionId = typeof body.questionId === "string" ? body.questionId : "";
                 const text = typeof body.text === "string" ? body.text : "";
-                const source = typeof body.source === "string" ? body.source : "";
+                // A stated controller must agree with the credential, so a request that names one
+                // controller while presenting another's credential is refused outright rather than
+                // silently treated as the credential's owner.
+                if (!claimAgrees(typeof body.controller === "string" ? body.controller : "")) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 const meta = registry.get(questionId);
                 if (meta === undefined) {
                     send(response, 404, { error: `unknown question "${questionId}"` });
                     return;
                 }
-                const matched = matchBinding({ sessionId: meta.sessionId, cwd: meta.cwd, controller: typeof body.controller === "string" ? body.controller : "" }, bindings);
+                // Exact binding match: the question's OWN bindingId must be the caller's, so a controller
+                // that owns a different binding cannot answer this question even for the same session,
+                // and a superseded binding cannot answer for its successor.
+                const matched = matchBinding(
+                    { sessionId: meta.sessionId, cwd: meta.cwd, controller, bindingId: meta.bindingId },
+                    bindings
+                );
                 if (!matched.allowed) {
                     send(response, 403, { error: `not your binding: ${matched.reason}` });
                     return;
                 }
+                // The source is written by the SERVER. A caller cannot label machine output as the human,
+                // so any supplied value is ignored rather than trusted.
+                const source = ANSWER_SOURCES[0];
                 const state = stateOfQuestion(meta.sessionId, questionId);
                 const verdict = answerVerdict(state, { text, source });
                 if (verdict.action === "reject" || verdict.action === "conflict") {
@@ -723,7 +1146,11 @@ export function apply(ctx, config) {
                     return;
                 }
                 const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
-                const controller = typeof body.controller === "string" ? body.controller : "";
+                // The credential already resolved the controller; a stated name must agree with it.
+                if (!claimAgrees(typeof body.controller === "string" ? body.controller : "")) {
+                    send(response, 403, { error: "stated controller does not match the presented credential" });
+                    return;
+                }
                 const kind = typeof body.kind === "string" ? body.kind : "";
                 const matched = matchBinding({ sessionId, controller }, bindings);
                 if (!matched.allowed) {
@@ -739,36 +1166,28 @@ export function apply(ctx, config) {
                     send(response, 409, { error: "session-not-live", sessionId });
                     return;
                 }
-                // An explicit, machine-readable notification. It is NOT a plain turn/end, so a normal
-                // finished turn cannot be mistaken for a completed delivery.
-                const at = new Date().toISOString();
-                agent.session.append("collab/notify", {
+                // The SAME producer the DS tool uses, so the passive route cannot drift from it.
+                const produced = await produceNotification({
+                    agent: agent.session,
+                    binding: matched.binding,
                     kind,
                     text: typeof body.text === "string" ? body.text : "",
-                    controller: matched.binding.controller,
-                    at
-                });
-                // Raise the signal only for an EXPLICIT notification, which is why a plain finished turn
-                // never wakes a controller: the caller declares the business result here.
-                const raised = raiseSignal({
-                    id: `sig-${kind}-${randomUUID()}`,
-                    controller: matched.binding.controller,
-                    bindingId: matched.binding.bindingId,
-                    sessionId,
-                    cwd: matched.binding.cwd,
-                    kind: kind === "error" ? "error" : "delivery",
                     ...(typeof body.goalId === "string" && body.goalId.length > 0 ? { goalId: body.goalId } : {}),
                     ...(typeof body.requestId === "string" && body.requestId.length > 0 ? { requestId: body.requestId } : {}),
-                    reference: `collab-notify:${sessionId}:${at}`,
-                    at
+                    at: new Date().toISOString()
                 });
-                // The durable event is already recorded, so a signal that could not be raised is reported
-                // rather than hidden behind a 200: the caller must know its controller may not be woken.
-                if (!raised.ok) {
-                    send(response, 500, { error: `notification recorded but its signal could not be raised: ${raised.reason}`, sessionId, kind });
+                // The durable event is already written, so a failing FILE projection is reported rather
+                // than hidden behind a 200: the caller must know its controller may not be reliably
+                // notified, and the stable event id makes its retry safe.
+                if (produced.fileError !== undefined) {
+                    send(response, 502, {
+                        error: "notification recorded and signalled, but its file projection failed",
+                        sessionId, kind, signalId: produced.signalId, fileError: produced.fileError,
+                        hint: "retry this same notification; the event id is stable so no second business event is created"
+                    });
                     return;
                 }
-                send(response, 200, { ok: true, sessionId, kind, signalId: raised.signal.id });
+                send(response, 200, { ok: true, sessionId, kind, signalId: produced.signalId, bindingId: matched.binding.bindingId });
                 return;
             }
 

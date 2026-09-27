@@ -9,8 +9,68 @@
  * @module dsh-codex-bridge/collab
  */
 
-/** Answer provenance. A machine controller must never be recorded as the human. */
-export const ANSWER_SOURCES = Object.freeze(["codex", "user"]);
+/**
+ * Answer provenance. A machine controller must never be recorded as the human.
+ *
+ * Only `codex` is accepted from the network: the controller's answer is always attributed to the
+ * controller, and the server sets it rather than trusting a caller-supplied field. A human answer is
+ * produced through the shell's own question and approval surfaces, which this bridge never intercepts —
+ * so there is deliberately no caller-selectable "user" source here.
+ */
+export const ANSWER_SOURCES = Object.freeze(["codex"]);
+
+/**
+ * Resolve which controller a request actually is, from a credential the caller must possess.
+ *
+ * `connection.admit` proves only that a request speaks for the operator; it cannot distinguish one
+ * controller from another, so a controller field sent in a body or query is a CLAIM and never an
+ * identity. The declared bindings name the credential reference for each controller, and the caller is
+ * whichever controller's secret matches. Nothing here compares or returns the secret itself beyond the
+ * equality test, and a caller with no match is not identified at all.
+ *
+ * @param {string} offered - the secret the caller presented, or an empty string.
+ * @param {ReadonlyArray<{controller: string, tokenRef?: string}>} bindings - declared bindings.
+ * @param {(ref: string) => string|null} resolveSecret - resolves a reference to its value, or null.
+ * @returns {{ok: true, controller: string} | {ok: false, reason: string}} the identified controller.
+ */
+export function identifyController(offered, bindings, resolveSecret) {
+    if (typeof offered !== "string" || offered.length === 0) return { ok: false, reason: "no-controller-credential" };
+    const candidates = [...new Set((bindings || []).map((entry) => entry.controller))]
+        .filter((controller) => typeof controller === "string" && controller.length > 0);
+    for (const controller of candidates) {
+        const binding = (bindings || []).find((entry) => entry.controller === controller);
+        const ref = binding === undefined ? undefined : binding.tokenRef;
+        if (typeof ref !== "string" || ref.length === 0) continue;
+        const secret = resolveSecret(ref);
+        // Constant-time-ish comparison is not required here (the secret is not echoed and the caller
+        // supplies it in full), but the value is never logged, returned or stored.
+        if (typeof secret === "string" && secret.length > 0 && secret === offered) return { ok: true, controller };
+    }
+    return { ok: false, reason: "credential-does-not-match-a-controller" };
+}
+
+/**
+ * Whether one session id is claimed by more than one binding.
+ *
+ * A session may have exactly ONE effective answer owner: two owners would make an answer ambiguous and
+ * could produce two terminal outcomes for one tool call. A handover is expressed as a new binding whose
+ * predecessor is explicitly marked non-current, so this reports only genuine multiplicity.
+ *
+ * @param {ReadonlyArray<{bindingId: string, sessionId: string, current?: boolean}>} bindings - declared bindings.
+ * @returns {{ok: true} | {ok: false, reason: string, sessionId: string}} the verdict.
+ */
+export function assertSingleOwner(bindings) {
+    const owners = new Map();
+    for (const entry of bindings || []) {
+        if (entry.current === false) continue;
+        const existing = owners.get(entry.sessionId);
+        if (existing !== undefined && existing !== entry.bindingId) {
+            return { ok: false, reason: `session "${entry.sessionId}" has more than one answer owner ("${existing}" and "${entry.bindingId}")`, sessionId: entry.sessionId };
+        }
+        owners.set(entry.sessionId, entry.bindingId);
+    }
+    return { ok: true };
+}
 
 /**
  * Normalize one collaboration binding.
@@ -36,10 +96,25 @@ export function normalizeBinding(raw) {
     const bindingId = raw && typeof raw.bindingId === "string" && raw.bindingId.trim().length > 0
         ? raw.bindingId.trim()
         : `${controller}\u0000${sessionId}`;
+    // The credential reference identifies the controller; it is a reference, never the secret.
+    const tokenRef = raw && typeof raw.tokenRef === "string" ? raw.tokenRef.trim() : "";
     if (sessionId.length === 0) return { ok: false, reason: "binding requires a sessionId" };
     if (cwd.length === 0) return { ok: false, reason: "binding requires a cwd" };
     if (controller.length === 0) return { ok: false, reason: "binding requires a controller" };
-    return { ok: true, binding: { bindingId, sessionId, cwd, controller } };
+    if (tokenRef.length === 0) return { ok: false, reason: "binding requires a tokenRef so the controller can be authenticated" };
+    return {
+        ok: true,
+        binding: {
+            bindingId,
+            sessionId,
+            cwd,
+            controller,
+            tokenRef,
+            // A superseded binding stays declared (so its late answers are recognizably stale) but is no
+            // longer a current owner.
+            current: raw.current !== false
+        }
+    };
 }
 
 /**

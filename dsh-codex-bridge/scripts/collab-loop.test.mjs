@@ -43,9 +43,10 @@ const question = "Should the retry use exponential backoff?";
 const inst = await startIsolatedInstance({
     pluginRoot,
     bindings: [
-        { bindingId: "codex::a", sessionId: sessionA, cwd: dirA, controller: "codex" },
-        { bindingId: "codex::b", sessionId: sessionB, cwd: dirB, controller: "codex" }
+        { bindingId: "codex::a", sessionId: sessionA, cwd: dirA, controller: "codex", tokenRef: "TEST_CONTROLLER_TOKEN_CODEX" },
+        { bindingId: "codex::b", sessionId: sessionB, cwd: dirB, controller: "codex", tokenRef: "TEST_CONTROLLER_TOKEN_CODEX" }
     ],
+    controllerTokens: [{ controller: "codex", tokenRef: "TEST_CONTROLLER_TOKEN_CODEX", token: "test-controller-codex-secret" }],
     answerTimeoutMs: 30_000,
     scripted: { question },
     inboxRoot
@@ -60,7 +61,7 @@ try {
     const call = async (route, init = {}) => {
         const response = await fetch(new URL(`/codex-collab${route}`, url), {
             ...init,
-            headers: { cookie, "content-type": "application/json", ...(init.headers ?? {}) }
+            headers: { cookie, "content-type": "application/json", "x-controller-token": "test-controller-codex-secret", ...(init.headers ?? {}) }
         });
         const text = await response.text();
         let body = {};
@@ -84,8 +85,11 @@ try {
     record("the received question matches what the tool asked", received?.question === question, JSON.stringify(received?.question ?? "").slice(0, 60));
 
     if (received) {
-        const answered = await call("/answer", { method: "POST", body: JSON.stringify({ questionId: received.id, text: "Yes, use exponential backoff.", source: "codex", controller: "codex" }) });
+        // The source rule is proven HERE, on a real pending question: the caller sends `user` and the
+        // recorded answer must still be the server's own `codex`. A machine cannot mint human consent.
+        const answered = await call("/answer", { method: "POST", body: JSON.stringify({ questionId: received.id, text: "Yes, use exponential backoff.", source: "user", controller: "codex" }) });
         record("the controller's answer is accepted and resumes the call", answered.status === 200 && answered.body.delivered === true, `status=${answered.status} delivered=${answered.body.delivered}`);
+        record("a caller-supplied `user` source is overridden by the server's own", answered.body.answer?.source === "codex", `recorded source=${answered.body.answer?.source}`);
 
         const repeated = await call("/answer", { method: "POST", body: JSON.stringify({ questionId: received.id, text: "Yes, use exponential backoff.", source: "codex", controller: "codex" }) });
         record("the identical answer again is idempotent, not a second delivery", repeated.status === 200 && repeated.body.idempotent === true, `idempotent=${repeated.body.idempotent}`);
@@ -108,7 +112,10 @@ try {
     record("the tool result carries the controller's answer", resultJson.includes("exponential backoff"), "answer present in tool/result");
     record("the answer is attributed to the controller, not to the human", resultJson.includes('"source":"codex"') || resultJson.includes('\\"source\\":\\"codex\\"'), "source recorded");
 
-    // ---- 2) machine approval is refused ----------------------------------------------------
+    // ---- 2) an answer cannot be labelled as the human, and unknown questions are refused -----
+    // An UNKNOWN question is refused by identity (404). That alone does not prove the source rule, so
+    // the source rule is proven on a REAL pending question further down: whatever a caller sends, the
+    // recorded source is the server's own.
     const forged = await call("/answer", { method: "POST", body: JSON.stringify({ questionId: "nope", text: "x", source: "user", controller: "codex" }) });
     record("an unknown question is refused rather than accepted", forged.status === 404, `status=${forged.status}`);
 

@@ -48,11 +48,21 @@ const otherDir = path.join(workDir, "proj-other");
 fs.mkdirSync(otherDir, { recursive: true });
 const other = { sessionId: "session-other", bindingId: "other::solo", cwd: otherDir, controller: "other" };
 
+// Each controller has its OWN credential. These are throwaway values for a disposable home, supplied
+// through the launch environment the credentials service reads; they are never written to Git.
+const TOKEN_A = "test-controller-codex-secret";
+const TOKEN_B = "test-controller-other-secret";
+const tokenRefOf = (controller) => `TEST_CONTROLLER_TOKEN_${controller.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+
 const inst = await startIsolatedInstance({
     pluginRoot,
     bindings: [
-        ...sessions.map((s) => ({ bindingId: s.bindingId, sessionId: s.sessionId, cwd: s.cwd, controller: s.controller })),
-        { bindingId: other.bindingId, sessionId: other.sessionId, cwd: other.cwd, controller: other.controller }
+        ...sessions.map((s) => ({ bindingId: s.bindingId, sessionId: s.sessionId, cwd: s.cwd, controller: s.controller, tokenRef: tokenRefOf(s.controller) })),
+        { bindingId: other.bindingId, sessionId: other.sessionId, cwd: other.cwd, controller: other.controller, tokenRef: tokenRefOf(other.controller) }
+    ],
+    controllerTokens: [
+        { controller: "codex", tokenRef: tokenRefOf("codex"), token: TOKEN_A },
+        { controller: "other", tokenRef: tokenRefOf("other"), token: TOKEN_B }
     ],
     answerTimeoutMs: 30_000,
     scripted: null,
@@ -64,16 +74,27 @@ try {
     const client = new DshClient(url, 55_000);
     await client.login();
     const cookie = client.cookie;
-    /** Issue one authenticated control request. @returns {Promise<{status: number, body: object}>} the result. */
-    const call = async (route, init = {}) => {
+    /**
+     * Issue one authenticated control request as a named controller.
+     * @param {string} route - path under the collaboration base.
+     * @param {object} [init] - fetch init.
+     * @param {string} [token] - the controller credential to present.
+     * @returns {Promise<{status: number, body: object}>} the result.
+     */
+    const call = async (route, init = {}, token = TOKEN_A) => {
         const response = await fetch(new URL(`/codex-collab${route}`, url), {
             ...init,
-            headers: { cookie, "content-type": "application/json", ...(init.headers ?? {}) }
+            headers: { cookie, "content-type": "application/json", "x-controller-token": token, ...(init.headers ?? {}) }
         });
         const text = await response.text();
         let body = {};
         try { body = text.length > 0 ? JSON.parse(text) : {}; } catch { body = { raw: text.slice(0, 200) }; }
         return { status: response.status, body };
+    };
+    /** Issue one request with NO controller credential, to prove authentication is required. */
+    const callAnonymous = async (route) => {
+        const response = await fetch(new URL(`/codex-collab${route}`, url), { headers: { cookie, "content-type": "application/json" } });
+        return { status: response.status, body: {} };
     };
     console.log(`instance: ${url.origin}  sessions=${sessions.length + 1}`);
 
@@ -82,18 +103,18 @@ try {
         await client.rpc("session/create", { request: { cwd: s.cwd, sessionId: s.sessionId } });
     }
 
-    // ---- 1) every session raises its own question signal ------------------------------------
+    // ---- 1) every session raises its own delivery signal ------------------------------------
     for (const s of sessions) {
         const notified = await call("/notify", {
             method: "POST",
             body: JSON.stringify({ sessionId: s.sessionId, controller: "codex", kind: "delivery", text: `slice ${s.sessionId} complete` })
         });
-        if (notified.status !== 200) record(`notification accepted for ${s.sessionId}`, false, `status=${notified.status}`);
+        if (notified.status !== 200) record(`notification accepted for ${s.sessionId}`, false, `status=${notified.status} ${JSON.stringify(notified.body).slice(0, 120)}`);
     }
     const otherNotify = await call("/notify", {
         method: "POST",
         body: JSON.stringify({ sessionId: other.sessionId, controller: "other", kind: "delivery", text: "other project complete" })
-    });
+    }, TOKEN_B);
     record("every session's notification is accepted", otherNotify.status === 200, `status=${otherNotify.status}`);
 
     // ---- 2) one controller receives ALL of its bindings, losslessly -------------------------
@@ -106,40 +127,50 @@ try {
     record("every signal carries the session's own cwd", received.every((s) => typeof s.cwd === "string" && s.cwd.length > 0), "cwds present");
 
     // ---- 3) wait-any returns a bounded batch with a cursor, not just the last event ----------
-    // Deliveries only interrupt a wait when the caller declares the business result complete, so the
-    // wait is asked with that intent — which is exactly the "notify me when work is really done" case.
-    const batch = await call("/wait-any?controller=codex&waitMs=1000&maxBatch=2&deliveryComplete=true");
+    // A production-declared delivery now wakes a wait by DEFAULT: there is no consumer-side switch
+    // declaring whether the producer finished.
+    const batch = await call("/wait-any?controller=codex&waitMs=1000&maxBatch=2");
     const batchSignals = batch.body.signals ?? [];
-    record("wait-any returns a bounded batch", batchSignals.length === 2, `batch=${batchSignals.length}`);
+    record("wait-any is woken by deliveries without the consumer declaring completion", batchSignals.length === 2, `batch=${batchSignals.length}`);
     record("the batch reports that more remain", batch.body.more === true, `more=${batch.body.more}`);
     record("the batch carries a cursor to resume from", Number.isFinite(batch.body.cursor), `cursor=${batch.body.cursor}`);
-    const next = await call(`/wait-any?controller=codex&waitMs=1000&maxBatch=10&deliveryComplete=true&since=${batch.body.cursor}`);
+    const next = await call(`/wait-any?controller=codex&waitMs=1000&maxBatch=10&since=${batch.body.cursor}`);
     const nextIds = (next.body.signals ?? []).map((s) => s.id);
     record("resuming from the cursor yields the remaining events", nextIds.length === sessions.length - 2, `next=${nextIds.length}`);
     record("no event is delivered twice across the two batches", nextIds.every((id) => !batchSignals.some((s) => s.id === id)), "ids disjoint");
-    // A plain finished turn is not a completed delivery, so an undeclared wait sees the deliveries as
-    // NOT wake-worthy. This is the rule that keeps "the turn ended" from meaning "the work is done".
-    const undeclared = await call("/wait-any?controller=codex&waitMs=800&maxBatch=2");
-    record("a wait that has not declared completion is not woken by a delivery", (undeclared.body.signals ?? []).length === 0 && undeclared.body.empty === true, `signals=${(undeclared.body.signals ?? []).length}`);
 
-    // ---- 4) a second controller cannot see or touch the first controller's events -----------
-    const foreign = await call("/signals?controller=other");
+    // ---- 4) controller identity: a credential decides WHO is calling ----------------------
+    record("a request with no controller credential is refused", (await callAnonymous("/signals?controller=codex")).status === 401, "anonymous control refused");
+    record("a wrong controller credential is refused", (await call("/signals?controller=codex", {}, "not-a-real-token")).status === 401, "wrong credential refused");
+    // B holding B's VALID credential while claiming to be A must still be refused: the credential
+    // decides the identity, so a stated name cannot elevate one controller into another's binding.
+    const bClaimsA = await call("/signals?controller=codex", {}, TOKEN_B);
+    record("B's valid credential cannot read A's events by claiming to be A", bClaimsA.status === 403, `status=${bClaimsA.status}`);
+    const bConfirmsA = await call("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: received[0].id }) }, TOKEN_B);
+    record("B's valid credential cannot confirm A's event by claiming to be A", bConfirmsA.status === 403, `status=${bConfirmsA.status}`);
+    // Each controller resolves to itself: A sees its own bindings even when claiming to be B.
+    const aClaimsB = await call("/signals?controller=other", {}, TOKEN_A);
+    record("A's valid credential cannot read B's events by claiming to be B", aClaimsB.status === 403, `status=${aClaimsB.status}`);
+
+    const foreign = await call("/signals?controller=other", {}, TOKEN_B);
     record("the second controller sees only its own binding", (foreign.body.signals ?? []).every((s) => s.controller === "other"), `count=${(foreign.body.signals ?? []).length}`);
     record("the first controller's events are not visible to the second", (foreign.body.signals ?? []).length === 1, `count=${(foreign.body.signals ?? []).length}`);
-    const foreignAnswers = await call("/answer", { method: "POST", body: JSON.stringify({ questionId: "anything", text: "x", source: "codex", controller: "other" }) });
+    const foreignAnswers = await call("/answer", { method: "POST", body: JSON.stringify({ questionId: "anything", text: "x", source: "codex", controller: "other" }) }, TOKEN_B);
     record("the second controller cannot answer the first controller's question", foreignAnswers.status === 404 || foreignAnswers.status === 403, `status=${foreignAnswers.status}`);
 
     // ---- 5) confirming one session's event leaves every other session's event intact --------
     const target = received.find((s) => s.sessionId === sessions[0].sessionId);
     const confirmed = await call("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: target.id }) });
     record("confirming one session's event succeeds", confirmed.status === 200 && confirmed.body.confirmed === true, `status=${confirmed.status}`);
-    // A confirmed event is excluded from what the controller is owed; the others are untouched. The
-    // caller names what it has processed, which is why confirmation is not implied by delivery.
-    const remaining = await call(`/signals?controller=codex&acknowledged=${encodeURIComponent(target.id)}`);
+    // Confirmation is durable, so it is excluded for EVERY caller with no client-supplied list.
+    const remaining = await call("/signals?controller=codex");
     const remainingIds = (remaining.body.signals ?? []).map((s) => s.id);
     record("confirming A does not confirm or delete B's event", !remainingIds.includes(target.id) && remainingIds.length === sessions.length - 1, `remaining=${remainingIds.length}`);
+    const again = await call("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: target.id }) });
+    record("confirming the same event twice is idempotent", again.status === 200 && again.body.idempotent === true, `idempotent=${again.body.idempotent}`);
     record("the confirmed event is gone from its file too", !(await call("/signals/files?controller=codex")).body.signals.some((s) => s.id === target.id), "file removed");
     record("the file projection still holds the unconfirmed events", (await call("/signals/files?controller=codex")).body.signals.length === sessions.length - 1, "files independent of the ack list");
+    record("an unknown signal cannot be confirmed", (await call("/signals/confirm", { method: "POST", body: JSON.stringify({ controller: "codex", signalId: "no-such-signal" }) })).status === 404, "unknown signal refused");
 
     // ---- 6) a per-controller inbox directory keeps the two controllers apart ----------------
     const dirs = fs.existsSync(inboxRoot) ? fs.readdirSync(inboxRoot).sort() : [];

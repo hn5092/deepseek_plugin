@@ -9,7 +9,10 @@
  */
 import assert from "node:assert/strict";
 import {
+    ANSWER_SOURCES,
     answerVerdict,
+    assertSingleOwner,
+    identifyController,
     matchBinding,
     normalizeBinding,
     pendingQuestions,
@@ -28,11 +31,12 @@ const WIN = "win32";
 const POSIX = "linux";
 
 // ---- binding identity: no guessing from titles or windows --------------------------------
-test("a binding requires session, directory and controller", () => {
-    assert.equal(normalizeBinding({ sessionId: "s", cwd: "D:/a", controller: "codex" }).ok, true);
-    assert.equal(normalizeBinding({ sessionId: "s", cwd: "D:/a" }).ok, false, "controller is mandatory");
-    assert.equal(normalizeBinding({ sessionId: "s", controller: "codex" }).ok, false, "cwd is mandatory");
-    assert.equal(normalizeBinding({ cwd: "D:/a", controller: "codex" }).ok, false, "session is mandatory");
+test("a binding requires a session, directory, controller and credential reference", () => {
+    assert.equal(normalizeBinding({ sessionId: "s", cwd: "D:/a", controller: "codex", tokenRef: "TOKEN" }).ok, true);
+    assert.equal(normalizeBinding({ sessionId: "s", cwd: "D:/a", controller: "codex" }).ok, false, "a controller must be authenticatable");
+    assert.equal(normalizeBinding({ sessionId: "s", cwd: "D:/a", tokenRef: "TOKEN" }).ok, false, "controller is mandatory");
+    assert.equal(normalizeBinding({ sessionId: "s", controller: "codex", tokenRef: "TOKEN" }).ok, false, "cwd is mandatory");
+    assert.equal(normalizeBinding({ cwd: "D:/a", controller: "codex", tokenRef: "TOKEN" }).ok, false, "session is mandatory");
 });
 
 test("only the bound session may answer", () => {
@@ -126,7 +130,9 @@ test("a late answer to a cancelled question is refused", () => {
 });
 
 test("a machine answer cannot masquerade as the human", () => {
-    assert.equal(answerVerdict({ status: "pending" }, { text: "x", source: "user" }).action, "accept", "the human source is valid");
+    // The bridge only ever produces controller answers, so `user` is NOT an accepted network source:
+    // a caller claiming it would be recording machine output as human consent on the transcript.
+    assert.equal(answerVerdict({ status: "pending" }, { text: "x", source: "user" }).action, "reject", "the human source is not caller-selectable");
     assert.equal(answerVerdict({ status: "pending" }, { text: "x", source: "codex" }).action, "accept");
     assert.equal(answerVerdict({ status: "pending" }, { text: "x", source: "system" }).action, "reject");
     assert.equal(answerVerdict({ status: "pending" }, { text: "x" }).action, "reject", "source is mandatory");
@@ -166,6 +172,73 @@ test("a reconnect after a cursor returns everything not yet seen, without duplic
     ];
     assert.deepEqual(pendingQuestions(questions, 1).map((q) => q.id), ["b", "c"]);
     assert.deepEqual(pendingQuestions(questions, 3).map((q) => q.id), []);
+});
+
+// ---- controller identity comes from a credential, never from a self-claim ----------------
+test("a controller is identified by its credential, not by the name it sends", () => {
+    const bindings = [
+        { bindingId: "a", sessionId: "s1", cwd: "D:/a", controller: "codex", tokenRef: "TOKEN_A" },
+        { bindingId: "b", sessionId: "s2", cwd: "D:/b", controller: "codex-2", tokenRef: "TOKEN_B" }
+    ];
+    const secrets = { TOKEN_A: "secret-a", TOKEN_B: "secret-b" };
+    const resolve = (ref) => secrets[ref] ?? null;
+    assert.deepEqual(identifyController("secret-a", bindings, resolve), { ok: true, controller: "codex" });
+    assert.deepEqual(identifyController("secret-b", bindings, resolve), { ok: true, controller: "codex-2" });
+});
+
+test("a caller without a matching credential is not identified at all", () => {
+    const bindings = [{ bindingId: "a", sessionId: "s1", cwd: "D:/a", controller: "codex", tokenRef: "TOKEN_A" }];
+    const resolve = () => "secret-a";
+    assert.equal(identifyController("", bindings, resolve).ok, false, "no credential is refused");
+    assert.equal(identifyController("wrong", bindings, resolve).ok, false, "a wrong credential is refused");
+    // A controller naming a controller with no declared credential cannot be trusted either.
+    assert.equal(identifyController("secret-a", [{ bindingId: "a", sessionId: "s1", cwd: "D:/a", controller: "codex" }], resolve).ok, false);
+    // An unresolvable reference never authenticates.
+    assert.equal(identifyController("secret-a", bindings, () => null).ok, false);
+});
+
+test("the AI answer source is codex only, and the human source is not caller-selectable", () => {
+    assert.deepEqual([...ANSWER_SOURCES], ["codex"]);
+    assert.equal(answerVerdict({ status: "pending" }, { text: "x", source: "codex" }).action, "accept");
+    assert.equal(answerVerdict({ status: "pending" }, { text: "x", source: "user" }).action, "reject", "a machine must not claim the human source");
+});
+
+// ---- one session has exactly one answer owner --------------------------------------------
+test("one session with two answer owners is refused", () => {
+    const verdict = assertSingleOwner([
+        { bindingId: "old", sessionId: "s1" },
+        { bindingId: "new", sessionId: "s1" }
+    ]);
+    assert.equal(verdict.ok, false);
+    assert.equal(verdict.sessionId, "s1");
+});
+
+test("a handover is expressed by marking the predecessor non-current", () => {
+    assert.equal(assertSingleOwner([
+        { bindingId: "old", sessionId: "s1", current: false },
+        { bindingId: "new", sessionId: "s1" }
+    ]).ok, true);
+    // Several sessions each with one owner is the multi-open case and stays valid.
+    assert.equal(assertSingleOwner([
+        { bindingId: "a", sessionId: "s1" },
+        { bindingId: "b", sessionId: "s2" },
+        { bindingId: "c", sessionId: "s3" }
+    ]).ok, true);
+});
+
+test("dropping an ambiguous session leaves it with no owner, never with two", () => {
+    // The startup rule: an ambiguous session's bindings are all removed, so the session goes from two
+    // possible owners to ZERO — the fail-closed direction. It must not silently keep one of them.
+    const declared = [
+        { bindingId: "a1", sessionId: "amb", current: true },
+        { bindingId: "a2", sessionId: "amb", current: true },
+        { bindingId: "ok", sessionId: "fine", current: true }
+    ];
+    const verdict = assertSingleOwner(declared);
+    assert.equal(verdict.ok, false);
+    const remaining = declared.filter((entry) => entry.sessionId !== verdict.sessionId);
+    assert.deepEqual(remaining.map((entry) => entry.bindingId), ["ok"]);
+    assert.equal(remaining.some((entry) => entry.sessionId === "amb"), false, "the ambiguous session has no answer owner at all");
 });
 
 // ---- runner -----------------------------------------------------------------------------

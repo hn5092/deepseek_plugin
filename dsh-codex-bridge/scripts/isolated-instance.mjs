@@ -49,9 +49,10 @@ async function freePort() {
  * @param {number} [options.timeoutMs] - how long to wait for the launch URL.
  * @param {{question?: string}|null} [options.scripted] - when set, also load the scripted provider plugin.
  * @param {string|null} [options.inboxRoot] - file-signal inbox root; null leaves it unconfigured.
+ * @param {ReadonlyArray<{controller: string, tokenRef: string, token: string}>} [options.controllerTokens] - test controller credentials.
  * @returns {Promise<object>} the instance handle.
  */
-export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = 90_000, scripted = null, inboxRoot = null }) {
+export async function startIsolatedInstance({ pluginRoot, bindings = [], answerTimeoutMs = 20_000, timeoutMs = 90_000, scripted = null, inboxRoot = null, controllerTokens = [] }) {
     const port = await freePort();
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "collab-instance-"));
     const home = path.join(workDir, "home");
@@ -75,6 +76,8 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
         bindingLines.push("            sessionId: '" + binding.sessionId + "'");
         bindingLines.push("            cwd: '" + binding.cwd.replace(/\\/g, "/") + "'");
         bindingLines.push("            controller: '" + binding.controller + "'");
+        bindingLines.push("            tokenRef: '" + binding.tokenRef + "'");
+        if (binding.current === false) bindingLines.push("            current: false");
     }
     const scriptedLines = scripted === null ? [] : [
         "",
@@ -113,9 +116,16 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
     fs.writeFileSync(patchFile, patch, "utf8");
 
     const out = fs.openSync(logFile, "a");
+    // Controller credentials resolve from the launch environment, so the fixture supplies its own
+    // throwaway tokens here. They are test-only values for a disposable home and are never written to
+    // the profile, the session, or the repository.
+    const credentialEnv = {};
+    for (const entry of controllerTokens) {
+        if (typeof entry.tokenRef === "string" && typeof entry.token === "string") credentialEnv[entry.tokenRef] = entry.token;
+    }
     // Usage is `dsh [--profile] <name> [options]`: the profile is the first positional.
     const child = spawn(NODE, [DSH_ENTRY, "--profile", "web", "--patch", patchFile, "--port", String(port), "--no-open"], {
-        env: { ...process.env, DSH_HOME: home },
+        env: { ...process.env, DSH_HOME: home, ...credentialEnv },
         stdio: ["ignore", out, out]
     });
 
@@ -129,18 +139,68 @@ export async function startIsolatedInstance({ pluginRoot, bindings = [], answerT
         if (child.exitCode !== null) break;
     }
 
-    /** Stop the instance and delete its disposable home. */
-    function stop() {
-        try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    // A child that exits immediately means the instance never started; report THAT, with its log, rather
+    // than blaming the launch URL or waiting out the full deadline.
+    if (child.exitCode !== null) {
+        const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-2500) : "(no log)";
         try { fs.closeSync(out); } catch { /* already closed */ }
-        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
+        throw new Error(`instance exited immediately (code ${child.exitCode}) on port ${port}. Log:\n${text}`);
+    }
+
+    /**
+     * Stop the instance and leave nothing behind.
+     *
+     * Bounded and verified rather than best-effort: the child is asked to terminate, its exit is awaited
+     * up to a deadline, the process is force-killed only if it did not go, and then this run's own
+     * temporary directory is removed and its absence confirmed. Failing to clean up is reported, so a
+     * leaked process or directory cannot be mistaken for a tidy run. Only paths inside this run's own
+     * temp directory are ever touched.
+     *
+     * @param {object} [options] - stop options.
+     * @param {boolean} [options.keepLog] - keep the temp directory (for diagnosing a failure).
+     * @returns {Promise<{stopped: boolean, dirRemoved: boolean, residue: ReadonlyArray<string>}>} what actually happened.
+     */
+    async function stop({ keepLog = false } = {}) {
+        const exited = await waitForExit(child, 8000);
+        if (!exited) {
+            try { child.kill("SIGKILL"); } catch { /* already gone */ }
+            await waitForExit(child, 4000);
+        }
+        try { fs.closeSync(out); } catch { /* already closed */ }
+        if (keepLog) return { stopped: true, dirRemoved: false, residue: [] };
+        // Guard: only ever delete a directory this run created, identified by the mkdtemp prefix.
+        const residue = [];
+        if (path.dirname(workDir) !== os.tmpdir() || !path.basename(workDir).startsWith("collab-instance-")) {
+            residue.push(workDir);
+            return { stopped: true, dirRemoved: false, residue };
+        }
+        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* verified below */ }
+        if (fs.existsSync(workDir)) residue.push(workDir);
+        return { stopped: true, dirRemoved: !fs.existsSync(workDir), residue };
     }
 
     if (url === null) {
         const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-2500) : "(no log)";
-        stop();
+        await stop({ keepLog: true });
         throw new Error(`instance did not publish a launch URL on port ${port}. Log tail:\n${text}`);
     }
 
-    return { port, url, home, workDir, logFile, patchFile, stop, pluginLoaded: true };
+    return { port, url, home, workDir, logFile, patchFile, stop, pluginLoaded: true, child };
+}
+
+/**
+ * Wait, within a bound, for a child process to exit.
+ * @param {import("node:child_process").ChildProcess} child - the process.
+ * @param {number} timeoutMs - how long to wait.
+ * @returns {Promise<boolean>} whether it had exited.
+ */
+async function waitForExit(child, timeoutMs) {
+    if (child.exitCode !== null || child.signalCode !== null) return true;
+    return await new Promise((resolve) => {
+        let done = false;
+        const finish = (value) => { if (!done) { done = true; clearTimeout(timer); child.removeListener("exit", onExit); resolve(value); } };
+        const onExit = () => finish(true);
+        const timer = setTimeout(() => finish(false), timeoutMs);
+        child.once("exit", onExit);
+    });
 }

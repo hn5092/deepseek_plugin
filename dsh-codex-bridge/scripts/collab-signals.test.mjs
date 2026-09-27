@@ -14,6 +14,7 @@ import path from "node:path";
 import {
     deliverableSignals,
     normalizeSignal,
+    recoverSignals,
     signalIsWakeworthy,
     signalVerdict,
     waitOutcome
@@ -44,6 +45,34 @@ test("a signal carries id, controller, session, cwd and kind", () => {
     assert.equal(result.signal.sessionId, "session-a");
     assert.equal(result.signal.kind, "question");
 });
+
+/**
+ * The integration counterexample a peer reproduced: one event id, one changed identity field.
+ * Every one of these must be a conflict, because the contract uses these fields to stop a stale task's
+ * event from being applied to the current one.
+ */
+for (const [field, value] of [
+    ["bindingId", "binding-new"],
+    ["cwd", "D:/different/b"],
+    ["goalId", "goal-new"],
+    ["requestId", "request-new"],
+    ["reference", "question:new"]
+]) {
+    test(`the same event id with a changed ${field} is a conflict`, () => {
+        const baseline = {
+            id: "event-1",
+            kind: "question",
+            controller: "controller-a",
+            bindingId: "binding-old",
+            sessionId: "session-a",
+            cwd: "D:/approved/a",
+            goalId: "goal-old",
+            requestId: "request-old",
+            reference: "question:old"
+        };
+        assert.equal(signalVerdict(baseline, { ...baseline, [field]: value }).action, "conflict");
+    });
+}
 
 test("a signal missing any routing identity is refused", () => {
     for (const missing of ["id", "controller", "bindingId", "sessionId", "cwd", "kind"]) {
@@ -163,6 +192,37 @@ test("a wait with backlog returns immediately and reports nothing new when there
     assert.equal(waitOutcome({ signals, controller: "codex" }).status, "signals");
     assert.equal(waitOutcome({ signals, controller: "codex", since: 1 }).status, "empty");
     assert.equal(waitOutcome({ signals: [], controller: "codex" }).status, "empty");
+});
+
+// ---- restart recovery: the authoritative log is enough to rebuild the view ----------------
+test("a restart recovers unconfirmed events and their cursor from the log alone", () => {
+    const records = [
+        normalizeSignal({ ...baseSignal, id: "e1" }).signal,
+        normalizeSignal({ ...baseSignal, id: "e2" }).signal,
+        normalizeSignal({ ...baseSignal, id: "e3" }).signal
+    ].map((s, i) => ({ ...s, seq: i + 1 }));
+    const recovered = recoverSignals(records, ["e1"]);
+    assert.deepEqual(recovered.signals.map((s) => s.id), ["e2", "e3"], "confirmed events do not come back");
+    assert.equal(recovered.cursor, 3, "the cursor reflects the log, not a counter that restarted at zero");
+});
+
+test("a cursor from before a restart still finds newer events", () => {
+    // Before the restart the controller had seen up to seq 1. After recovery, seq 2 exists and must
+    // still be delivered — a restart must not make an old cursor filter out new work.
+    const records = [
+        { ...normalizeSignal({ ...baseSignal, id: "old" }).signal, seq: 1 },
+        { ...normalizeSignal({ ...baseSignal, id: "new" }).signal, seq: 2 }
+    ];
+    const recovered = recoverSignals(records, ["old"]);
+    const outcome = waitOutcome({ signals: recovered.signals, controller: "codex", since: 1 });
+    assert.equal(outcome.status, "signals");
+    assert.deepEqual(outcome.signals.map((s) => s.id), ["new"]);
+});
+
+test("recovery never invents an event the log does not contain", () => {
+    const recovered = recoverSignals([], ["anything"]);
+    assert.equal(recovered.signals.length, 0);
+    assert.equal(recovered.cursor, 0);
 });
 
 // ---- the file inbox ------------------------------------------------------------------------

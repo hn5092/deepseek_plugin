@@ -62,12 +62,32 @@ export function normalizeSignal(raw) {
 }
 
 /**
+ * The immutable identity of one event.
+ *
+ * These are the fields that say WHICH task the event belongs to. Two events sharing an id but
+ * disagreeing on any of them are not the same event: accepting the second would let a stale file, a
+ * retry from an older task, or a mis-routed notification silently retarget work that already moved on.
+ * The mutable part of a signal (its timestamp, and presentation-only extras) is deliberately excluded.
+ */
+export const SIGNAL_IDENTITY_FIELDS = Object.freeze([
+    "kind",
+    "controller",
+    "bindingId",
+    "sessionId",
+    "cwd",
+    "goalId",
+    "requestId",
+    "reference"
+]);
+
+/**
  * Whether two signals are the same delivery.
  *
- * Identity is the signal id alone: the same id seen twice — after a reconnect, or because two file
- * notifications pointed at one file — is ONE event, and must not be delivered twice. Different content
- * under the same id is a conflict the caller must resolve rather than a silent overwrite, because
- * accepting it would let a stale file retarget a task that already moved on.
+ * Identity is the signal id AND every task-identifying field. The same id with the same identity —
+ * which is what a reconnect, or two file notifications pointing at one file, produces — is ONE event
+ * and must not be delivered twice. The same id with ANY differing identity field is a conflict the
+ * caller must resolve, because the contract uses those fields precisely to stop one task's event from
+ * being applied to another.
  *
  * @param {object} known - the signal already recorded.
  * @param {object} candidate - the signal being offered.
@@ -76,10 +96,14 @@ export function normalizeSignal(raw) {
 export function signalVerdict(known, candidate) {
     if (known === null || known === undefined) return { action: "new", reason: "unseen" };
     if (known.id !== candidate.id) return { action: "new", reason: "different-id" };
-    if (known.kind !== candidate.kind || known.sessionId !== candidate.sessionId || known.controller !== candidate.controller) {
-        return { action: "conflict", reason: "same-id-different-content" };
+    for (const field of SIGNAL_IDENTITY_FIELDS) {
+        // A field absent on both sides is the same fact; present on one side only is a difference, since
+        // "the producer did not state its goal" is not "the producer stated this goal".
+        const left = known[field] ?? null;
+        const right = candidate[field] ?? null;
+        if (left !== right) return { action: "conflict", reason: `same-id-different-${field}` };
     }
-    return { action: "same", reason: "same-id-and-content" };
+    return { action: "same", reason: "same-id-and-identity" };
 }
 
 /**
@@ -131,8 +155,8 @@ export function deliverableSignals(signals, controller, acknowledged = []) {
  * @param {ReadonlyArray<object>} input.signals - known signals for this controller.
  * @param {ReadonlyArray<string>} [input.acknowledged] - confirmed ids.
  * @param {number} [input.since] - highest sequence already seen.
- * @param {boolean} [input.deliveryCompleteFor] - whether deliveries count as complete.
- * @returns {{status: "signals", signals: Array<object>} | {status: "empty"}} the outcome.
+ * @param {number} [input.maxBatch] - bound on one batch.
+ * @returns {{status: "signals", signals: Array<object>, cursor: number, more: boolean} | {status: "empty"}} the outcome.
  */
 export function waitOutcome(input) {
     const deliverable = deliverableSignals(input.signals, input.controller, input.acknowledged ?? []);
@@ -144,4 +168,31 @@ export function waitOutcome(input) {
     // single global sequence number can never be advanced past events that were never delivered.
     const batch = unseen.slice(0, Number.isFinite(input.maxBatch) ? input.maxBatch : 50);
     return { status: "signals", signals: batch, cursor: batch[batch.length - 1].seq ?? null, more: unseen.length > batch.length };
+}
+
+/**
+ * Recover the events a restart must not lose.
+ *
+ * A restart must not silently forget what a controller was owed. Confirmation is durable, so the
+ * recovered set is "what the authoritative log says happened, minus what the log says was confirmed",
+ * and its cursor is derived from the events themselves — never from a counter that starts at zero
+ * again. A caller holding a cursor from before the restart therefore still receives anything newer,
+ * and an event it had not confirmed arrives again rather than being assumed handled.
+ *
+ * @param {ReadonlyArray<object>} records - every recorded event, in log order.
+ * @param {ReadonlyArray<string>} confirmed - ids the authoritative log records as confirmed.
+ * @returns {{signals: ReadonlyArray<object>, cursor: number, highestSeq: number}} the recovered view.
+ */
+export function recoverSignals(records, confirmed) {
+    const done = new Set(confirmed ?? []);
+    const signals = [];
+    let highestSeq = 0;
+    for (const record of records ?? []) {
+        if (record === null || typeof record !== "object") continue;
+        if (typeof record.seq === "number" && record.seq > highestSeq) highestSeq = record.seq;
+        if (done.has(record.id)) continue;
+        signals.push(record);
+    }
+    signals.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    return { signals, cursor: highestSeq, highestSeq };
 }
