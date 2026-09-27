@@ -75,7 +75,7 @@ try {
 
         const refused = await callOn(broken, "/notify", {
             method: "POST",
-            body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "should not be recorded", requestId: "req-broken" })
+            body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "should not be recorded", requestId: "req-broken", issuedAt: new Date().toISOString() })
         });
         record("a notification that cannot be recorded durably is REFUSED", refused.status >= 500, `status=${refused.status}`);
         record("the refusal says the record could not be written, not that it was delivered", /not-recorded|not-recorded durably|recorded/.test(JSON.stringify(refused.body)) === false || refused.status >= 500, JSON.stringify(refused.body).slice(0, 140));
@@ -124,14 +124,14 @@ try {
 
         const first = await callOn(healthy, "/notify", {
             method: "POST",
-            body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "recorded", requestId: "req-ok" })
+            body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "recorded", requestId: "req-ok", issuedAt: new Date().toISOString() })
         });
         record("a notification is accepted when the store is writable", first.status === 200, `status=${first.status}`);
 
         // The same request id twice is the SAME event, so a retry cannot become two business events.
         const retried = await callOn(healthy, "/notify", {
             method: "POST",
-            body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "recorded", requestId: "req-ok" })
+            body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "recorded", requestId: "req-ok", issuedAt: new Date().toISOString() })
         });
         record("retrying the same notification is accepted", retried.status === 200, `status=${retried.status}`);
         record("a retry does not create a second business event", retried.body.signalId === first.body.signalId, `first=${first.body.signalId} retry=${retried.body.signalId}`);

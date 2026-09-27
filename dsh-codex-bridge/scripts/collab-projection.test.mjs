@@ -119,8 +119,8 @@ try {
     await client.rpc("session/create", { request: { cwd: projDir, sessionId } });
 
     // Two durable notifications; then their files are DELETED behind the plugin's back.
-    await call("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "first", requestId: "proj-1" }) });
-    const second = await call("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "second", requestId: "proj-2" }) });
+    await call("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "first", requestId: "proj-1", issuedAt: new Date().toISOString() }) });
+    const second = await call("/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "second", requestId: "proj-2", issuedAt: new Date().toISOString() }) });
     const dir = inboxDirFor(inboxRoot, "codex").dir;
     const before = readSignals(dir).signals.length;
     for (const name of fs.readdirSync(dir)) fs.rmSync(path.join(dir, name), { force: true });

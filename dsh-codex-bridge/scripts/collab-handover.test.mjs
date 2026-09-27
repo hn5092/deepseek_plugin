@@ -123,7 +123,7 @@ try {
     // A notification from a session resolves through the live owner too.
     const notifyAsNew = await callAs(NEW_TOKEN, "/notify", {
         method: "POST",
-        body: JSON.stringify({ sessionId, controller: "codex-new", kind: "delivery", text: "handover complete", requestId: "handover-1" })
+        body: JSON.stringify({ sessionId, controller: "codex-new", kind: "delivery", text: "handover complete", requestId: "handover-1", issuedAt: new Date().toISOString() })
     });
     record("the live owner can notify for this session", notifyAsNew.status === 200, `status=${notifyAsNew.status}`);
     record("the notification is attributed to the new binding", notifyAsNew.status === 200 && notifyAsNew.body.bindingId === "codex::new", `binding=${notifyAsNew.body.bindingId}`);

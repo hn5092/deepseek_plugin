@@ -71,9 +71,11 @@ try {
         first.cookie = client.cookie;
         await client.rpc("session/create", { request: { cwd: projDir, sessionId } });
 
-        // Two events, both durable. One is confirmed; one is deliberately left unconfirmed.
-        const a = await callOn(first, "/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "keep me", requestId: "req-keep" }) });
-        const b = await callOn(first, "/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "confirm me", requestId: "req-confirm" }) });
+        // Two events, both durable. One is confirmed; one is deliberately left unconfirmed. Each carries
+        // its ORIGINAL issue time, which is what a retry of that identity must present.
+        const keepIssuedAt = new Date().toISOString();
+        const a = await callOn(first, "/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "keep me", requestId: "req-keep", issuedAt: keepIssuedAt }) });
+        const b = await callOn(first, "/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "confirm me", requestId: "req-confirm", issuedAt: new Date().toISOString() }) });
         record("both notifications are accepted before the restart", a.status === 200 && b.status === 200, `a=${a.status} b=${b.status}`);
         const before = await callOn(first, "/signals?controller=codex");
         record("both events are visible before the restart", (before.body.signals ?? []).length === 2, `count=${(before.body.signals ?? []).length}`);
@@ -119,7 +121,7 @@ try {
 
         // A cursor from before the restart must not hide newer work.
         const cursorBefore = Number(fs.readFileSync(path.join(workDir, "cursor.txt"), "utf8"));
-        const newer = await callOn(second, "/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "after restart", requestId: "req-after" }) });
+        const newer = await callOn(second, "/notify", { method: "POST", body: JSON.stringify({ sessionId, controller: "codex", kind: "delivery", text: "after restart", requestId: "req-after", issuedAt: new Date().toISOString() }) });
         record("a new event can be raised after the restart", newer.status === 200, `status=${newer.status}`);
         const withOldCursor = await callOn(second, `/wait-any?controller=codex&waitMs=600&maxBatch=50&since=${cursorBefore}`);
         const seenNew = (withOldCursor.body.signals ?? []).some((s) => (s.reference ?? "").includes("req-after") || s.id === newer.body.signalId);

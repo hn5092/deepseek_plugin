@@ -121,6 +121,12 @@ function readJson(file) {
  * so a crash leaves a gap in the sequence rather than two events sharing one, and reclaiming records
  * can never lower the high-water mark — which is what keeps a caller's cursor meaningful across
  * reclamation and restart.
+ *
+ * `generation` is a PERSISTENT NAMESPACE for server-issued ids, not a handover mechanism: it lets an id
+ * state which issuing epoch it came from, and handover is actually enforced by `bindingId` plus the
+ * `current` flag in `matchBinding` (a superseded binding is never selected, and one session has exactly
+ * one answer owner). Nothing increments it today, and no method is offered to, because inventing a
+ * caller for it would be adding a concept rather than serving one.
  */
 export class CollabStore {
     /**
@@ -182,27 +188,6 @@ export class CollabStore {
         const written = writeJsonAtomic(target.file, { nextSeq: seq + 1, generation: current.meta.generation });
         if (!written.ok) return { ok: false, reason: `could not reserve a sequence: ${written.reason}` };
         return { ok: true, seq, generation: current.meta.generation };
-    }
-
-    /**
-     * Advance the generation, invalidating every identity issued before it.
-     *
-     * A handover must not let an answer or retry meant for the previous owner act on the new one, so an
-     * identity carries the generation it was issued under and a stale one is refused by comparison
-     * instead of being silently accepted.
-     *
-     * @returns {{ok: true, generation: number} | {ok: false, reason: string}} the new generation.
-     */
-    advanceGeneration() {
-        if (!this.available) return { ok: false, reason: "store-not-configured" };
-        const current = this.readMeta();
-        if (!current.ok) return { ok: false, reason: current.reason };
-        const target = this.metaFile();
-        if (!target.ok) return target;
-        const generation = current.meta.generation + 1;
-        const written = writeJsonAtomic(target.file, { nextSeq: current.meta.nextSeq, generation });
-        if (!written.ok) return { ok: false, reason: written.reason };
-        return { ok: true, generation };
     }
 
     /** @returns {{ok: true, file: string} | {ok: false, reason: string}} one record's path. */

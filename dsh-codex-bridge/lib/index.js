@@ -242,8 +242,39 @@ export function apply(ctx, config) {
         const probe = state.store.probeWritable();
         if (!probe.ok) ctx.logger.error("codex-bridge: the durable store is not writable (%s); transfers will be refused rather than lost", probe.reason);
     }
-    /** @type {ReturnType<typeof import("./state.js").BridgeState.prototype.load>} */
-    let loaded = { loaded: 0, problems: [] };
+
+    /**
+     * Load the authoritative records BEFORE anything can write.
+     *
+     * This runs at the top of `apply`, ahead of registering the tools, the native-event observer and the
+     * routes, because those are all producers: a producer that ran against an empty cache could publish
+     * into it and then overwrite a durable record it never read. The failure this prevents is concrete —
+     * after a restart the model's `notify_controller` call or a native event can arrive before the
+     * controller's first GET, and a cache that was never loaded would then lose an existing confirmation.
+     *
+     * A store that cannot be read is NOT treated as empty. Continuing with empty state would rewrite
+     * records from an empty basis, so production is refused outright and the writes report that the
+     * bridge is not ready instead of silently acting on state it does not have.
+     */
+    const initialLoad = state.load();
+    let stateReady = initialLoad.ok;
+    if (!initialLoad.ok) {
+        ctx.logger.error(
+            "codex-bridge: refusing to serve: the durable store could not be loaded (%s, %d record(s) read); production is disabled until it can be read",
+            initialLoad.reason, initialLoad.loaded
+        );
+    } else {
+        ctx.logger.info("codex-bridge: loaded %d record(s) from the durable store before exposing any producer", initialLoad.loaded);
+    }
+    /** @type {{ok: boolean, loaded: number, problems: ReadonlyArray<object>, reason?: string}} */
+    let loaded = initialLoad;
+
+    /**
+     * Refuse a production write while the authoritative state is not loaded.
+     *
+     * @returns {{ok: true} | {ok: false, reason: string}} whether production may proceed.
+     */
+    const requireReady = () => (stateReady ? { ok: true } : { ok: false, reason: `store-not-loaded:${loaded.reason ?? "unknown"}` });
 
     /**
      * The question state a controller reads, derived from the ONE record.
@@ -379,6 +410,13 @@ export function apply(ctx, config) {
             if (!bound.allowed) {
                 return { status: "rejected", questionId: "", reason: `not-a-controlled-session:${bound.reason}` };
             }
+            // A question is a producer like any other, so it too is refused while the authoritative state
+            // could not be loaded: asking into an unread state would record a question against an empty
+            // basis and could hide an existing one.
+            const readiness = requireReady();
+            if (!readiness.ok) {
+                return { status: "rejected", questionId: "", reason: readiness.reason };
+            }
             // ONE call records the question as a single atomic record carrying both axes: the business
             // state starts `pending` and the notification starts `outstanding`. The owner persists before
             // it publishes, so a question that could not be recorded is never asked at all.
@@ -429,7 +467,9 @@ export function apply(ctx, config) {
                 const timer = setTimeout(() => {
                     // A bounded wait. Timing out is a real business outcome, not merely a dropped promise:
                     // the record is marked `expired` so a later answer is recognizably too late and a
-                    // restart can see that this question was never answered.
+                    // restart can see that this question was never answered. Recording the outcome and
+                    // settling the wait are ONE call, so the timeout also runs retention at this terminal
+                    // boundary rather than waiting for a confirmation that may never come.
                     state.settleBusiness(questionId, { business: "expired" });
                     settle({ status: "interrupted", reason: "answer-timeout" });
                 }, timeoutMs);
@@ -473,16 +513,23 @@ export function apply(ctx, config) {
      * @param {string} input.text - short summary.
      * @param {string} [input.goalId] - Goal identity.
      * @param {string} [input.requestId] - request identity.
+     * @param {string} [input.issuedAt] - the ORIGINAL issue time of a retried event, from its envelope.
      * @param {string} input.at - ISO timestamp.
      * @returns {{eventId: string, signalId: string, raised: object}} the produced identities.
      */
-    const produceNotification = async ({ agent, binding, kind, text, goalId, requestId, at }) => {
-        // A caller that retries names the SAME event, and an event id is issued by this store, so a retry
-        // inside the retention window matches the existing record exactly. Beyond that window the record
-        // has been reclaimed and a bare arbitrary string is no longer accepted as proof of identity: the
-        // caller must present the original issue time and is told the event expired rather than being
-        // allowed to re-create it. Unlimited retention and unlimited deduplication cannot both hold, and
-        // pretending otherwise with tombstones would be an unbounded store claiming to be bounded.
+    const produceNotification = async ({ agent, binding, kind, text, goalId, requestId, issuedAt, at }) => {
+        // A caller that retries names the SAME event. Inside the retention window the record is still here
+        // and the retry is idempotent WITHOUT the caller having to supply anything. Beyond that window the
+        // record is gone for good, and then:
+        //
+        //   - the caller MAY present the original issue time, and is told the event expired;
+        //   - the caller may NOT present just the bare string, because that would mint a fresh event that
+        //     merely reuses an old identifier and would meet a controller as new work;
+        //   - the caller must NOT substitute the retry's own time, which is why `issuedAt` travels from
+        //     the envelope rather than being invented here.
+        //
+        // A NEW notification carries no `requestId` at all and lets the server allocate its identity, so an
+        // ordinary caller never has to write an internal sequence number.
         const knownId = typeof requestId === "string" && requestId.length > 0
             ? `notify-${binding.bindingId}-${requestId}-${kind}`
             : undefined;
@@ -494,6 +541,8 @@ export function apply(ctx, config) {
             cwd: binding.cwd,
             text,
             ...(knownId === undefined ? {} : { id: knownId }),
+            // The envelope's original time is the ONLY accepted issue time for a retried id.
+            ...(issuedAt === undefined ? {} : { issuedAt }),
             ...(at === undefined ? {} : { at }),
             sourceIdentity: {
                 ...(goalId === undefined ? {} : { goalId }),
@@ -506,7 +555,7 @@ export function apply(ctx, config) {
                 eventId: knownId ?? "",
                 signalId: "",
                 raised: { ok: false, reason: published.reason },
-                fileError: `${published.expired === true ? "event-expired" : "record-not-persisted"}:${published.reason}`
+                fileError: `${published.expired === true ? "event-expired" : published.rejected === true ? "event-id-not-retryable" : "record-not-persisted"}:${published.reason}`
             };
         }
         // The DURABLE record is what makes the event recoverable, and the FILE is only how a controller
@@ -550,7 +599,11 @@ export function apply(ctx, config) {
             },
             requestId: {
                 type: "string",
-                description: "Optional request identity this result answers."
+                description: "Optional identity of an event being RETRIED. Omit it for a new notification and the server allocates the identity."
+            },
+            issuedAt: {
+                type: "string",
+                description: "Required when retrying a requestId: the ORIGINAL issue time from that event's envelope. Never the time of the retry."
             }
         },
         output: {
@@ -580,6 +633,12 @@ export function apply(ctx, config) {
             if (!bound.allowed) {
                 return { ok: false, reason: `not-a-controlled-session:${bound.reason}` };
             }
+            // A producer is refused while authoritative state could not be loaded, so a restart cannot
+            // record into, and thereby overwrite, state it never read.
+            const readiness = requireReady();
+            if (!readiness.ok) {
+                return { ok: false, reason: readiness.reason };
+            }
             const at = new Date().toISOString();
             const produced = await produceNotification({
                 agent: agent.session,
@@ -588,6 +647,9 @@ export function apply(ctx, config) {
                 text: typeof args.text === "string" ? args.text : "",
                 ...(typeof args.goalId === "string" && args.goalId.length > 0 ? { goalId: args.goalId } : {}),
                 ...(typeof args.requestId === "string" && args.requestId.length > 0 ? { requestId: args.requestId } : {}),
+                // A retry must present the event's ORIGINAL issue time; the schema requires it alongside
+                // requestId and the owner refuses a retried id without one.
+                ...(typeof args.issuedAt === "string" && args.issuedAt.length > 0 ? { issuedAt: args.issuedAt } : {}),
                 at
             });
             // The tool's contract is to tell the MODEL the truth. Reporting success when the durable
@@ -629,15 +691,18 @@ export function apply(ctx, config) {
      */
     const recoverFromEvents = () => {
         try {
-            if (!state.store.available) return { records: 0, questions: 0, cursor: 0 };
-            // Rebuild the cache from the durable records. Nothing is derived a second time: the records ARE
-            // the state, so a restart cannot resurrect a record that reclamation has removed, and a record
-            // that exists is visible with both of its axes intact.
-            const loaded = state.load();
-            const questions = state.all().filter((record) => record.kind === "question").length;
-            if (loaded.problems.length > 0) {
-                ctx.logger.warn("codex-bridge: %d unreadable record(s) in the durable store", loaded.problems.length);
+            if (!state.store.available) return { ok: false, records: 0, questions: 0, cursor: 0, reason: "store-not-configured" };
+            // Re-read the authoritative records and REPAIR the projection. Nothing is derived a second
+            // time: the records ARE the state, so a restart cannot resurrect a record that reclamation has
+            // removed, and a record that exists is visible with both of its axes intact.
+            const reloaded = state.load();
+            loaded = reloaded;
+            stateReady = reloaded.ok;
+            if (!reloaded.ok) {
+                ctx.logger.error("codex-bridge: the durable store could not be reloaded (%s); production stays disabled", reloaded.reason);
+                return { ok: false, records: reloaded.loaded, questions: 0, cursor: 0, reason: reloaded.reason };
             }
+            const questions = state.all().filter((record) => record.kind === "question").length;
             // Repair the notification projection as a normal part of recovering: a record that is durable
             // but lost its file (a crash between the two writes, a previously unwritable inbox, a file
             // removed by hand) gets that file written again.
@@ -652,13 +717,14 @@ export function apply(ctx, config) {
             const meta = state.store.readMeta();
             const cursor = meta.ok ? meta.meta.nextSeq - 1 : 0;
             ctx.logger.info("codex-bridge: recovered %d record(s), %d question(s) from the durable store (cursor=%d, projection-repaired=%d)",
-                loaded.loaded, questions, cursor, repaired);
-            return { records: loaded.loaded, questions, cursor };
+                reloaded.loaded, questions, cursor, repaired);
+            return { ok: true, records: reloaded.loaded, questions, cursor };
         } catch (error) {
-            // Recovery failing must not take the host down; the bridge starts with what it has, and an
-            // unreadable question then reports `unknown` rather than a wrong answer.
+            // Recovery failing must not take the host down, but it MUST disable production: continuing on
+            // state that could not be read is how a record gets overwritten from an empty basis.
+            stateReady = false;
             ctx.logger.warn("codex-bridge: recovery from the durable store failed: %s", messageOf(error));
-            return { records: 0, questions: 0, cursor: 0 };
+            return { ok: false, records: 0, questions: 0, cursor: 0, reason: messageOf(error) };
         }
     };
 
@@ -723,6 +789,25 @@ export function apply(ctx, config) {
             // while another append is being published") and takes the whole host down. Recording the
             // notification on a later tick leaves the append that triggered us to finish first.
             const pending = report;
+            // A native event is a producer too: it is not allowed to record while authoritative state could
+            // not be loaded, because that is exactly the restart window where the model or the harness can
+            // act before the controller's first read.
+            if (!requireReady().ok) {
+                ctx.logger.warn("codex-bridge: a native %s event was not recorded because the store is not loaded", event.type);
+                return;
+            }
+            // The ORIGINAL time of the native event becomes the issue time of the retried identity. It is
+            // taken from the event the harness recorded — its own `time` — and NEVER from the moment this
+            // observer happens to run: substituting "now" would let a retry of an already-reclaimed event
+            // slip past the expiry check.
+            //
+            // Deduplication is only offered when the event really carries that time. Without it an identity
+            // could not be retried safely, so the event is published under a SERVER-allocated id instead of
+            // being given a fabricated timestamp: better a fresh, honest event than one whose identity
+            // claims a time that never happened.
+            const hasEventTime = typeof event.time === "number" && Number.isFinite(event.time);
+            const eventTime = hasEventTime ? new Date(event.time).toISOString() : undefined;
+            const eventSeq = typeof event.seq === "number" ? `seq${event.seq}` : undefined;
             setImmediate(() => {
                 produceNotification({
                     agent: session,
@@ -730,7 +815,11 @@ export function apply(ctx, config) {
                     kind: pending.kind,
                     text: pending.text,
                     ...(pending.goalId === undefined ? {} : { goalId: pending.goalId }),
-                    ...(pending.requestId === undefined ? {} : { requestId: pending.requestId }),
+                    // A retryable identity needs both an original time and a distinct sequence; otherwise the
+                    // server allocates the id and the event is simply new.
+                    ...(hasEventTime && eventSeq !== undefined && pending.requestId !== undefined
+                        ? { requestId: `${pending.requestId}:${eventSeq}`, issuedAt: eventTime }
+                        : {}),
                     at: new Date().toISOString()
                 }).catch((error) => ctx.logger.warn("codex-bridge: could not report a native event: %s", messageOf(error)));
             });
@@ -1163,13 +1252,14 @@ export function apply(ctx, config) {
                     return;
                 }
                 // The answer is the question's terminal BUSINESS fact, applied as a compare-and-set so the
-                // first answer wins: a second, different answer is refused rather than overwriting it. It is
-                // recorded durably before any waiter is resumed, so it is never observable only through a
-                // live in-memory promise.
+                // first answer wins: a second, different answer is refused rather than overwriting it. The
+                // owner persists it, settles this process's live waiter with THAT recorded result, and only
+                // then runs retention — so the winner is saved, the tool call receives what was actually
+                // recorded rather than what was hoped for, and the reclaim cannot outrun either.
                 const applied = state.settleBusiness(questionId, {
                     business: QUESTION_STATE.ANSWERED,
                     answer: { id: questionId, text, source, at: new Date().toISOString() }
-                });
+                }, { status: "answered", answer: text, source });
                 if (!applied.ok) {
                     send(response, 503, { error: `the answer could not be recorded: ${applied.reason}`, questionId });
                     return;
@@ -1180,9 +1270,9 @@ export function apply(ctx, config) {
                     send(response, 409, { error: "question-already-decided", action: "conflict", questionId, answer: applied.record.answer });
                     return;
                 }
-                // Resume the SAME tool call, if this process still has one. Nothing already executed is
-                // replayed: the loop simply receives the tool result it was waiting for.
-                const delivered = state.settleWaiter(questionId, { status: "answered", answer: text, source });
+                // The record snapshot comes from the transition itself, so a reclaim that removed the
+                // record immediately afterwards cannot make this response read `unknown`.
+                const delivered = applied.delivered;
                 // A tool cannot be resumed across a restart, so an answer to a question whose waiter died
                 // with the previous process is still recorded and reported as NOT delivered — the truth,
                 // rather than an implication that a continuation happened.
@@ -1215,12 +1305,21 @@ export function apply(ctx, config) {
                     send(response, 400, { error: "kind must be delivery or error" });
                     return;
                 }
+                // A producer is refused while authoritative state could not be loaded, so it cannot record
+                // into an unread basis.
+                const readiness = requireReady();
+                if (!readiness.ok) {
+                    send(response, 503, { error: "the bridge is not ready to accept events", detail: readiness.reason });
+                    return;
+                }
                 const agent = ctx.agents.get(sessionId);
                 if (agent === undefined || agent === null) {
                     send(response, 409, { error: "session-not-live", sessionId });
                     return;
                 }
-                // The SAME producer the DS tool uses, so the passive route cannot drift from it.
+                // The SAME producer the DS tool uses, so the passive route cannot drift from it. A retry
+                // must present the ORIGINAL issue time: the envelope's time, never a fresh one, or the
+                // expiry check could be bypassed by retrying.
                 const produced = await produceNotification({
                     agent: agent.session,
                     binding: matched.binding,
@@ -1228,6 +1327,7 @@ export function apply(ctx, config) {
                     text: typeof body.text === "string" ? body.text : "",
                     ...(typeof body.goalId === "string" && body.goalId.length > 0 ? { goalId: body.goalId } : {}),
                     ...(typeof body.requestId === "string" && body.requestId.length > 0 ? { requestId: body.requestId } : {}),
+                    ...(typeof body.issuedAt === "string" && body.issuedAt.length > 0 ? { issuedAt: body.issuedAt } : {}),
                     at: new Date().toISOString()
                 });
                 // The durable event is already written, so a failing FILE projection is reported rather

@@ -90,12 +90,32 @@ export class BridgeState {
         this.onChange = null;
     }
 
-    /** Rebuild the cache from the durable records. */
+    /**
+     * Rebuild the cache from the durable records.
+     *
+     * Called before any producer or observer is exposed, because a producer that ran against an empty
+     * cache would publish into it and could then overwrite a durable record it never read — a restart
+     * where the model's tool call arrived before the controller's first read would lose a confirmation.
+     * A store that cannot be read is reported so the caller can refuse to serve rather than continue with
+     * empty state.
+     *
+     * @returns {{ok: boolean, loaded: number, problems: ReadonlyArray<object>, reason?: string}} the outcome.
+     */
     load() {
         this.records.clear();
+        if (!this.store.available) return { ok: false, loaded: 0, problems: [], reason: "store-not-configured" };
         const { records, problems } = this.store.allRecords();
         for (const record of records) this.records.set(record.id, record);
-        return { loaded: records.length, problems };
+        // A meta file that cannot be read would reset the sequence, letting a new event reuse a number an
+        // existing cursor had already passed, so it is treated as a load failure rather than defaulted.
+        const meta = this.store.readMeta();
+        if (!meta.ok) return { ok: false, loaded: records.length, problems, reason: meta.reason };
+        if (problems.length > 0) {
+            // An unreadable record is reported. It is NOT silently skipped: continuing could hide a
+            // conflict, and the caller decides whether that is acceptable for this start.
+            return { ok: false, loaded: records.length, problems, reason: `${problems.length} unreadable record(s)` };
+        }
+        return { ok: true, loaded: records.length, problems: [] };
     }
 
     /**
@@ -158,13 +178,33 @@ export class BridgeState {
             const file = this.projectRecord(existing);
             return { ok: true, record: existing, duplicate: true, ...(file.ok ? {} : { fileError: file.reason }) };
         }
-        // A deterministic id the caller supplied but that is not present may have been issued and then
-        // reclaimed. Within the retention window its record is still here (handled above); beyond it the
-        // caller must bring the original issue time so it can be told the event has expired rather than
-        // silently re-created as new work.
-        if (input.id !== undefined && typeof input.issuedAt === "string") {
+        // A caller-supplied identity that is NOT present may be a first delivery or a retry of one already
+        // reclaimed. Bounded retention and unlimited deduplication cannot both hold, and the two cases
+        // cannot be told apart from the string alone, so the rule is explicit and applies to every entry
+        // point alike:
+        //
+        //   - retrying an id we still hold is accepted above, idempotently, using the issue time already
+        //     recorded in the envelope — the caller does not, and must not, substitute "now";
+        //   - naming an id we no longer hold requires the ORIGINAL issue time, and is then answered as
+        //     expired rather than re-created;
+        //   - with no issue time the request is refused. There is deliberately NO "treat as new" escape:
+        //     such a flag would be a documented way to slip a retry past the expiry check, which is the
+        //     exact thing the check exists to prevent.
+        //
+        // An ordinary NEW notification carries no caller-supplied id at all and lets the server allocate
+        // one, so a caller never has to invent an internal identity — it only has to name one when it is
+        // genuinely retrying.
+        if (input.id !== undefined) {
+            if (typeof input.issuedAt !== "string") {
+                return { ok: false, reason: "event-id-without-issue-time", rejected: true };
+            }
             const issued = Date.parse(input.issuedAt);
-            if (Number.isFinite(issued) && this.retention.maxAgeMs >= 0 && Date.now() - issued > this.retention.maxAgeMs) {
+            if (!Number.isFinite(issued)) {
+                return { ok: false, reason: "event-id-with-unparsable-issue-time", rejected: true };
+            }
+            if (Date.now() - issued > this.retention.maxAgeMs) {
+                // Beyond the retention window the record is gone for good; the caller is told it expired
+                // instead of being allowed to re-create it as fresh work.
                 return { ok: false, reason: "event-expired", expired: true };
             }
         }
@@ -243,25 +283,48 @@ export class BridgeState {
     }
 
     /**
-     * Move a question to a terminal business state, if it is still pending.
+     * Move a question to a terminal business state, settle its live waiter, then reclaim — in that order.
+     *
+     * This is THE terminal boundary, shared by every way a question can finish (an answer, a
+     * cancellation, a timeout), so no caller has to remember to run retention itself: a question that was
+     * confirmed first and only finished later is reclaimed here even though no further confirmation ever
+     * arrives.
+     *
+     * The order is the contract:
+     *   1. the compare-and-set persists the winning outcome and nothing later may undo it;
+     *   2. the live waiter is settled with THAT confirmed result, so the tool call receives what was
+     *      actually recorded rather than whatever the caller hoped to write;
+     *   3. only then is retention run.
+     *
+     * The caller receives a SNAPSHOT taken from the winning record, so a reclaim that removes the record
+     * afterwards cannot make the caller read back `unknown` for a transition it just performed.
      *
      * @param {string} id - the record id.
-     * @param {object} outcome - `{business, answer?, reason?}`.
-     * @returns {{ok: true, record: object, changed: boolean} | {ok: false, reason: string}} the outcome.
+     * @param {object} outcome - `{business, answer?}`.
+     * @param {object} [waiterValue] - what to resolve a live waiter with; omitted leaves it untouched.
+     * @returns {{ok: true, record: object, changed: boolean, delivered: boolean} | {ok: false, reason: string}} the outcome.
      */
-    settleBusiness(id, outcome) {
+    settleBusiness(id, outcome, waiterValue) {
         const current = this.get(id);
         if (current === null) return { ok: false, reason: "unknown-question" };
         if (current.kind !== "question") return { ok: false, reason: "not-a-question" };
         if (isTerminalBusiness(current)) {
-            // The first terminal outcome wins. A second is reported, never applied.
-            return { ok: true, record: current, changed: false };
+            // The first terminal outcome wins. A second is reported, never applied — and the caller still
+            // gets the recorded truth rather than a failure.
+            return { ok: true, record: current, changed: false, delivered: false };
         }
         const applied = this.store.setBusinessOutcome(id, outcome);
         if (!applied.ok) return applied;
-        this.records.set(applied.record.id, applied.record);
+        // Take the snapshot BEFORE retention runs: the transition happened, and the caller must be able to
+        // report it even if the record is reclaimed in the very next statement.
+        const winner = { ...applied.record };
+        this.records.set(winner.id, winner);
+        const delivered = waiterValue === undefined ? false : this.settleWaiter(id, waiterValue);
         if (this.onChange !== null) this.onChange();
-        return { ok: true, record: applied.record, changed: applied.changed };
+        // Retention runs at this boundary too, so a confirmed-then-finished question is bounded without
+        // waiting for a later confirmation that may never come.
+        if (applied.changed) this.reclaim(this.retention);
+        return { ok: true, record: winner, changed: applied.changed, delivered };
     }
 
     /** Register the live waiter for one question. @returns {() => void} a disposer. */
