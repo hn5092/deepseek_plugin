@@ -105,12 +105,29 @@ function writeJsonAtomic(file, value) {
     }
 }
 
-/** Read one JSON file. */
+/**
+ * Read one JSON file.
+ *
+ * The failure carries its `code` alongside the message so callers can classify it structurally. Matching
+ * a message for a token like `ENOENT` is not safe: the text also contains the FILE PATH, so a path
+ * containing that literal would be misread, and the message wording is not a contract.
+ *
+ * @param {string} file - the file to read.
+ * @returns {{ok: true, value: unknown} | {ok: false, reason: string, code: string, missing: boolean}} the outcome.
+ */
 function readJson(file) {
     try {
         return { ok: true, value: JSON.parse(fs.readFileSync(file, "utf8")) };
     } catch (error) {
-        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+        const code = error !== null && typeof error === "object" && typeof error.code === "string" ? error.code : "";
+        return {
+            ok: false,
+            reason: error instanceof Error ? error.message : String(error),
+            code,
+            // Only a genuine absence counts as "not here". A syntax error or an IO failure is corruption,
+            // which is a different fact and must not be reported as a missing record.
+            missing: code === "ENOENT"
+        };
     }
 }
 
@@ -197,17 +214,54 @@ export class CollabStore {
     }
 
     /**
+     * Whether any record already exists, without reading or parsing them.
+     *
+     * Used by the sequence allocator to tell an empty store from one whose meta was lost. The distinction
+     * is the whole point: a missing meta beside existing records means the sequence history is gone, and
+     * continuing from 1 would hand out numbers an existing cursor has already passed — and could collide
+     * with a server-issued event id that is already in the store.
+     *
+     * A directory that cannot be READ is reported rather than treated as empty, because "I could not look"
+     * and "there is nothing there" lead to opposite decisions here.
+     *
+     * @returns {{ok: true, present: boolean} | {ok: false, reason: string}} whether records exist.
+     */
+    hasRecords() {
+        if (!this.available) return { ok: false, reason: "store-not-configured" };
+        const dir = this.eventsDir();
+        if (!dir.ok) return { ok: false, reason: dir.reason };
+        let names;
+        try {
+            names = fs.readdirSync(dir.file);
+        } catch (error) {
+            const code = error !== null && typeof error === "object" && typeof error.code === "string" ? error.code : "";
+            // A store with no events directory yet is genuinely empty.
+            if (code === "ENOENT") return { ok: true, present: false };
+            return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+        }
+        return { ok: true, present: names.some((name) => name.endsWith(".json")) };
+    }
+
+    /**
      * Reserve the next sequence and write the meta back, BEFORE the event that will use it.
      *
      * Reserving first is what makes a crash safe: an unused reserved number is a harmless gap, whereas
      * writing the event first and then discovering the sequence was stale would give two events one
      * identity. The high-water mark only ever increases.
      *
+     * This is the ALLOCATION boundary every producer shares — the question tool, the notification tool and
+     * the native-event observer all reach the store through it — so the lost-meta check belongs here and
+     * not in one of those callers or in the HTTP surface. A producer that runs without a controller reload
+     * must be refused exactly like one that followed a reload; otherwise a missing meta would quietly
+     * renumber the store for whichever writer happened to arrive first.
+     *
      * @returns {{ok: true, seq: number, generation: number} | {ok: false, reason: string}} the reservation.
      */
     reserveSeq() {
         if (!this.available) return { ok: false, reason: "store-not-configured" };
-        const current = this.readMeta();
+        const presence = this.hasRecords();
+        if (!presence.ok) return { ok: false, reason: `records could not be checked: ${presence.reason}` };
+        const current = this.readMeta({ recordsPresent: presence.present });
         if (!current.ok) return { ok: false, reason: current.reason };
         const target = this.metaFile();
         if (!target.ok) return target;
@@ -258,9 +312,9 @@ export class CollabStore {
         if (!target.ok) return target;
         const read = readJson(target.file);
         if (read.ok) return read;
-        // `readRecord` already distinguishes an absent file from an unreadable one through its error text;
-        // make the absence explicit so callers can branch on it without parsing a message.
-        return /ENOENT/.test(read.reason) ? { ok: false, reason: "not-found" } : read;
+        // The classification uses the error CODE carried by the reader, not a pattern match on the message:
+        // the message includes the path, so a path containing "ENOENT" would otherwise be misread.
+        return read.missing ? { ok: false, reason: "not-found", code: read.code, missing: true } : read;
     }
 
     /** Every record, plus any unreadable files. */

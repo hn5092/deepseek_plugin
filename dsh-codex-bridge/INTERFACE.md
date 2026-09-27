@@ -1,6 +1,6 @@
 # dsh-codex-bridge：DS↔Codex 双向协作桥
 
-状态：**隔离实例全部验收 GREEN（13 套 268/268，全部 EXIT=0）；未安装主实例、未重启、未推送。**
+状态：**隔离实例全部验收 GREEN（14 套 291/291，全部 EXIT=0）；未安装主实例、未重启、未推送。**
 作者源码：`D:\workspace\_tools\deepseek_plugin\dsh-codex-bridge\`（唯一）。
 
 ## 零之一、重试合同（所有入口同一语义）
@@ -38,8 +38,13 @@
 - **只有"明确的 ENOENT 且无记录"才算空存储**。`EACCES`/`EPERM`/`ENOTDIR`/IO 错误/损坏记录
   **明确上报并拒绝生产**（HTTP 503，`detail` 保留**原始错误文本**），**不当作空**。
   ⇒ 不会出现"读不到记录 → 以为空 → 覆盖已有记录"。
-- **不再用 `existsSync` 判断 meta**：文件存在但不可读与"不存在"是不同事实。**有记录却缺 meta**
-  视为**序号历史丢失**并上报，**不默默从 seq 1 重新开始**。
+- **不再用 `existsSync`**（生产路径已无）：文件存在但不可读与"不存在"是不同事实。`readJson` 失败时
+  **带出 `error.code`**，`missing` 只认 `ENOENT`；**不按错误消息里的路径字面量分类**（消息含路径，
+  路径里出现 `ENOENT` 会被误判）。
+- **有记录却缺 meta = 序号历史丢失**：**运行期**由 `reserveSeq` 在**所有 producer 共用的分配边界**
+  拒绝（先 `hasRecords()` 探测，再 `readMeta({recordsPresent})`），**不默默从 seq 1 重建** ——
+  避免覆盖已有服务端事件 ID。⇒ **模型工具与原生事件在未经 controller reload 时同样被拒**，
+  不是只有 HTTP reload 才拦得住；失败的 ask 返回**具体存储错误**，**不挂起**。
 - **`reclaim` 也检查可读性**：读不到记录时返回原因，不谎报"没有到期项"。
 
 ## 零之五、`generation` 的定位（不为概念扩功能）
@@ -148,7 +153,7 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 - **重启**：确认不重现、未确认可补收、**旧 cursor 不漏新事件**、**不重放**；未恢复的工具等待**不复活**，
   答复照常落盘并回 `delivered:false` 说明本进程无活等待。
 
-## 四、验收（全部实测，`EXIT=0`，合计 268/268）
+## 四、验收（全部实测，`EXIT=0`，合计 291/291）
 
 `node scripts/<suite>.test.mjs`：
 
@@ -167,6 +172,7 @@ DS 在一个绑定目录的会话里发出技术问题 → Codex 当前的等待
 | `collab-projection` | 17/17 | **投影修复**（文件被删后读回自动补建）、**ghost 不交付只上报**、**有界回收**（两轴：确认且终态且过双界才回收；**未确认/已确认但仍 pending 均永不因上限删除**）、**高水位不降** |
 | **`collab-retention`** | **13/13** | **保留参数非法则插件拒绝激活**；**真 ask → 只确认不答复 → 小窗口回收 → 问题仍可答、原工具调用恰好继续一次** |
 | **`collab-callers`** | **35/35** | **回收后用同 `requestId` 重试：缺 `issuedAt` 拒绝、给原 `issuedAt` 判过期、均不重建**；**批量 confirm 后仅 answer/timeout（不再 confirm）仍在终态边界收尾**；**保留中的重复=幂等 200 且不重新 outstanding，真正超窗已回收的重复=过期拒绝**；**配置窗口在全新实例与重启后的首写即生效**；**读不到的 store 拒绝生产并保留原始错误**；未确认记录在多次回收后仍在 |
+| **`collab-meta-loss`** | **23/23** | **运行期 meta 丢失**：producer（模型工具/原生事件）**未经任何 collaboration HTTP reload** 即被拒，**已有记录与游标不变、不重建 seq 1**；共享分配边界独立反例；fresh store 仍正常；失效 ask **返回具体存储错误且不挂起** |
 
 另需 `scripts/isolated-instance.mjs`（可丢弃或 caller-owned home + `--patch` overlay，**真 SIGTERM → 等退出 →
 有界 SIGKILL → 复核**的 stop，**回收本次自有孙进程**，失败日志复制到 caller 指定的证据目录，并导出
