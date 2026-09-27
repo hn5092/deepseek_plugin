@@ -19,6 +19,7 @@
  * Usage:
  *   node bridge-cli.mjs health
  *   node bridge-cli.mjs bindings   --token-ref REF --controller NAME
+ *   node bridge-cli.mjs questions  --token-ref REF --controller NAME --session ID
  *   node bridge-cli.mjs wait-any   --token-ref REF --controller NAME [--wait-ms N] [--since N] [--acknowledged ID,ID]
  *   node bridge-cli.mjs answer     --token-ref REF --controller NAME --question ID --text-file FILE
  *   node bridge-cli.mjs confirm    --token-ref REF --controller NAME --signal ID
@@ -196,6 +197,15 @@ async function main() {
 
     if (command === "bindings") {
         const result = await control({ url, cookie, base, token, method: "GET", route: `/bindings?controller=${encodeURIComponent(controller)}` });
+        process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
+        return result.status === 200 ? 0 : 1;
+    }
+
+    if (command === "questions") {
+        const sessionId = options.get("session");
+        if (!sessionId) throw new Error("--session is required");
+        const query = new URLSearchParams({ controller, sessionId });
+        const result = await control({ url, cookie, base, token, method: "GET", route: `/questions?${query}` });
         process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
         return result.status === 200 ? 0 : 1;
     }
