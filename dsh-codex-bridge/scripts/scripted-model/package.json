@@ -1,0 +1,8 @@
+{
+  "name": "dsh-codex-collab-scripted-model",
+  "version": "0.1.0",
+  "description": "Test-only DSH plugin registering a scripted model provider for the collaboration bridge suite",
+  "type": "module",
+  "main": "index.js",
+  "private": true
+}
