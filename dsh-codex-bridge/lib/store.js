@@ -241,13 +241,26 @@ export class CollabStore {
         return writeJsonAtomic(target.file, record);
     }
 
-    /** @param {string} id - the record id. @returns {{ok: true, value: object} | {ok: false, reason: string}} */
+    /**
+     * Read one record.
+     *
+     * A missing record and an unreadable one are reported DIFFERENTLY: `not-found` means the id is absent,
+     * while any other error carries the real reason. Collapsing both into "not-found" would let a
+     * permissions problem look exactly like a record that was reclaimed, which is the distinction a caller
+     * deciding whether an event was retired needs.
+     *
+     * @param {string} id - the record id.
+     * @returns {{ok: true, value: object} | {ok: false, reason: string}} the record or why it is unavailable.
+     */
     getRecord(id) {
         if (!this.available) return { ok: false, reason: "store-not-configured" };
         const target = this.recordFile(id);
         if (!target.ok) return target;
-        if (!fs.existsSync(target.file)) return { ok: false, reason: "not-found" };
-        return readJson(target.file);
+        const read = readJson(target.file);
+        if (read.ok) return read;
+        // `readRecord` already distinguishes an absent file from an unreadable one through its error text;
+        // make the absence explicit so callers can branch on it without parsing a message.
+        return /ENOENT/.test(read.reason) ? { ok: false, reason: "not-found" } : read;
     }
 
     /** Every record, plus any unreadable files. */
