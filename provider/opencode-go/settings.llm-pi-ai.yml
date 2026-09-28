@@ -52,8 +52,11 @@ llm-pi-ai:
             - text
             - image
           reasoningEfforts:
+            minimal: minimal
             low: low
+            medium: medium
             high: high
+            xhigh: xhigh
             max: max
     opencode-go-2:
       displayName: "2"
@@ -103,8 +106,11 @@ llm-pi-ai:
             - text
             - image
           reasoningEfforts:
+            minimal: minimal
             low: low
+            medium: medium
             high: high
+            xhigh: xhigh
             max: max
     opencode-go-3:
       displayName: "3"
@@ -154,8 +160,11 @@ llm-pi-ai:
             - text
             - image
           reasoningEfforts:
+            minimal: minimal
             low: low
+            medium: medium
             high: high
+            xhigh: xhigh
             max: max
     opencode-go-4:
       displayName: "4"
@@ -205,8 +214,11 @@ llm-pi-ai:
             - text
             - image
           reasoningEfforts:
+            minimal: minimal
             low: low
+            medium: medium
             high: high
+            xhigh: xhigh
             max: max
     opencode-go-5:
       displayName: "5"
@@ -256,6 +268,9 @@ llm-pi-ai:
             - text
             - image
           reasoningEfforts:
+            minimal: minimal
             low: low
+            medium: medium
             high: high
+            xhigh: xhigh
             max: max
