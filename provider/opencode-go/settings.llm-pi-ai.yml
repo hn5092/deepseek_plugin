@@ -44,6 +44,17 @@ llm-pi-ai:
           reasoningEfforts:
             high: high
             max: max
+        - id: space-bunny-free
+          name: Space Bunny
+          contextWindow: 100000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
     opencode-go-2:
       displayName: "2"
       apiKeyEnv: OPENCODE_API_KEY_2
@@ -82,6 +93,17 @@ llm-pi-ai:
             - text
             - image
           reasoningEfforts:
+            high: high
+            max: max
+        - id: space-bunny-free
+          name: Space Bunny
+          contextWindow: 100000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
             high: high
             max: max
     opencode-go-3:
@@ -124,6 +146,17 @@ llm-pi-ai:
           reasoningEfforts:
             high: high
             max: max
+        - id: space-bunny-free
+          name: Space Bunny
+          contextWindow: 100000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
     opencode-go-4:
       displayName: "4"
       apiKeyEnv: OPENCODE_API_KEY_4
@@ -164,6 +197,17 @@ llm-pi-ai:
           reasoningEfforts:
             high: high
             max: max
+        - id: space-bunny-free
+          name: Space Bunny
+          contextWindow: 100000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
+            high: high
+            max: max
     opencode-go-5:
       displayName: "5"
       apiKeyEnv: OPENCODE_API_KEY_5
@@ -202,5 +246,16 @@ llm-pi-ai:
             - text
             - image
           reasoningEfforts:
+            high: high
+            max: max
+        - id: space-bunny-free
+          name: Space Bunny
+          contextWindow: 100000000
+          maxTokens: 65536
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            low: low
             high: high
             max: max
