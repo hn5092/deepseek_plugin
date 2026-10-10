@@ -40,7 +40,7 @@ lib/client.js         # 浏览器：往 conversation.input.right 注册胶囊+�
    "error":null}]}
 ```
 
-- 采样：宿主进程内按 `sampleEveryMs`（默认 1800000 = 30 分钟，0 关闭）采样，加载时先立刻采一次；`historyPath`（默认取按平台的用户状态目录：Windows `%LOCALAPPDATA%`、macOS `~/Library/Application Support`、其它 `$XDG_STATE_HOME` 或 `~/.local/state`，落到 `opencode-go-usage/history.jsonl`，超 2 MiB 轮转）、`historyMax`（默认 96 条）。接口返回最近 24 条供面板算「Δ周/Δ月」。
+- 采样：宿主进程内按 `sampleEveryMs`（默认 1800000 = 30 分钟，0 关闭）采样，加载时先立刻采一次；`historyPath`（默认取按平台的用户状态目录：Windows `%LOCALAPPDATA%`、macOS `~/Library/Application Support`、其它 `$XDG_STATE_HOME` 或 `~/.local/state`，落到 `opencode-go-usage/history.jsonl`，超 2 MiB 轮转）、`historyMax`（默认 96 条）。接口在每次响应里附带最近 24 条。**注意**：面板原先用这些历史算「Δ周/Δ月」，该列已按用户要求移除，所以历史现在只作为可外部查看的时间序列保留，界面不再消费它。
 - 配置（Schemastery，`Config`）：`refs`（要采样的凭据引用，默认 `OPENCODE_API_KEY_1..4`）、`routes`（与 `refs` 对齐的路由名，例如 `opencode-go-1`；省略则按 `routePrefix` 推导）、`routePrefix`（默认 `opencode-go`，置空则不推导）、`path`、`endpoint`、`cacheMs`（默认 30000）、`timeoutMs`（默认 15000）。
 - CommandCode 配置：`commandcodeRefs`（显式列出的引用）、`commandcodeRefPrefix`（默认 `COMMANDCODE_API_KEY`，会同时发现 `<prefix>` 与 `<prefix>_<n>`）、`commandcodeRefMax`（默认 4）、`commandcodeBaseUrl`（默认 `https://api.commandcode.ai`）。**默认无需配置**：只要凭据存储里有 `COMMANDCODE_API_KEY` 就会自动出现一行。
 
@@ -66,5 +66,6 @@ lib/client.js         # 浏览器：往 conversation.input.right 注册胶囊+�
 - 胶囊读会话投影 `modelSelection.lastUsed.provider`（插槽传来 `sessionId`/`useSessions`）来挑选账号；宿主没给 `route` 时按引用名尾号推导，匹配不到就回退显示全部账号最高值。（`order: 40`）
 - **面板定位**：面板比胶囊宽得多又向上弹出，只锚在胶囊上会把左缘推出窗口（窄窗口下账号名和前几列被裁掉）。所以面板改用 `position:fixed`，由一个布局效果按视口摆放：优先右缘对齐胶囊，左缘一旦越过 8px 边距就改成贴左边距，宽度上限 `100vw - 16px`；窗口缩放或输入区滚动时重算。表格仍比面板宽时在面板内横向滚动。
 - 不放会话头部的原因见根 README「为什么不在会话头部显示」：Windows 标题栏覆盖层会吞掉顶部 36 DIP 的点击。
+- **表格**：账号列用与胶囊一致的短标签（`GO 7` / `CMD 2`），完整凭据引用留在该单元格的 tooltip 里；完整引用名太长，是表格变宽的主要原因。列有：账号、Key、5 小时、周、月、周重置、Tokens入→出 · 请求。
 - 样式走 DSH 的主题变量（`--dsw-specific-menu`、`--dsw-alias-label-*`、`--dsw-alias-state-warn-*` 等），自动跟随浅色/深色主题；≥80% 的窗口标黄。
 - 点击目标做了三处加固：胶囊本身 28px 高并加大内边距、`z-index:2` 抬到同级之上、`::after` 上下各外扩 4px 命中区，同时 `-webkit-app-region:no-drag` 让它在 Electron 里不被拖拽区吞掉点击。

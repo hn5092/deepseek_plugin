@@ -47,7 +47,7 @@ window.__ModuleLoader__.load({
             // to the chip alone pushed its left edge off-screen on a narrow window and the account
             // names plus the first columns were cut. The placement effect below clamps it instead.
             ".dsw-ogu-panel{position:fixed;z-index:60;width:max-content;max-height:min(60vh, 420px);overflow:auto;",
-            "right:8px;bottom:8px;max-width:calc(100vw - 16px);padding:12px 14px;border-radius:12px;",
+            "right:8px;bottom:8px;max-width:calc(100vw - 16px);padding:10px 12px;border-radius:12px;",
             "border:1px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));",
             // Opaque surface. --dsw-specific-menu resolves to var(--dsw-menu-surface-fill) on this
             // theme, a 58%-alpha fill meant to sit over a backdrop blur; using it alone let the
@@ -61,10 +61,10 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-title{font-weight:600;color:var(--dsw-alias-label-primary, inherit);margin-bottom:8px}",
             ".dsw-ogu-table{border-collapse:collapse;font-variant-numeric:tabular-nums}",
             ".dsw-ogu-table th{color:var(--dsw-alias-label-tertiary, inherit);font-weight:500;text-align:right;",
-            "padding:2px 8px;white-space:nowrap}",
+            "padding:2px 6px;white-space:nowrap}",
             ".dsw-ogu-table th:first-child,.dsw-ogu-table td:first-child{text-align:left}",
             ".dsw-ogu-table th:nth-child(2),.dsw-ogu-table td:nth-child(2){text-align:left}",
-            ".dsw-ogu-table td{color:var(--dsw-alias-label-secondary, inherit);text-align:right;padding:4px 8px;white-space:nowrap}",
+            ".dsw-ogu-table td{color:var(--dsw-alias-label-secondary, inherit);text-align:right;padding:3px 6px;white-space:nowrap}",
             ".dsw-ogu-table td:first-child{color:var(--dsw-alias-label-primary, inherit)}",
             ".dsw-ogu-table td[data-warn=true]{font-weight:600}",
             ".dsw-ogu-table tr[data-active=true] td{background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.08))}",
@@ -204,29 +204,18 @@ window.__ModuleLoader__.load({
             return String(value);
         }
 
-        /** Most recent history sample that is not the one being displayed. */
-        function previousSample(payload) {
-            const history = payload && Array.isArray(payload.history) ? payload.history : [];
-            for (let index = history.length - 1; index >= 0; index--) {
-                const sample = history[index];
-                if (sample && sample.at !== payload.sampledAt) return sample;
-            }
-            return null;
+        /**
+         * Short label for the account column. The chip already names an account by its route
+         * number ("GO 7"), so the table uses the same label; the full credential reference is what
+         * made the column wide and is kept in the cell tooltip instead.
+         */
+        function accountLabel(row) {
+            const found = routeOf(row);
+            const number = found ? /(\d+)\s*$/.exec(found.route) : null;
+            return (isCommandCode(row) ? "CMD " : "GO ") + (number ? number[1] : "1");
         }
 
-        function deltaText(current, previous) {
-            if (typeof current !== "number" || typeof previous !== "number") return "—";
-            const delta = current - previous;
-            if (delta === 0) return "0%";
-            return (delta > 0 ? "+" : "") + round1(delta) + "%";
-        }
-
-        function rowDelta(previous, account, window) {
-            if (!previous || !Array.isArray(previous.accounts)) return "—";
-            const row = previous.accounts.find((entry) => entry.account === account);
-            return row ? row[window] : "—";
-        }
-        function AccountRows({ accounts, activeAccount, previous }) {
+        function AccountRows({ accounts, activeAccount }) {
             // Both readers report window percentages, so every row uses the same percent
             // cells; the CommandCode money view stays available in the tooltip.
             const valueCell = (row, entry) => percentCell(entry);
@@ -234,15 +223,13 @@ window.__ModuleLoader__.load({
                 key: row.account,
                 "data-active": row.account === activeAccount ? "true" : null
             },
-                h("td", null, (row.account === activeAccount ? "▸ " : "") + row.account
+                h("td", { title: row.account }, (row.account === activeAccount ? "▸ " : "") + accountLabel(row)
                     + (isCommandCode(row) && row.planId ? " (" + row.planId.replace(/^individual-/, "") + ")" : "")),
                 h("td", null, row.key || "—"),
                 valueCell(row, row.rolling),
                 valueCell(row, row.weekly),
                 valueCell(row, row.monthly),
                 h("td", null, whenText(row.weekly && row.weekly.resetsAt)),
-                h("td", null, deltaText(percentOf(row.weekly), rowDelta(previous, row.account, "weekly"))
-                    + " / " + deltaText(percentOf(row.monthly), rowDelta(previous, row.account, "monthly"))),
                 h("td", null, isCommandCode(row)
                     ? tokenText(row.tokensIn) + "→" + tokenText(row.tokensOut) + " · " + (typeof row.requests === "number" ? row.requests : "—")
                     : "—")
@@ -256,7 +243,6 @@ window.__ModuleLoader__.load({
                         h("th", null, "周"),
                         h("th", null, "月"),
                         h("th", null, "周重置"),
-                        h("th", null, "Δ周/Δ月"),
                         h("th", null, "Tokens入→出 · 请求")
                     )
                 ),
@@ -418,12 +404,12 @@ window.__ModuleLoader__.load({
                 ),
                 open ? h("div", { className: "dsw-ogu-panel", ref: panelRef },
                     h("div", { className: "dsw-ogu-title" }, "用量（5 小时 / 周 / 月）· OpenCode Go + CommandCode"),
-                    h(AccountRows, { accounts, activeAccount: active ? active.account : null, previous: previousSample(state.payload) }),
+                    h(AccountRows, { accounts, activeAccount: active ? active.account : null }),
                     failures.length > 0 ? h("div", { className: "dsw-ogu-error" },
                         "⚠ " + failures.map((row) => row.account + " " + row.error).join("；")) : null,
                     h("div", { className: "dsw-ogu-meta" },
                         state.payload && state.payload.sampledAt
-                            ? "采样于 " + whenText(state.payload.sampledAt) + "，面板每 30 秒刷新、后台每 30 分钟存一次历史；Δ = 相比上一次采样；≥" + WARN_PERCENT + "% 标黄"
+                            ? "采样于 " + whenText(state.payload.sampledAt) + "，面板每 30 秒刷新、后台每 30 分钟存一次历史；≥" + WARN_PERCENT + "% 标黄"
                                 + "；Go 行为百分比，CMD 行为美元金额（已用/额度）"
                                 + (active ? "；▸ = " + (picked && picked.derived ? "按引用名尾号匹配的 " : "本会话选择的 ") + picked.route
                                     : (provider ? "；未找到 " + provider + " 对应的账号（按引用名尾号匹配）" : ""))
