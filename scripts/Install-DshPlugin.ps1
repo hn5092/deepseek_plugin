@@ -152,6 +152,8 @@ if (-not (Test-Path -LiteralPath $PluginDir)) { throw "plugin source not found: 
 # 1) Installed copy: the artifact DSH resolves from the profile.
 Remove-ReparsePointOrDirectory -Path $target
 Copy-Item -LiteralPath $PluginDir -Destination $target -Recurse -Force
+# Tests are development material; the installed artifact only needs what DSH loads.
+Get-ChildItem -LiteralPath $target -Recurse -File -Filter '*.test.mjs' -ErrorAction SilentlyContinue | Remove-Item -Force
 $fileCount = (Get-ChildItem -LiteralPath $target -Recurse -File | Measure-Object).Count
 Write-Host "installed $packageName -> $target ($fileCount files)"
 
