@@ -24,6 +24,10 @@ window.__ModuleLoader__.load({
         const COMMANDCODE_ROUTE = "commandcode";
         /** Percent at or above which a window is called out in the warning color. */
         const WARN_PERCENT = 80;
+        /** Smallest gap the open panel keeps to the viewport edge, in px. */
+        const PANEL_MARGIN = 8;
+        /** Layout effects run before paint, so the panel is placed without a visible jump. */
+        const useLayoutEffect = react.useLayoutEffect || react.useEffect;
 
         // Theme-aware styling through the DSH alias variables, so the panel follows the
         // active light/dark theme instead of hardcoding one surface color.
@@ -39,8 +43,11 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-dot[data-tone=ok]{background:var(--dsw-alias-state-success-primary, #22c55e)}",
             ".dsw-ogu-dot[data-tone=warn]{background:var(--dsw-alias-state-warn-primary, #f59e0b)}",
             ".dsw-ogu-dot[data-tone=error]{background:var(--dsw-alias-state-error-primary, #ef4444)}",
-            ".dsw-ogu-panel{position:absolute;bottom:calc(100% + 6px);right:0;z-index:60;width:max-content;max-height:min(60vh, 420px);overflow:auto;",
-            "max-width:min(620px, calc(100vw - 32px));padding:12px 14px;border-radius:12px;",
+            // Fixed positioning: the panel is wider than the chip and opens upward, so anchoring it
+            // to the chip alone pushed its left edge off-screen on a narrow window and the account
+            // names plus the first columns were cut. The placement effect below clamps it instead.
+            ".dsw-ogu-panel{position:fixed;z-index:60;width:max-content;max-height:min(60vh, 420px);overflow:auto;",
+            "right:8px;bottom:8px;max-width:calc(100vw - 16px);padding:12px 14px;border-radius:12px;",
             "border:1px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));",
             // Opaque surface. --dsw-specific-menu resolves to var(--dsw-menu-surface-fill) on this
             // theme, a 58%-alpha fill meant to sit over a backdrop blur; using it alone let the
@@ -272,6 +279,7 @@ window.__ModuleLoader__.load({
             const state = useUsage();
             const [open, setOpen] = react.useState(false);
             const wrapRef = react.useRef(null);
+            const panelRef = react.useRef(null);
             const swallowedRef = react.useRef(false);
 
             // The composer surfaces pass the sessions store; without it the chip falls back to
@@ -307,6 +315,37 @@ window.__ModuleLoader__.load({
                 document.addEventListener("click", onDocumentClick, true);
                 return () => document.removeEventListener("click", onDocumentClick, true);
             }, []);
+
+            // Place the open panel inside the viewport. Right-aligning its edge to the chip is the
+            // preferred position; when that would cross the left margin (the chip sits near the
+            // left on a narrow window, and the table is wide) the panel is pinned to the margin
+            // instead, so no column is clipped. It stays reachable while the window is resized or
+            // the composer scrolls, and scrolls internally if the table still does not fit.
+            useLayoutEffect(() => {
+                if (!open) return;
+                const place = () => {
+                    const panel = panelRef.current;
+                    const wrap = wrapRef.current;
+                    if (!panel || !wrap) return;
+                    const anchor = wrap.getBoundingClientRect();
+                    const viewportWidth = window.innerWidth;
+                    panel.style.maxWidth = (viewportWidth - PANEL_MARGIN * 2) + "px";
+                    panel.style.bottom = (window.innerHeight - anchor.top + 6) + "px";
+                    panel.style.right = (viewportWidth - anchor.right) + "px";
+                    panel.style.left = "auto";
+                    if (panel.getBoundingClientRect().left < PANEL_MARGIN) {
+                        panel.style.left = PANEL_MARGIN + "px";
+                        panel.style.right = "auto";
+                    }
+                };
+                place();
+                window.addEventListener("resize", place);
+                window.addEventListener("scroll", place, true);
+                return () => {
+                    window.removeEventListener("resize", place);
+                    window.removeEventListener("scroll", place, true);
+                };
+            }, [open]);
 
             const accounts = state.payload && Array.isArray(state.payload.accounts) ? state.payload.accounts : [];
             const picked = selectedRoute(accounts, provider);
@@ -377,7 +416,7 @@ window.__ModuleLoader__.load({
                     h("span", { className: "dsw-ogu-dot", "data-tone": tone, "aria-hidden": true }),
                     h("span", null, label)
                 ),
-                open ? h("div", { className: "dsw-ogu-panel" },
+                open ? h("div", { className: "dsw-ogu-panel", ref: panelRef },
                     h("div", { className: "dsw-ogu-title" }, "用量（5 小时 / 周 / 月）· OpenCode Go + CommandCode"),
                     h(AccountRows, { accounts, activeAccount: active ? active.account : null, previous: previousSample(state.payload) }),
                     failures.length > 0 ? h("div", { className: "dsw-ogu-error" },

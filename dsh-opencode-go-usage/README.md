@@ -63,7 +63,8 @@ lib/client.js         # 浏览器：往 conversation.input.right 注册胶囊+�
 
 ## 浏览器侧
 
-- 胶囊读会话投影 `modelSelection.lastUsed.provider`（插槽传来 `sessionId`/`useSessions`）来挑选账号；宿主没给 `route` 时按引用名尾号推导，匹配不到就回退显示全部账号最高值。（`order: 40`）；面板向上弹出（`bottom: calc(100% + 6px)`）并限高滚动。
+- 胶囊读会话投影 `modelSelection.lastUsed.provider`（插槽传来 `sessionId`/`useSessions`）来挑选账号；宿主没给 `route` 时按引用名尾号推导，匹配不到就回退显示全部账号最高值。（`order: 40`）
+- **面板定位**：面板比胶囊宽得多又向上弹出，只锚在胶囊上会把左缘推出窗口（窄窗口下账号名和前几列被裁掉）。所以面板改用 `position:fixed`，由一个布局效果按视口摆放：优先右缘对齐胶囊，左缘一旦越过 8px 边距就改成贴左边距，宽度上限 `100vw - 16px`；窗口缩放或输入区滚动时重算。表格仍比面板宽时在面板内横向滚动。
 - 不放会话头部的原因见根 README「为什么不在会话头部显示」：Windows 标题栏覆盖层会吞掉顶部 36 DIP 的点击。
 - 样式走 DSH 的主题变量（`--dsw-specific-menu`、`--dsw-alias-label-*`、`--dsw-alias-state-warn-*` 等），自动跟随浅色/深色主题；≥80% 的窗口标黄。
 - 点击目标做了三处加固：胶囊本身 28px 高并加大内边距、`z-index:2` 抬到同级之上、`::after` 上下各外扩 4px 命中区，同时 `-webkit-app-region:no-drag` 让它在 Electron 里不被拖拽区吞掉点击。
