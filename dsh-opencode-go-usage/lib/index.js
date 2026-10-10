@@ -156,27 +156,53 @@ function routeNumber(ref, index) {
 }
 
 /**
+ * The stored value of a reference, or undefined when it does not resolve. Shared by both
+ * providers so a probe and the duplicate check below read the credential the same way.
+ */
+async function resolvedSecret(ctx, ref) {
+    try {
+        const hit = await ctx.credentials.resolve(credentialRef(ref));
+        return hit && typeof hit.value === "string" && hit.value.length > 0 ? hit.value : void 0;
+    } catch {
+        return void 0;
+    }
+}
+
+/** Resolved values already claimed by the references listed ahead of the discovery loop. */
+async function claimedSecrets(ctx, refs) {
+    const claimed = new Set();
+    for (const ref of refs) {
+        const value = await resolvedSecret(ctx, ref);
+        if (value !== void 0) claimed.add(value);
+    }
+    return claimed;
+}
+
+/**
  * Configured references plus every `<autoRefPrefix><n>` that currently resolves, so adding a
  * key to the credential store is enough for it to appear. Configured entries keep their order
  * and stay listed even when their key is missing.
+ *
+ * A discovered reference is skipped when it resolves to a key an earlier reference already
+ * claimed: one API key is one account, so the same key listed twice is the same account twice.
+ * That is reachable without any misconfiguration, because the credential store also resolves
+ * from the process environment — a leftover `..._1` variable holding the base key would
+ * otherwise be listed beside the base account it duplicates.
  */
 async function collectRefs(ctx, config) {
     const refs = [...config.refs];
     const seen = new Set(refs);
+    const claimed = await claimedSecrets(ctx, refs);
     const max = config.autoRefMax ?? 0;
     if (!config.autoRefPrefix || max <= 0) return refs;
     for (let index = 1; index <= max; index++) {
         const ref = config.autoRefPrefix + index;
         if (seen.has(ref)) continue;
-        try {
-            const hit = await ctx.credentials.resolve(credentialRef(ref));
-            if (hit && typeof hit.value === "string" && hit.value.length > 0) {
-                refs.push(ref);
-                seen.add(ref);
-            }
-        } catch {
-            // An unresolvable probe is simply not an account.
-        }
+        const value = await resolvedSecret(ctx, ref);
+        if (value === void 0 || claimed.has(value)) continue;
+        claimed.add(value);
+        refs.push(ref);
+        seen.add(ref);
     }
     return refs;
 }
@@ -379,25 +405,26 @@ async function readCommandCodeAccount(ctx, ref, config, route) {
         return match && match[1] !== "1" ? "commandcode-" + match[1] : "commandcode";
     }
 
-/** CommandCode references: the configured list plus discoverable `<prefix>` / `<prefix>_<n>`. */
+/**
+ * CommandCode references: the configured list plus discoverable `<prefix>` / `<prefix>_<n>`.
+ * Discovered candidates resolving to a key already claimed are skipped, for the same reason as
+ * in {@link collectRefs}: a repeated key is a repeated account, not a second one.
+ */
 async function collectCommandCodeRefs(ctx, config) {
     const refs = [...(config.commandcodeRefs ?? [])];
     const seen = new Set(refs);
+    const claimed = await claimedSecrets(ctx, refs);
     const prefix = config.commandcodeRefPrefix;
     const max = config.commandcodeRefMax ?? 0;
     if (!prefix || max <= 0) return refs;
     // "<PREFIX>" itself first (the common single-account case), then "<PREFIX>_<n>".
     for (const candidate of [prefix, ...Array.from({ length: max }, (_, i) => prefix + "_" + (i + 1))]) {
         if (seen.has(candidate)) continue;
-        try {
-            const hit = await ctx.credentials.resolve(credentialRef(candidate));
-            if (hit && typeof hit.value === "string" && hit.value.length > 0) {
-                refs.push(candidate);
-                seen.add(candidate);
-            }
-        } catch {
-            // An unresolvable probe is simply not an account.
-        }
+        seen.add(candidate);
+        const value = await resolvedSecret(ctx, candidate);
+        if (value === void 0 || claimed.has(value)) continue;
+        claimed.add(value);
+        refs.push(candidate);
     }
     return refs;
 }

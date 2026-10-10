@@ -58,6 +58,7 @@ lib/client.js         # 浏览器：往 conversation.input.right 注册胶囊+�
 - 注意 `api.commandcode.ai` 才是 API host，`commandcode.ai` 是网页，两者端点不通用。
 - 单个账号失败只体现在该行 `error`，不会让整块面板空白。
 - 账号列表 = 配置里的 `refs`（没 key 也列出，显示 `missing credential`）+ 自动发现的 `autoRefPrefix<n>`（默认 `OPENCODE_API_KEY_1..8`，只收能解析出 key 的），所以往凭据里加一条 key 就会多一行，不必改配置。
+- **一把 key 只占一行**：自动发现的引用如果解析出的 key 已被前面某条占用，就跳过它。凭据除了 `.credentials.yaml` 还会从进程环境解析，所以环境里遗留一个与 base 同值的 `<PREFIX>_1` 变量时，过去会在面板里多出一条重复账号（同一把 key 被列两次）。显式配置的 `refs` / `commandcodeRefs` 不受影响，始终按原样保留。
 - 单个账号失败只体现在该行的 `error` 上，不会让整块面板空白；缺凭据是 `missing credential`。
 
 ## 浏览器侧
