@@ -69,8 +69,13 @@ window.__ModuleLoader__.load({
             ".dsw-ogu-table td[data-warn=true]{font-weight:600}",
             ".dsw-ogu-table tr[data-active=true] td{background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,.08))}",
             ".dsw-ogu-table tr[data-active=true] td:first-child{font-weight:600}",
-            ".dsw-ogu-meta{margin-top:8px;color:var(--dsw-alias-label-caption, inherit);font-size:11px}",
-            ".dsw-ogu-error{margin-top:6px;color:var(--dsw-alias-label-tertiary, #adb2b8);font-size:11px;line-height:16px;word-break:break-word}"
+            // The footer is one long sentence. Left as a normal block its max-content width decided
+            // the panel's width, so the panel stretched to the viewport cap and the table sat in a
+            // mostly empty box (and the sentence itself was still cut off). `width:0;min-width:100%`
+            // takes it out of the panel's intrinsic width while still filling it, so the panel is
+            // sized by the table and the sentence wraps inside that width.
+            ".dsw-ogu-meta{margin-top:8px;color:var(--dsw-alias-label-caption, inherit);font-size:11px;width:0;min-width:100%}",
+            ".dsw-ogu-error{margin-top:6px;color:var(--dsw-alias-label-tertiary, #adb2b8);font-size:11px;line-height:16px;word-break:break-word;width:0;min-width:100%}"
         ].join("");
 
         const STYLE_TAG_ID = "dsh-opencode-go-usage/panel.css";
