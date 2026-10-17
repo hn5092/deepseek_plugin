@@ -304,7 +304,7 @@ if [ -f "$PATCH" ]; then
     fi
 fi
 
-file_count=$(find "$PLUGIN_DIR" -type f | wc -l | tr -d ' ')
+file_count=$(find "$PLUGIN_DIR" -type f ! -name '*.test.mjs' | wc -l | tr -d ' ')
 
 row=$(mktemp "${TMPDIR:-/tmp}/dsh-plugin-row.XXXXXX")
 {
@@ -333,6 +333,10 @@ fi
 rm -rf "$TARGET"
 mkdir -p "$(dirname "$TARGET")"
 cp -R "$PLUGIN_DIR" "$TARGET"
+# Tests are development material; the installed artifact only needs what DSH loads.
+# Matches scripts/Install-DshPlugin.ps1 so both platforms install the same file set.
+find "$TARGET" -type f -name '*.test.mjs' -delete
+file_count=$(find "$TARGET" -type f | wc -l | tr -d ' ')
 echo "installed $PACKAGE_NAME -> $TARGET ($file_count files)"
 
 write_patch "$row"
